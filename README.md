@@ -10,7 +10,7 @@ The preset is fixed to ChatGPT Plus **High** (`thinking_extended`). `/sol` does 
 ![Node.js >=22](https://img.shields.io/badge/node.js-%3E%3D22-339933)
 ![ChatGPT Plus High](https://img.shields.io/badge/ChatGPT-Plus%20High-10a37f)
 
-中文：**直接在 Pi 里调用网页版 ChatGPT GPT-5.6 Sol High。** 浏览器登录态由隔离的 pi-oracle worker 管理；Plus 最高档是 **High**，不是 Extra High / Pro。
+**English** | [简体中文](./README.zh-CN.md)
 
 ---
 
@@ -20,6 +20,7 @@ The preset is fixed to ChatGPT Plus **High** (`thinking_extended`). `/sol` does 
 - [Quick start](#quick-start)
 - [Commands](#commands)
 - [Why pi-sol?](#why-pi-sol)
+- [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility)
 - [How it works](#how-it-works)
 - [Behavior guarantees](#behavior-guarantees)
 - [Troubleshooting](#troubleshooting)
@@ -48,9 +49,7 @@ Before installing, make sure you have:
 > Open `chrome://settings/languages`, move **English** to the top, fully quit and relaunch Chrome, then run `/sol-auth` again.
 
 > [!IMPORTANT]
-> The bundled High / Power-slider compatibility patch is specifically version-gated to **pi-oracle 0.7.20**.
->
-> If a different `pi-oracle` version is installed, `pi-sol` does **not** copy the bundled 0.7.20 worker over it. Treat that as a **version-mismatch state** rather than assuming the bundled compatibility behavior applies. Do not force-copy the 0.7.20 vendor worker over a different `pi-oracle` version.
+> The vendored worker restore is version-gated; see [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility) for the exact marker check, restore rule, and version-mismatch behavior.
 
 ---
 
@@ -64,7 +63,7 @@ cd pi-sol
 ./scripts/install.sh
 ```
 
-The installer copies the extension, the skill, and the patched worker into your Pi configuration (`~/.pi/agent/`).
+The installer copies the extension, the skill, and the vendored patch files into your Pi configuration (`~/.pi/agent/`); any restore into the installed `pi-oracle` worker happens later at runtime under the [compatibility rule](#pi-oracle-0720-compatibility) below.
 
 ### 2. Reload Pi
 
@@ -109,6 +108,11 @@ Copy the returned job ID and read it:
 
 A working setup completes the synchronous request **and** makes the background job readable without silently dropping to Instant or Standard.
 
+<!-- Screenshot placeholder — add this file before uncommenting the image line:
+![Successful pi-sol smoke test in Pi](./docs/screenshots/smoke-test.png)
+Capture `/sol ping`, `/sol --bg ping`, the returned job ID, and `/sol-read <job-id>`. Crop out account identifiers, ChatGPT conversation URLs, cookies, private prompts, and unrelated terminal history.
+-->
+
 After the smoke test, try a real question:
 
 ```text
@@ -123,7 +127,7 @@ After the smoke test, try a real question:
 |---|---|
 | `/sol [--bg] [--follow <job-id>] [--files a,b] <prompt>` | Ask ChatGPT GPT-5.6 Sol High. Waits for the answer by default. |
 | `/sol-followup <job-id> [--bg] [--files a,b] <prompt>` | Continue an earlier `/sol` ChatGPT thread. |
-| `/sol-read [job-id]` | Read a saved job. With no ID, reads the latest available `/sol` job. |
+| `/sol-read [job-id]` | Read a saved job. With no ID, it falls back to an `oracle-*` job discovered in the configured jobs directory; pass the returned `/sol` job ID when you need an unambiguous result. |
 | `/sol-auth` | Sync ChatGPT cookies from local Chrome into pi-oracle's isolated browser seed. |
 
 > `/sol --follow <job-id> <prompt>` and `/sol-followup <job-id> <prompt>` **both continue an existing `/sol` ChatGPT thread**. Use whichever form is more convenient; `/sol-followup` is the dedicated command form.
@@ -152,7 +156,7 @@ The model preset is always `thinking_extended`, which `pi-sol` uses for GPT-5.6 
 
 ### Why use pi-sol on top of `pi-oracle`?
 
-`pi-oracle` provides the underlying ChatGPT browser worker. `pi-sol` adds the Pi-facing contract around it: `/sol` and `/sol-followup` slash commands, the fixed `thinking_extended` / Plus **High** preset (no silent fallback), explicit local-file staging, the ChatGPT `agent_browser` guard, and version-gated restoration of the supported 0.7.20 worker patch. If you only want raw ChatGPT automation, use `pi-oracle` directly. If you want a single `/sol` command that always lands on Plus High, install `pi-sol`.
+`pi-oracle` provides the underlying ChatGPT browser worker. `pi-sol` adds the Pi-facing contract around it: `/sol` and `/sol-followup` slash commands, the fixed `thinking_extended` / Plus **High** preset (no silent fallback), explicit local-file staging, the ChatGPT `agent_browser` guard, and version-gated worker restoration. See [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility) for the exact restore boundary. If you only want raw ChatGPT automation, use `pi-oracle` directly. If you want a single `/sol` command that always lands on Plus High, install `pi-sol`.
 
 ### pi-sol vs opening chatgpt.com
 
@@ -166,18 +170,27 @@ The model preset is always `thinking_extended`, which `pi-sol` uses for GPT-5.6 
 | ChatGPT browser ownership | Isolated pi-oracle worker | Your normal browser |
 | pi-oracle High compatibility handling | Automatic where supported | Not applicable |
 
-### Compatibility with pi-oracle 0.7.20
+---
 
-`pi-oracle 0.7.20` was written for an older ChatGPT model-selection UI. ChatGPT Plus now exposes **High** and a **Power** slider, which can make the unpatched worker fail with errors such as:
+## pi-oracle 0.7.20 compatibility
+
+`pi-sol` vendors a High / Power-slider compatibility patch derived from **pi-oracle 0.7.20**. The unpatched 0.7.20 worker can fail against the compact / Power model-selection UI with errors such as:
 
 ```text
 Could not open effort dropdown for requested effort: Extended
 Could not find model family control for instant
 ```
 
-`pi-sol` bundles the corresponding 0.7.20 worker patch and restores it automatically if `pi update npm:pi-oracle` replaces the patched worker.
+The restore rule is deliberately narrow:
 
-If the installed pi-oracle version is no longer 0.7.20, `pi-sol` refuses to overwrite it with the bundled older worker.
+1. On `session_start` and every `before_agent_start`, `pi-sol` checks the installed worker for the required High / Power-slider patch markers.
+2. If all required markers are already present, no vendor copy is needed.
+3. If markers are missing, `pi-sol` restores the vendored worker files only when the installed `pi-oracle` version exactly matches the vendored version, **0.7.20**.
+4. If the installed version is different or unreadable, `pi-sol` refuses to overwrite the worker; do not force-copy the 0.7.20 vendor files over it.
+5. `pi update npm:pi-oracle` may replace patched worker files; when restoration is allowed, the next automatic check restores them.
+6. If a supported High submit still hits the old effort-dropdown or model-family-control error, the in-Pi agent may run the restore once and retry the same `thinking_extended` submit once; the user should not be asked to run patch scripts, and `/sol` must not downgrade to Instant or Standard.
+
+This is the compatibility boundary for the vendored restore mechanism; it is not a claim that every other `pi-oracle` version is supported or unsupported.
 
 ---
 
@@ -185,19 +198,41 @@ If the installed pi-oracle version is no longer 0.7.20, `pi-sol` refuses to over
 
 ```mermaid
 flowchart LR
-    U["Pi user<br/>/sol"] --> E["pi-sol extension<br/>parse + stage + guard"]
-    E --> A["Pi agent<br/>sol skill"]
-    A -->|"oracle_preflight / auth / submit / read"| O["pi-oracle worker<br/>isolated Chrome"]
-    O --> C["ChatGPT web<br/>GPT-5.6 Sol High"]
-    C --> O
-    O --> A
-    A --> U
+    subgraph Pi["Pi coding agent"]
+        U["Pi user<br/>/sol"] --> E["pi-sol extension<br/>parse + stage + guard"]
+        E --> SK["sol skill"]
+        SK -->|"oracle_preflight / auth / submit / read"| RT["pi-oracle runtime"]
+    end
+    subgraph Oracle["pi-oracle (separate npm package)"]
+        RT --> PCH["ensureSolOraclePatches()<br/>version-gated restore"]
+        RT --> W["isolated Chrome worker"]
+    end
+    W --> C["ChatGPT web<br/>GPT-5.6 Sol High"]
+    C --> W
+    W --> RT
+    RT --> SK
+    SK --> U
     B["agent_browser"] -. "ChatGPT URLs blocked" .-> E
 ```
 
-`pi-sol` does not create a second ChatGPT browser session. Browser automation for ChatGPT stays inside pi-oracle's isolated worker. The extension itself only parses input, stages files, and enforces the ChatGPT `agent_browser` guard; the in-Pi `sol` skill owns the `oracle_*` calls.
+`pi-sol` does not create a second ChatGPT browser session. The extension parses commands, stages explicitly selected files, injects the relay instructions, and blocks ChatGPT URLs in `agent_browser`; the in-Pi `sol` skill drives `oracle_preflight`, `oracle_auth`, `oracle_submit`, and `oracle_read`, while `pi-oracle` owns the isolated Chrome session.
 
-Before a supported submit, `pi-sol` checks that the bundled pi-oracle 0.7.20 High / Power-slider patch is present. If an update replaced it, `pi-sol` restores it automatically. The patch is version-gated: `pi-sol` will not copy its bundled 0.7.20 worker over a different pi-oracle version.
+For the exact worker-patch decision, see [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility).
+
+### Background-job lifecycle
+
+```mermaid
+flowchart LR
+    BG["/sol --bg &lt;prompt&gt;"] --> S["oracle_submit"]
+    S --> J["return job ID"]
+    S --> W["pi-oracle worker"]
+    W --> D["job directory<br/>$PI_ORACLE_JOBS_DIR/oracle-&lt;id&gt;/ or /tmp/oracle-&lt;id&gt;/"]
+    J --> R["/sol-read &lt;job-id&gt;<br/>local read"]
+    D --> R
+    R --> O["status + saved response"]
+```
+
+Synchronous `/sol` reuses the same `oracle_submit` + `oracle_read` flow but blocks in Pi until the response is ready.
 
 The detailed hydration rules and decision logic live in [SKILL.md](./skills/sol/SKILL.md) and the test suite.
 
@@ -217,7 +252,9 @@ The detailed hydration rules and decision logic live in [SKILL.md](./skills/sol/
 ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. For that reason, `pi-sol` blocks `agent_browser` from opening:
 
 - `chatgpt.com`
+- `www.chatgpt.com`
 - `chat.openai.com`
+- `chatgpt.openai.com`
 - `auth.openai.com`
 
 This prevents two browser-automation paths from competing for the ChatGPT session. Use `/sol` for ChatGPT instead.
@@ -232,17 +269,16 @@ User-selected local files are **strictly opt-in**: they are included only when y
 
 Internally, `/sol` may stage a generated `request.md` containing the request. If you explicitly select a file **outside the current project**, it is copied to `.pi/sol-staging/<id>/` so `pi-oracle` can receive a project-relative path. Files inside the current project are referenced in place and are not copied.
 
-**Pre-submit file limits:**
+**Local pre-submit checks:**
 
 - Maximum **10 files** per turn
-- Hard cap: **512 MiB per file**
 - Images: **20 MiB**
-- Spreadsheets: approximately **50 MiB**
-- Text / documents: approximately **2M tokens**
-- Supported: documents, spreadsheets, presentations, images, text
-- **Rejected:** executables and installers (`.exe`, `.dmg`, `.apk`, …)
+- Spreadsheets: **50 MiB**
+- Known text / document extensions and extensionless files: **20 MiB** local byte cap, used as a rough proxy for ChatGPT's approximately **2M-token** document limit
+- Other non-blocked extensions: **512 MiB** hard cap
+- **Rejected locally:** known executables and installers (`.exe`, `.dmg`, `.apk`, …)
 
-Uploads that exceed any of these limits are blocked before submission, so the ChatGPT web request is never made with an unsupported payload.
+These checks prevent known-invalid payloads from being submitted, but they are not a complete mirror of ChatGPT web validation; ChatGPT may still reject an unsupported file type or apply additional service-side token, rate, storage, login, challenge, or policy limits.
 
 ### Authentication and policy failures
 
@@ -250,9 +286,7 @@ Login, challenge, and content-policy failures are treated as **terminal** condit
 
 ### pi-oracle updates
 
-`pi update npm:pi-oracle` can replace the installed worker. When the installed version matches the supported 0.7.20 worker, `pi-sol` automatically restores its High / Power-slider compatibility patch on every `session_start` and before each `/sol`. A different pi-oracle version is left untouched.
-
-You do not need to run a patch script manually — and you should not, against a different pi-oracle version.
+For update-time restore behavior, version gating, and the marker-first exception, see [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility); users should not run the worker restore script manually.
 
 For coding-agent invariants, see [AGENTS.md](./AGENTS.md).
 For patch-development rules, see [CONTRIBUTING.md](./CONTRIBUTING.md).
@@ -295,13 +329,11 @@ You may also see:
 Could not find model family control for instant
 ```
 
-These are the pi-oracle 0.7.20 UI-compatibility errors that the bundled High / Power-slider patch is designed to handle. `pi-sol` restores the supported patch automatically; reload Pi (or start a new session) and retry the same `/sol` request. Do not work around the problem by silently switching the request to Instant or Standard.
-
-If it continues, check which pi-oracle version is installed.
+Reload Pi (or start a new session) and retry the same `/sol` request; if the error persists, see [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility) for the exact restore and version-mismatch rule, and do not work around it by switching to Instant or Standard.
 
 ### pi-sol reports a pi-oracle version mismatch
 
-The bundled worker patch targets pi-oracle **0.7.20**. If another version is installed, `pi-sol` intentionally refuses to overwrite that worker with its bundled older files. Do not force-copy the 0.7.20 vendor worker over a different pi-oracle version.
+A version mismatch matters when patch markers are missing and restoration is required; see [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility) for the exact rule, and do not force-copy the vendored worker over a different installed version.
 
 ### `/sol` says High is unavailable
 
@@ -324,14 +356,7 @@ instead.
 
 ### A file is rejected before `/sol` submits
 
-`--files` is validated before submission:
-
-- Only explicitly listed files are sent.
-- Maximum **10 files** per turn.
-- Executables / installers are rejected.
-- ChatGPT web upload-size limits still apply.
-
-Remove the unsupported file or reduce the upload set and retry.
+`--files` applies local count, byte-size, and known executable/installer checks before submission; see [Files and local staging](#files-and-local-staging) for the exact local checks, then remove or reduce the rejected input and retry.
 
 ### `/sol-read` says no jobs were found
 
@@ -347,7 +372,7 @@ Then read the returned job:
 /sol-read <job-id>
 ```
 
-With no job ID, `/sol-read` attempts to use the latest available `/sol` job.
+With no job ID, `/sol-read` falls back to an `oracle-*` job discovered in the configured jobs directory and is not scoped only to `/sol`, so use the returned job ID when other pi-oracle jobs may exist.
 
 ---
 
@@ -383,7 +408,7 @@ Yes. `/sol` submits your question to ChatGPT web, so the prompt is sent to ChatG
 
 ### What happens after `pi update npm:pi-oracle`?
 
-An update can replace pi-oracle's installed worker and therefore remove the `pi-sol` compatibility patch. For the supported pi-oracle 0.7.20 worker, `pi-sol` detects this on the next `session_start` (and before every `/sol`) and restores the bundled High / Power-slider patch automatically. You should not need to run a patch script manually. If the installed pi-oracle version is different, `pi-sol` refuses to overwrite it with its bundled 0.7.20 worker.
+An update can replace pi-oracle's installed worker; see [pi-oracle 0.7.20 compatibility](#pi-oracle-0720-compatibility) for the exact marker check, restore boundary, and version-mismatch behavior.
 
 ---
 
@@ -408,6 +433,8 @@ The test suite covers:
 ### Project layout
 
 ```text
+README.md                    English README (this file)
+README.zh-CN.md              Simplified Chinese README
 extensions/sol.ts              Pi slash commands + hooks
 extensions/lib/sol/            parse, files, guard, jobs, prompts, patches
 extensions/lib/sol/vendor/     patched pi-oracle 0.7.20 worker (MIT)
@@ -415,6 +442,8 @@ extensions/__tests__/          node:test suite
 skills/sol/SKILL.md            in-Pi model procedure
 scripts/install.sh             copy into ~/.pi/agent
 ```
+
+Screenshots referenced from this README live under `docs/screenshots/`.
 
 ---
 

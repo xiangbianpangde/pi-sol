@@ -47,8 +47,10 @@ Before installing, make sure you have:
 >
 > Open `chrome://settings/languages`, move **English** to the top, fully quit and relaunch Chrome, then run `/sol-auth` again.
 
-> [!NOTE]
-> The bundled worker compatibility patch targets **pi-oracle 0.7.20**. `pi-sol` will not overwrite a different or newer pi-oracle version with the bundled 0.7.20 worker.
+> [!IMPORTANT]
+> The bundled High / Power-slider compatibility patch is specifically version-gated to **pi-oracle 0.7.20**.
+>
+> If a different `pi-oracle` version is installed, `pi-sol` does **not** copy the bundled 0.7.20 worker over it. Treat that as a **version-mismatch state** rather than assuming the bundled compatibility behavior applies. Do not force-copy the 0.7.20 vendor worker over a different `pi-oracle` version.
 
 ---
 
@@ -82,19 +84,36 @@ Or start a new Pi session.
 
 This copies ChatGPT login cookies from your local Chrome profile into pi-oracle's isolated browser seed.
 
-### 4. Verify it works
+> [!WARNING]
+> `/sol-auth` handles your ChatGPT session cookies. **Never commit, publish, paste into an issue, or otherwise share** ChatGPT cookies, Chrome profile data, or `oracle-auth-seed-profile` files.
+
+### 4. Run the smoke test
+
+First verify a synchronous request:
 
 ```text
 /sol ping
 ```
 
-Then try a real question:
+Then verify the background-job path:
+
+```text
+/sol --bg ping
+```
+
+Copy the returned job ID and read it:
+
+```text
+/sol-read <job-id>
+```
+
+A working setup completes the synchronous request **and** makes the background job readable without silently dropping to Instant or Standard.
+
+After the smoke test, try a real question:
 
 ```text
 /sol Review this architecture decision and identify the three highest-risk assumptions.
 ```
-
-By default, `/sol` waits for the Sol High answer and returns it directly in Pi.
 
 ---
 
@@ -107,12 +126,14 @@ By default, `/sol` waits for the Sol High answer and returns it directly in Pi.
 | `/sol-read [job-id]` | Read a saved job. With no ID, reads the latest available `/sol` job. |
 | `/sol-auth` | Sync ChatGPT cookies from local Chrome into pi-oracle's isolated browser seed. |
 
+> `/sol --follow <job-id> <prompt>` and `/sol-followup <job-id> <prompt>` **both continue an existing `/sol` ChatGPT thread**. Use whichever form is more convenient; `/sol-followup` is the dedicated command form.
+
 ### Common options
 
 - **Default:** synchronous — wait for Sol and return the answer in Pi.
-- **`--bg`:** submit in the background and return a job ID; read it later with `/sol-read`.
-- **`--files a,b`:** send only the explicitly listed files. Maximum **10 files** per turn. Whole repositories are never auto-archived.
-- **`--follow <job-id>`:** continue an existing ChatGPT thread from `/sol`.
+- **`--bg`:** submit in the background and return a job ID; read it later with `/sol-read`. Background results are pi-oracle jobs. They live under `$PI_ORACLE_JOBS_DIR` when that variable is configured, otherwise under `/tmp/oracle-<id>/`; `/sol-read` is the normal way to read them from Pi.
+- **`--files a,b`:** send only the explicitly listed files. Whole repositories are never auto-archived. Files you select that live outside the current project are copied to `.pi/sol-staging/<id>/` so `pi-oracle` can receive a project-relative path.
+- **`--follow <job-id>`:** continue an existing ChatGPT thread from `/sol`. See the alias note above.
 
 The model preset is always `thinking_extended`, which `pi-sol` uses for GPT-5.6 Sol **High** on ChatGPT Plus. It does not silently downgrade to Instant or Standard. See [SKILL.md](./skills/sol/SKILL.md) for the full in-Pi operating procedure.
 
@@ -128,6 +149,10 @@ The model preset is always `thinking_extended`, which `pi-sol` uses for GPT-5.6 
 - Continue an earlier ChatGPT thread with `/sol-followup`.
 - Keep ChatGPT browser automation inside pi-oracle's isolated worker.
 - Auto-restore the supported High / Power-slider compatibility patch when needed.
+
+### Why use pi-sol on top of `pi-oracle`?
+
+`pi-oracle` provides the underlying ChatGPT browser worker. `pi-sol` adds the Pi-facing contract around it: `/sol` and `/sol-followup` slash commands, the fixed `thinking_extended` / Plus **High** preset (no silent fallback), explicit local-file staging, the ChatGPT `agent_browser` guard, and version-gated restoration of the supported 0.7.20 worker patch. If you only want raw ChatGPT automation, use `pi-oracle` directly. If you want a single `/sol` command that always lands on Plus High, install `pi-sol`.
 
 ### pi-sol vs opening chatgpt.com
 
@@ -160,16 +185,17 @@ If the installed pi-oracle version is no longer 0.7.20, `pi-sol` refuses to over
 
 ```mermaid
 flowchart LR
-    U["Pi user<br/>/sol"] --> P["pi-sol"]
-    P -->|"prompt + explicit files"| O["pi-oracle worker<br/>isolated Chrome"]
+    U["Pi user<br/>/sol"] --> E["pi-sol extension<br/>parse + stage + guard"]
+    E --> A["Pi agent<br/>sol skill"]
+    A -->|"oracle_preflight / auth / submit / read"| O["pi-oracle worker<br/>isolated Chrome"]
     O --> C["ChatGPT web<br/>GPT-5.6 Sol High"]
-    C --> J["oracle job / saved response"]
-    J --> P
-    P --> U
-    B["agent_browser"] -. "ChatGPT URLs blocked" .-> P
+    C --> O
+    O --> A
+    A --> U
+    B["agent_browser"] -. "ChatGPT URLs blocked" .-> E
 ```
 
-`pi-sol` does not create a second ChatGPT browser session. Browser automation for ChatGPT stays inside pi-oracle's isolated worker.
+`pi-sol` does not create a second ChatGPT browser session. Browser automation for ChatGPT stays inside pi-oracle's isolated worker. The extension itself only parses input, stages files, and enforces the ChatGPT `agent_browser` guard; the in-Pi `sol` skill owns the `oracle_*` calls.
 
 Before a supported submit, `pi-sol` checks that the bundled pi-oracle 0.7.20 High / Power-slider patch is present. If an update replaced it, `pi-sol` restores it automatically. The patch is version-gated: `pi-sol` will not copy its bundled 0.7.20 worker over a different pi-oracle version.
 
@@ -196,15 +222,27 @@ ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. F
 
 This prevents two browser-automation paths from competing for the ChatGPT session. Use `/sol` for ChatGPT instead.
 
-### Files
+### Files and local staging
 
-Files are strictly opt-in:
+User-selected local files are **strictly opt-in**: they are included only when you pass `--files`. `pi-sol` does not archive or upload the whole repository automatically.
 
 ```text
 /sol --files paper.pdf,src/example.ts <prompt>
 ```
 
-`pi-sol` does not archive or upload the whole repository automatically. A maximum of **10 files** can be selected per turn, and unsupported or oversized uploads are rejected before submission (executables, installers, oversize images, etc. are blocked).
+Internally, `/sol` may stage a generated `request.md` containing the request. If you explicitly select a file **outside the current project**, it is copied to `.pi/sol-staging/<id>/` so `pi-oracle` can receive a project-relative path. Files inside the current project are referenced in place and are not copied.
+
+**Pre-submit file limits:**
+
+- Maximum **10 files** per turn
+- Hard cap: **512 MiB per file**
+- Images: **20 MiB**
+- Spreadsheets: approximately **50 MiB**
+- Text / documents: approximately **2M tokens**
+- Supported: documents, spreadsheets, presentations, images, text
+- **Rejected:** executables and installers (`.exe`, `.dmg`, `.apk`, …)
+
+Uploads that exceed any of these limits are blocked before submission, so the ChatGPT web request is never made with an unsupported payload.
 
 ### Authentication and policy failures
 

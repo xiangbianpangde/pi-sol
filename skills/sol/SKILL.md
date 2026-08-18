@@ -32,7 +32,7 @@ Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `
 
 0. `/sol` already restores pi-oracle High/Power-slider worker patches on `session_start` and before this turn. **You** are the operator of that restore, not the user. Never tell the user to run apply scripts or `pi update`.
 1. Call `oracle_preflight` with `provider: "chatgpt"`.
-2. If auth is missing/stale, call `oracle_auth` (`provider: "chatgpt"`) and preflight again. `/sol` is allowed to auto-sync Chrome cookies. If Chrome has the cookie DB locked, tell the user to quit Chrome and rerun `/sol-auth`.
+2. If auth is missing/stale, call `oracle_auth` (`provider: "chatgpt"`) and preflight again. `/sol` is allowed to auto-sync Chrome cookies. If Chrome has the cookie DB locked, tell the user to quit Chrome and rerun `/sol-auth`. If auth hits Cloudflare「请稍候…」or `about:blank`, the Chrome UI is not English — tell them to put English first in `chrome://settings/languages`, relaunch Chrome, then `/sol-auth` again.
 3. Submit with `oracle_submit`:
    - `provider`: `chatgpt`
    - `preset`: `thinking_extended` (maps to GPT-5.6 Sol **High**, Plus max)

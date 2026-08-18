@@ -13,4 +13,5 @@ rm -rf "$DEST/skills/sol"
 cp -R "$ROOT/skills/sol" "$DEST/skills/sol"
 
 echo "installed /sol → $DEST"
+echo "Chrome UI must be English (chrome://settings/languages) or /sol-auth will fail"
 echo "in Pi: /reload   then   /sol-auth   then   /sol ping"

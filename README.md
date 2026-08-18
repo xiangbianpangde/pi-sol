@@ -40,7 +40,15 @@ Live check on this machine: job `3c4db6be-dfa6-43ee-b0da-8c0fc4aa1a06`, preset `
 
 ## Install
 
-Needs a working [Pi](https://github.com/badlogic/pi-mono) with `npm:pi-oracle` and ChatGPT Plus (English UI in the isolated profile).
+Needs a working [Pi](https://github.com/badlogic/pi-mono) with `npm:pi-oracle` and ChatGPT Plus.
+
+> **Chrome must be English, or `/sol-auth` fails.**
+>
+> 隔离 Chrome / 本机用来同步 cookie 的 Chrome **界面语言必须是 English**。中文界面会被 Cloudflare 卡在「请稍候…」，worker 拿不到 ChatGPT 登录态，`oracle_auth` / `/sol-auth` 会失败。
+>
+> `chrome://settings/languages` → move **English** to the top → relaunch Chrome → then `/sol-auth`.
+>
+> If Chrome already ran with a Chinese UI, quit it fully and auth again. Do not leave a Chinese-language profile for the isolated oracle seed to inherit.
 
 ```bash
 git clone https://github.com/xiangbianpangde/pi-sol.git
@@ -63,7 +71,9 @@ First use:
 /sol ping
 ```
 
-If Chrome has the cookie DB locked, quit Chrome once and run `/sol-auth` again. Keep the isolated profile in English so Cloudflare does not stick on「请稍候…」.
+If Chrome has the cookie DB locked, quit Chrome once and run `/sol-auth` again.
+
+If auth still fails with a challenge page or `about:blank`, the browser language is almost always the cause — see the English-UI warning above. A Chinese Chrome will not get a usable ChatGPT session.
 
 ## Usage
 
@@ -108,7 +118,8 @@ The human does not run patch scripts. The extension restores the 0.7.20 vendor w
 2. Browser automation for ChatGPT stays inside the oracle worker.
 3. Plus max is High. Extra High / Pro need a Pro plan; do not invent them.
 4. Content-policy, login, and challenge failures are terminal.
-5. After `pi update npm:pi-oracle` on 0.7.20, the next `/sol` puts the patch back. No user step.
+5. Chrome UI must be English. Chinese UI → Cloudflare「请稍候…」→ no auth.
+6. After `pi update npm:pi-oracle` on 0.7.20, the next `/sol` puts the patch back. No user step.
 
 ## Tests
 

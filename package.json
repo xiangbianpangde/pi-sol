@@ -1,0 +1,19 @@
+{
+  "name": "pi-sol",
+  "version": "0.1.0",
+  "private": false,
+  "license": "MIT",
+  "description": "Pi extension: /sol relays to ChatGPT web GPT-5.6 Sol High via pi-oracle, with Plus High / Power-slider worker patches.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiangbianpangde/pi-sol.git"
+  },
+  "scripts": {
+    "test": "npx --yes tsx --test extensions/__tests__/sol.test.ts extensions/__tests__/sol-load.test.ts extensions/__tests__/sol-patches.test.ts extensions/__tests__/sol-chatgpt-ui.test.ts",
+    "check:patches": "node extensions/lib/sol/apply-sol-patches.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,15 @@
+pi-sol
+Copyright (c) 2026 xiangbianpangde
+
+This repository includes patched worker files from pi-oracle 0.7.20:
+
+  extensions/lib/sol/vendor/chatgpt-ui-helpers.mjs
+  extensions/lib/sol/vendor/chatgpt-ui-helpers.d.mts
+  extensions/lib/sol/vendor/artifact-heuristics.mjs
+  extensions/lib/sol/vendor/run-job.mjs
+
+Those files remain under the MIT License, Copyright (c) 2026 Mitch Fultz.
+Upstream: https://github.com/fitchmultz/pi-oracle
+
+The patches teach the worker ChatGPT Plus's compact High button and
+Power-slider popover. They do not change pi-oracle's license.

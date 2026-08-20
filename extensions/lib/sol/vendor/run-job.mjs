@@ -36,6 +36,7 @@ import {
   snapshotHasModelOpener,
   snapshotHasPowerSliderCompactMenu,
   describeCompactComposerSelection,
+  snapshotHasChatGptStopControl,
   snapshotHasUsableComposerControls,
   snapshotStronglyMatchesRequestedModel,
   snapshotWeaklyMatchesRequestedModel,
@@ -708,7 +709,11 @@ async function streamStatus(job) {
 
 async function ensureBrowserConnected(job) {
   if (!browserStarted || cleaningUpBrowser) return;
-  const status = await streamStatus(job);
+  let status = await streamStatus(job);
+  if (status.connected === false) {
+    await sleep(1000);
+    status = await streamStatus(job);
+  }
   if (status.connected === false) {
     throw new Error("The isolated oracle browser disconnected during the job.");
   }
@@ -1374,7 +1379,7 @@ async function sendAcceptanceState(job, baselineAssistantCount) {
     url: urlResult.url,
     urlKnown: urlResult.ok,
     assistantCount: Math.max(baselineAssistantCount, messages.length),
-    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming"),
+    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
     transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
   };
 }
@@ -1909,7 +1914,7 @@ async function waitForChatCompletion(job, baselineAssistantCount) {
   while (Date.now() < timeoutAt) {
     await heartbeat();
     const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
-    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming");
+    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot);
     const hasRetryButton = snapshot.includes('button "Retry"');
     const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
     throwIfProviderTransientError(job, snapshot, "waiting for response completion");

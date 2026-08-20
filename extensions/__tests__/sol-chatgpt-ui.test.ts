@@ -13,6 +13,7 @@ import { describe, it } from "node:test";
 import {
 	effortSelectionVisible,
 	snapshotCanSafelySkipModelConfiguration,
+	snapshotHasChatGptStopControl,
 	snapshotHasModelConfigurationUi,
 	snapshotHasModelOpener,
 	snapshotHasUsableComposerControls,
@@ -125,6 +126,22 @@ describe("non-High Power-slider pills must not look like Sol High", () => {
 		assert.equal(snapshotCanSafelySkipModelConfiguration(MEDIUM_POWER_OPEN, THINKING_EXTENDED), false);
 		assert.equal(snapshotStronglyMatchesRequestedModel(MEDIUM_POWER_OPEN, THINKING_EXTENDED), false);
 		assert.equal(snapshotHasModelConfigurationUi(MEDIUM_POWER_OPEN), false);
+	});
+});
+
+describe("send-accepted detection on the 2026 composer", () => {
+	it("treats Stop answering as an in-flight Sol response", () => {
+		const streaming = `
+- button "Inspecting Uploaded Tar Archive" [ref=e205]
+- button "Add files and more" [expanded=false, ref=e206]
+- textbox "Chat with ChatGPT" [ref=e207]
+- button "High" [expanded=false, ref=e247]
+- button "Start dictation" [ref=e208]
+- button "Stop answering" [ref=e209]
+`;
+		assert.equal(snapshotHasChatGptStopControl(streaming), true);
+		assert.equal(snapshotHasChatGptStopControl(HIGH_CLOSED), false);
+		assert.equal(snapshotHasChatGptStopControl('- button "Stop streaming" [ref=e1]'), true);
 	});
 });
 

@@ -21,6 +21,7 @@ export declare function thinkingChipVisible(snapshot: string): boolean;
 export declare function snapshotHasClosedCompactSelection(snapshot: string, selection: OracleUiSelection): boolean;
 export declare function snapshotHasModelConfigurationUi(snapshot: string): boolean;
 export declare function snapshotHasUsableComposerControls(snapshot: string): boolean;
+export declare function snapshotHasChatGptStopControl(snapshot: string): boolean;
 export declare function snapshotHasPowerSliderCompactMenu(snapshot: string): boolean;
 export declare function describeCompactComposerSelection(snapshot: string): string | undefined;
 export declare function snapshotHasModelOpener(snapshot: string): boolean;

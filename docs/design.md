@@ -26,6 +26,7 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 - Instant / Medium must not skip as High
 - wait if the High button has not hydrated
 - assumed High fallback only when no other compact tier is visible
+- follow-up send is accepted when the composer shows `Stop answering` (not only the old `Stop streaming` label)
 
 ## Patch restore
 

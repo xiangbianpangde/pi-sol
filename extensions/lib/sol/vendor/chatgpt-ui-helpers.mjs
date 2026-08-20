@@ -579,6 +579,18 @@ export function describeCompactComposerSelection(snapshot) {
   return compactSelection.compactTier || compactSelection.modelFamily;
 }
 
+const CHATGPT_STOP_CONTROL_PATTERN = /button "Stop (?:streaming|answering|generating)"/i;
+
+/**
+ * @param {string} snapshot
+ * @returns {boolean}
+ */
+export function snapshotHasChatGptStopControl(snapshot) {
+  const text = String(snapshot || "");
+  if (CHATGPT_STOP_CONTROL_PATTERN.test(text)) return true;
+  return /\bStop (?:streaming|answering|generating)\b/i.test(text);
+}
+
 export function snapshotHasUsableComposerControls(snapshot) {
   /** @type {SnapshotEntry[]} */
   const entries = parseSnapshotEntries(snapshot);

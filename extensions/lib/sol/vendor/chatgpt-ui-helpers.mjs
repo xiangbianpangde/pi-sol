@@ -603,6 +603,24 @@ export function snapshotHasChatGptSendReady(snapshot) {
 }
 
 /**
+ * After a reply finishes the empty composer shows Voice, not Send prompt.
+ * That idle chrome means ChatGPT is done; requiring Send prompt kept /sol
+ * polling for tens of minutes after the tab already had the answer.
+ * @param {string} snapshot
+ * @returns {boolean}
+ */
+export function snapshotHasChatGptComposerIdle(snapshot) {
+  if (snapshotHasChatGptStopControl(snapshot)) return false;
+  const entries = parseSnapshotEntries(snapshot);
+  const hasComposer = entries.some(
+    (entry) => entry.kind === "textbox" && entry.label === "Chat with ChatGPT" && !entry.disabled,
+  );
+  if (!hasComposer) return false;
+  if (snapshotHasChatGptSendReady(snapshot)) return true;
+  return entries.some((entry) => entry.kind === "button" && /^Start Voice$/i.test(String(entry.label || "")));
+}
+
+/**
  * @param {string} snapshot
  * @returns {number}
  */

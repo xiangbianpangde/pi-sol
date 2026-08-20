@@ -14,6 +14,7 @@ import {
 	countChatGptCopyControls,
 	effortSelectionVisible,
 	snapshotCanSafelySkipModelConfiguration,
+	snapshotHasChatGptComposerIdle,
 	snapshotHasChatGptSendReady,
 	snapshotHasChatGptStopControl,
 	snapshotHasModelConfigurationUi,
@@ -157,6 +158,20 @@ describe("send-accepted detection on the 2026 composer", () => {
 		assert.equal(snapshotHasChatGptSendReady(idle), true);
 		assert.equal(snapshotHasChatGptSendReady(HIGH_CLOSED), false);
 		assert.equal(countChatGptCopyControls('- button "Copy response" [ref=e1]\n- button "Copy message" [ref=e2]'), 2);
+	});
+
+	it("treats empty composer + Start Voice as idle after a finished reply", () => {
+		const afterReply = `
+- button "Copy response" [ref=e233]
+- button "Add files and more" [expanded=false, ref=e250]
+- textbox "Chat with ChatGPT" [ref=e251]
+- button "High" [expanded=false, ref=e405]
+- button "Start dictation" [ref=e252]
+- button "Start Voice" [ref=e406]
+`;
+		assert.equal(snapshotHasChatGptComposerIdle(afterReply), true);
+		assert.equal(snapshotHasChatGptSendReady(afterReply), false);
+		assert.equal(snapshotHasChatGptStopControl(afterReply), false);
 	});
 });
 

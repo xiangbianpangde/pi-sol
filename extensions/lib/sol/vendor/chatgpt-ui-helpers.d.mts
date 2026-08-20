@@ -23,6 +23,7 @@ export declare function snapshotHasModelConfigurationUi(snapshot: string): boole
 export declare function snapshotHasUsableComposerControls(snapshot: string): boolean;
 export declare function snapshotHasChatGptStopControl(snapshot: string): boolean;
 export declare function snapshotHasChatGptSendReady(snapshot: string): boolean;
+export declare function snapshotHasChatGptComposerIdle(snapshot: string): boolean;
 export declare function countChatGptCopyControls(snapshot: string): number;
 export declare function snapshotHasPowerSliderCompactMenu(snapshot: string): boolean;
 export declare function describeCompactComposerSelection(snapshot: string): string | undefined;

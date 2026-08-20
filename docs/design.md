@@ -27,6 +27,7 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 - wait if the High button has not hydrated
 - assumed High fallback only when no other compact tier is visible
 - follow-up send is accepted when the composer shows `Stop answering` (not only the old `Stop streaming` label)
+- reply is complete when Stop answering is gone and Send prompt is enabled again — do not wait for `Copy response` count to exceed the previous assistant count (that is what made /sol lag minutes behind the tab)
 
 ## Patch restore
 

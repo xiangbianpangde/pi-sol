@@ -580,15 +580,34 @@ export function describeCompactComposerSelection(snapshot) {
 }
 
 const CHATGPT_STOP_CONTROL_PATTERN = /button "Stop (?:streaming|answering|generating)"/i;
+const CHATGPT_COPY_CONTROL_PATTERN = /button "Copy(?: response| message)?"/g;
+
+/**
+ * True only for the live stop control. Do not match those words inside the reply body —
+ * that kept waitForChatCompletion running for minutes after the tab already showed the answer.
+ * @param {string} snapshot
+ * @returns {boolean}
+ */
+export function snapshotHasChatGptStopControl(snapshot) {
+  return CHATGPT_STOP_CONTROL_PATTERN.test(String(snapshot || ""));
+}
 
 /**
  * @param {string} snapshot
  * @returns {boolean}
  */
-export function snapshotHasChatGptStopControl(snapshot) {
-  const text = String(snapshot || "");
-  if (CHATGPT_STOP_CONTROL_PATTERN.test(text)) return true;
-  return /\bStop (?:streaming|answering|generating)\b/i.test(text);
+export function snapshotHasChatGptSendReady(snapshot) {
+  return parseSnapshotEntries(snapshot).some(
+    (entry) => entry.kind === "button" && entry.label === "Send prompt" && !entry.disabled,
+  );
+}
+
+/**
+ * @param {string} snapshot
+ * @returns {number}
+ */
+export function countChatGptCopyControls(snapshot) {
+  return [...String(snapshot || "").matchAll(CHATGPT_COPY_CONTROL_PATTERN)].length;
 }
 
 export function snapshotHasUsableComposerControls(snapshot) {

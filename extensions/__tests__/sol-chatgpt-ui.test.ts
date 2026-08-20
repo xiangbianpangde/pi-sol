@@ -11,8 +11,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+	countChatGptCopyControls,
 	effortSelectionVisible,
 	snapshotCanSafelySkipModelConfiguration,
+	snapshotHasChatGptSendReady,
 	snapshotHasChatGptStopControl,
 	snapshotHasModelConfigurationUi,
 	snapshotHasModelOpener,
@@ -142,6 +144,19 @@ describe("send-accepted detection on the 2026 composer", () => {
 		assert.equal(snapshotHasChatGptStopControl(streaming), true);
 		assert.equal(snapshotHasChatGptStopControl(HIGH_CLOSED), false);
 		assert.equal(snapshotHasChatGptStopControl('- button "Stop streaming" [ref=e1]'), true);
+		assert.equal(snapshotHasChatGptStopControl('paragraph "Do not Stop answering in prose"'), false);
+	});
+
+	it("treats Send prompt enabled as the reply being done", () => {
+		const idle = `
+- button "Add files and more" [expanded=false, ref=e120]
+- textbox "Chat with ChatGPT" [ref=e121]
+- button "High" [expanded=false, ref=e124]
+- button "Send prompt" [ref=e90]
+`;
+		assert.equal(snapshotHasChatGptSendReady(idle), true);
+		assert.equal(snapshotHasChatGptSendReady(HIGH_CLOSED), false);
+		assert.equal(countChatGptCopyControls('- button "Copy response" [ref=e1]\n- button "Copy message" [ref=e2]'), 2);
 	});
 });
 

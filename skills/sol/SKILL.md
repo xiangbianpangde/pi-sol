@@ -38,7 +38,7 @@ Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `
    - `preset`: `thinking_extended` (maps to GPT-5.6 Sol **High**, Plus max)
    - `files`: only the staged / user-listed paths
    - `followUpJobId` only for `/sol-followup` or `--follow`
-4. If the turn is sync, poll `oracle_read` until terminal, then present the saved answer.
+4. If the turn is sync, poll `oracle_read` every 10–15 seconds until terminal, then present the saved answer. Do not wait a full minute between polls.
 5. If `--bg`, stop after submit and give the job id plus `/sol-read`.
 6. If the job fails with `Could not open effort dropdown` or `Could not find model family control`, run `node ~/.pi/agent/extensions/lib/sol/apply-sol-patches.mjs --restore` yourself, then retry the **same** `thinking_extended` submit once. Do not fall back to Instant/Standard. Do not ask the user to apply patches.
 

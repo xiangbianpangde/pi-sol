@@ -37,6 +37,8 @@ import {
   snapshotHasPowerSliderCompactMenu,
   describeCompactComposerSelection,
   snapshotHasChatGptStopControl,
+  snapshotHasChatGptSendReady,
+  countChatGptCopyControls,
   snapshotHasUsableComposerControls,
   snapshotStronglyMatchesRequestedModel,
   snapshotWeaklyMatchesRequestedModel,
@@ -87,7 +89,7 @@ const MODEL_CONFIGURATION_OPEN_TIMEOUT_MS = 45_000;
 const MODEL_CONFIGURATION_SETTLE_TIMEOUT_MS = 20_000;
 const MODEL_CONFIGURATION_SETTLE_POLL_MS = 250;
 const MODEL_CONFIGURATION_CLOSE_RETRY_MS = 1_000;
-const POST_SEND_SETTLE_MS = 15_000;
+const POST_SEND_SETTLE_MS = 2_000;
 const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
   (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
 ) || "agent-browser";
@@ -1905,24 +1907,33 @@ async function waitForStableChatUrl(job, previousChatUrl) {
   return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
 }
 
-async function waitForChatCompletion(job, baselineAssistantCount) {
+async function waitForChatCompletion(job, baselineAssistantCount, options = {}) {
   const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
+  const baselineCopyCount = Number(options.baselineCopyCount || 0);
   let lastCompletionSignature = "";
   let stableCount = 0;
   let retriedAfterFailure = false;
+  let lastStatusLogAt = 0;
 
   while (Date.now() < timeoutAt) {
     await heartbeat();
     const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
     const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot);
+    const sendReady = isGrokJob(job) ? false : snapshotHasChatGptSendReady(snapshot);
     const hasRetryButton = snapshot.includes('button "Retry"');
-    const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
+    const copyResponseCount = isGrokJob(job)
+      ? (snapshot.match(/button "Copy"/g) || []).length
+      : countChatGptCopyControls(snapshot);
     throwIfProviderTransientError(job, snapshot, "waiting for response completion");
     const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
     const messages = await assistantMessages(job);
     const targetMessage = messages[baselineAssistantCount];
     const targetText = targetMessage?.text || "";
-    const hasTargetCopyResponse = copyResponseCount > baselineAssistantCount;
+    const hasTargetCopyResponse = copyResponseCount > baselineCopyCount || (!hasStopStreaming && sendReady && Boolean(targetText));
+    if (Date.now() - lastStatusLogAt >= 15_000) {
+      lastStatusLogAt = Date.now();
+      await log(`Completion poll: stop=${hasStopStreaming} sendReady=${sendReady} copy=${copyResponseCount}/${baselineCopyCount} msgs=${messages.length}/${baselineAssistantCount} text=${targetText.length}`);
+    }
 
     if (!hasStopStreaming && hasRetryButton && responseFailureText) {
       if (!retriedAfterFailure) {
@@ -2464,6 +2475,7 @@ async function run() {
     await uploadArchive(currentJob);
     await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
     const baselineAssistantCount = (await assistantMessages(currentJob)).length;
+    const baselineCopyCount = countChatGptCopyControls(await snapshotText(currentJob));
     await log(`Assistant response count before send: ${baselineAssistantCount}`);
     await clickSend(currentJob, baselineAssistantCount);
     await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
@@ -2484,7 +2496,7 @@ async function run() {
       patch: awaitingResponsePatch,
     }));
 
-    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount);
+    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount, { baselineCopyCount });
     if (isGrokJob(currentJob) && !currentJob.conversationId) {
       const stableGrokChatUrl = await waitForStableChatUrl(currentJob, undefined);
       const stableGrokConversationId = conversationIdFromUrl(stableGrokChatUrl);

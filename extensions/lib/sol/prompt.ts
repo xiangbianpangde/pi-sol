@@ -41,7 +41,7 @@ function waitRules(wait: boolean): string {
 	return [
 		"Mode: synchronous (default).",
 		"After oracle_submit, poll oracle_read until the job is terminal (completed / failed / cancelled).",
-		"Sleep between polls; do not busy-loop. When complete, present the full saved answer as the advisor reply.",
+		"Sleep 10-15 seconds between polls — not a minute. The ChatGPT tab often shows the answer minutes before the worker marks the job complete.",
 		"If the job is still running after a long wait, report the job id and /sol-read instructions instead of inventing an answer.",
 	].join("\n");
 }

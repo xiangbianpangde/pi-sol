@@ -10,7 +10,7 @@
 
 The extension never drives chatgpt.com. `agent_browser` on ChatGPT hosts is blocked so it cannot steal the oracle session.
 
-Before `oracle_submit`, `lib/sol/admission.ts` takes a short atomic local lease and inspects `$PI_ORACLE_JOBS_DIR` for active ChatGPT jobs (`queued`, `preparing`, `submitted`, `waiting`). This deliberately serializes ChatGPT account submissions across local Pi processes: pi-oracle may support isolated-profile concurrency, but the ChatGPT account-level rate limit makes concurrent `/sol` submissions unsafe. Terminal jobs do not block; a bounded TTL recovers a lease after a crashed Pi process.
+Before `oracle_submit`, `lib/sol/admission.ts` takes a short atomic local lease and inspects `$PI_ORACLE_JOBS_DIR` for active ChatGPT jobs (`queued`, `preparing`, `submitted`, `waiting`). This bounds ChatGPT account submissions across local Pi processes to `maxConcurrentJobs` (default 2, mirrored from pi-oracle's `browser.maxConcurrentJobs`): pi-oracle runs each job in its own isolated browser runtime profile cloned from a single auth seed profile, so concurrent `/sol` submissions are safe up to the provider's account-level capacity. Terminal jobs do not block; a bounded TTL recovers a lease after a crashed Pi process.
 
 ## ChatGPT Plus UI (2026-08)
 
@@ -44,7 +44,7 @@ The admission path is intentionally separate from browser ownership and conversa
 
 1. The `tool_call` hook sees `oracle_submit` before execution.
 2. For ChatGPT (the `/sol` provider), it atomically creates `pi-sol-submit.lock` under the per-user private state dir (`PI_SOL_STATE_DIR`, default `~/.pi/agent/state`).
-3. It reads durable `oracle-*/job.json` records from `$PI_ORACLE_JOBS_DIR` and blocks when any job is still open (malformed records fail closed; other users' job dirs are ignored).
+3. It reads durable `oracle-*/job.json` records from `$PI_ORACLE_JOBS_DIR` and blocks only when the concurrency limit is reached (malformed records fail closed; other users' job dirs are ignored).
 4. The block reason names the active job and tells the model to stop and use `/sol-read <job-id>`; it never changes the preset or silently retries.
 5. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease by removing the fixed lock path only when the owner token still matches. Crashed locks are reclaimed atomically (rename to a unique trash path) only after the owner PID is provably dead and the TTL elapsed.
 

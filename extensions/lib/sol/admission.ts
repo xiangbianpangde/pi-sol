@@ -21,8 +21,10 @@ export function oracleMaxConcurrentJobs(env = process.env): number {
 		const cfgPath = join(env.HOME ?? homedir(), ".pi", "agent", "extensions", "oracle.json");
 		if (existsSync(cfgPath)) {
 			const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
-			const value = Number(cfg?.browser?.maxConcurrentJobs);
-			if (Number.isInteger(value) && value >= 1 && value <= 32) return value;
+			const raw = cfg?.browser?.maxConcurrentJobs;
+			// Strict: must be a JSON number (rejects `true`/`"2"` coercions, and
+			// ensures the mirrored cap is a real integer in [1, 32]).
+			if (typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= 32) return raw;
 		}
 	} catch { /* fall back to the pi-oracle default */ }
 	return 2;
@@ -279,7 +281,7 @@ async function acquireReclaimToken(stateDir: string): Promise<(() => Promise<voi
 	return undefined;
 }
 
-function busyReason(activeJobs: SolJobSummary[], lockPath?: string): string {
+function busyReason(activeJobs: SolJobSummary[], _lockPath?: string): string {
 	if (activeJobs.length > 0) {
 		const shown = activeJobs
 			.slice(0, 3)
@@ -288,10 +290,11 @@ function busyReason(activeJobs: SolJobSummary[], lockPath?: string): string {
 		const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
 		return `ChatGPT /sol concurrency limit reached: active jobs ${shown}${suffix}. Wait for one to finish, then use /sol-read <job-id> and retry.`;
 	}
-	const recovery = lockPath
-		? ` If you are sure no other /sol is running, remove the stale coordination lock: rm -rf ${lockPath}`
-		: "";
-	return `Another Pi session is currently admitting a ChatGPT /sol submission; the admission coordination lock is briefly held. Wait briefly and retry.${recovery}`;
+	// No rm -rf advice: the coordination lock may be legitimately held by a
+	// live oracle_submit that simply took longer than the wait window.  Stale
+	// locks are reclaimed automatically by the protocol (PID dead + TTL); we
+	// never instruct an agent to bypass the generation/reclaim authority.
+	return `Another Pi session is currently admitting a ChatGPT /sol submission; the admission coordination lock is briefly held. Wait briefly and retry.`;
 }
 
 /** Acquire a short-lived cross-Pi admission lease before oracle_submit.
@@ -320,7 +323,7 @@ export async function acquireSolSubmitLease(
 	if (activeJobs.length >= maxConcurrentJobs) {
 		return { acquired: false, reason: busyReason(activeJobs), activeJobs };
 	}
-	for (let attempt = 0; attempt < 6; attempt += 1) {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
 		const staging = await createStagingDir(stateDir);
 		const owner: LeaseOwner = { token, pid: process.pid, createdAt: new Date().toISOString() };
 		const published = await atomicPublishLock(staging, path, owner);
@@ -342,14 +345,25 @@ export async function acquireSolSubmitLease(
 				continue;
 			}
 			// Live holder: wait for the brief oracle_submit call to release it.
-			await new Promise((r) => setTimeout(r, 100));
+			// 250ms × 20 attempts = 5s window (audit round P2-2: 600ms had no
+			// reliable latency contract; 5s covers cold spawn / fs / IPC).
+			await new Promise((r) => setTimeout(r, 250));
 			const active = listActiveSolJobs(jobsDir);
 			if (active.length >= maxConcurrentJobs) {
 				return { acquired: false, reason: busyReason(active), activeJobs: active };
 			}
 			continue;
 		}
-		// Fresh lock atomically published.
+		// Fresh lock atomically published.  AUTHORITATIVE capacity check:
+		// re-scan AFTER acquiring the coordination lock, so the decision is
+		// atomic with the reservation.  A contender that passed an earlier
+		// pre-lock scan cannot slip past the limit while the previous holder
+		// completed its submit and released (audit round P1).
+		const active = listActiveSolJobs(jobsDir);
+		if (active.length >= maxConcurrentJobs) {
+			await rm(path, { recursive: true, force: true }).catch(() => undefined);
+			return { acquired: false, reason: busyReason(active), activeJobs: active };
+		}
 		return { acquired: true, lease: { path, token } };
 	}
 	return { acquired: false, reason: busyReason([], path), activeJobs: listActiveSolJobs(jobsDir) };

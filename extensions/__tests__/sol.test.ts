@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { acquireSolSubmitLease, moveReclaimCandidate, releaseSolSubmitLease, releaseTokenGeneration, restoreMovedGeneration } from "../lib/sol/admission.ts";
+import { acquireSolSubmitLease, moveReclaimCandidate, oracleMaxConcurrentJobs, releaseSolSubmitLease, releaseTokenGeneration, restoreMovedGeneration } from "../lib/sol/admission.ts";
 import { stageSolFiles, validateSolFileMeta } from "../lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard.ts";
 import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
@@ -495,6 +495,53 @@ describe("jobs + prompt", () => {
 			assert.match(formatSolJobSummary(job!), /advisor says hi/);
 		} finally {
 			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves no coordination lock behind when capacity is reached after lock acquisition (audit P1 atomicity)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// Two active jobs already exceed maxConcurrentJobs=2.
+			for (const id of ["active", "active2"]) {
+				const dir = join(jobsDir, `oracle-${id}`);
+				await mkdir(dir, { recursive: true });
+				await writeFile(join(dir, "job.json"), JSON.stringify({ id, status: "waiting", selection: { provider: "chatgpt" } }));
+			}
+			const blocked = await acquireSolSubmitLease(stateDir, jobsDir, 2);
+			assert.equal(blocked.acquired, false);
+			// The freshly-published coordination lock must have been removed
+			// before returning busy — no residue for the next contender to
+			// misinterpret as a live holder.
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			assert.equal(existsSync(lock), false, "coordination lock must not linger after a capacity-rejected acquire");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reads oracle.json maxConcurrentJobs with strict typing and fails back to the default (audit P2-4)", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "sol-cfg-"));
+		const home = join(dir, "fake-home");
+		try {
+			const cfgDir = join(home, ".pi", "agent", "extensions");
+			await mkdir(cfgDir, { recursive: true });
+			const writeCfg = async (json: unknown) => writeFile(join(cfgDir, "oracle.json"), JSON.stringify(json));
+			// Valid integer → used.
+			await writeCfg({ browser: { maxConcurrentJobs: 3 } });
+			assert.equal(oracleMaxConcurrentJobs({ HOME: home } as NodeJS.ProcessEnv), 3);
+			// Boolean `true` must NOT coerce to 1 (Number(true) === 1).
+			await writeCfg({ browser: { maxConcurrentJobs: true } });
+			assert.equal(oracleMaxConcurrentJobs({ HOME: home } as NodeJS.ProcessEnv), 2);
+			// String must not coerce.
+			await writeCfg({ browser: { maxConcurrentJobs: "2" } });
+			assert.equal(oracleMaxConcurrentJobs({ HOME: home } as NodeJS.ProcessEnv), 2);
+			// Out of range → default.
+			await writeCfg({ browser: { maxConcurrentJobs: 99 } });
+			assert.equal(oracleMaxConcurrentJobs({ HOME: home } as NodeJS.ProcessEnv), 2);
+		} finally {
+			await rm(dir, { recursive: true, force: true });
 		}
 	});
 

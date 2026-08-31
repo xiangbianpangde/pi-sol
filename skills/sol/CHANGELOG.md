@@ -1,6 +1,21 @@
 # sol CHANGELOG
 
-## 1.10.0 - 2026-08-31
+## 1.11.0 - 2026-08-31
+
+- **New `/sol-resume [job-id] [--bg]`**: recover the FULL answer of an
+  interrupted /sol job. When an oracle worker's browser dies AFTER the send
+  succeeded, ChatGPT web still completes the answer server-side; the local
+  response was just never captured. /sol-resume continues the SAME ChatGPT
+  conversation (chatGptConversationId from the job record) and asks Sol to
+  re-print the complete final answer, then relays it back.
+- Sol audit final sign-off (22d00e9a): parallel admission PASS with
+  P0=P1=P2=0. Kernel-level flock(2) admission (fs-ext), maxConcurrentJobs
+  default 2, in-lock authoritative capacity check, one-shot release,
+  cross-process + SIGKILL tests, stop-the-world migration guard, filesystem
+  support boundary documented (中英文 README + design 一致).
+- Tests: 113/113.
+
+ - 2026-08-31
 
 - **Parallel /sol submissions (maxConcurrentJobs=2, mirroring pi-oracle)**:
   - pi-sol admission is no longer globally serialized. pi-oracle already runs

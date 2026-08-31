@@ -25,7 +25,7 @@ import {
 	type ParsedSolInput,
 } from "./lib/sol/parse.ts";
 import { ensureSolOraclePatches, formatSolPatchNote } from "./lib/sol/patches.ts";
-import { buildSolAuthPrompt, buildSolDispatchPrompt, buildSolStandingRule, SOL_SKILL_NAME } from "./lib/sol/prompt.ts";
+import { buildSolAuthPrompt, buildSolDispatchPrompt, buildSolResumePrompt, buildSolStandingRule, SOL_SKILL_NAME } from "./lib/sol/prompt.ts";
 import { classifySolTrigger, DETECTOR_RULESET, hashSolText, normalizeSolText } from "./lib/sol/trigger-detect.ts";
 import {
 	defaultSolTriggerLogPath,
@@ -306,6 +306,45 @@ export default function (pi: ExtensionAPI) {
 				await pi.sendUserMessage(formatted);
 			} catch (error) {
 				emit(pi, ctx, error instanceof Error ? error.message : "Usage: /sol-followup <job-id> [--bg] [--files a,b] <prompt>", "warning");
+			}
+		},
+	});
+
+	pi.registerCommand("sol-resume", {
+		description: "Resume an interrupted /sol job whose send succeeded but the browser died (fetch the full answer from the completed ChatGPT conversation)",
+		handler: async (args, ctx) => {
+			try {
+				const input = parseSolInput(`/sol-resume ${args.trim()}`);
+				if (!input || input.command !== "sol-resume") throw new Error("Usage: /sol-resume [job-id] [--bg]");
+				const jobId = input.jobId ?? listRecentSolJobIds().find((id) => {
+					const job = readSolJob(id);
+					return job && job.status !== "complete" && job.conversationId;
+				}) ?? listRecentSolJobIds().find((id) => {
+					const job = readSolJob(id);
+					return job && job.conversationId;
+				});
+				if (!jobId) {
+					emit(pi, ctx, "No recent /sol jobs with a conversationId found. Run /sol first.", "warning");
+					return;
+				}
+				const job = readSolJob(jobId);
+				if (!job) {
+					emit(pi, ctx, `Job ${jobId} not found.`, "warning");
+					return;
+				}
+				if (!job.conversationId && !job.chatUrl) {
+					emit(pi, ctx, `Job ${jobId} has no conversationId — cannot resume. Try /sol-read ${jobId} instead.`, "warning");
+					return;
+				}
+				const formatted = buildSolResumePrompt(job, input.wait);
+				const classification = classifySolTrigger(formatted, { command: "sol-resume", ...input });
+				const session = sessionOf(ctx);
+				seenCommandIds.set(`${session}\u0000${classification.id}`, { session, ts: Date.now() });
+				logSolTrigger(recordFromClassification(classification, { session, phase: "command" }));
+				emit(pi, ctx, input.wait ? `Resuming ChatGPT conversation from job ${jobId}…` : `Dispatching background resume for job ${jobId}…`);
+				await pi.sendUserMessage(formatted);
+			} catch (error) {
+				emit(pi, ctx, error instanceof Error ? error.message : "Usage: /sol-resume [job-id] [--bg]", "warning");
 			}
 		},
 	});

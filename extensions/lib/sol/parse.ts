@@ -1,4 +1,4 @@
-export type SolCommandName = "sol" | "sol-read" | "sol-auth" | "sol-followup";
+export type SolCommandName = "sol" | "sol-read" | "sol-auth" | "sol-followup" | "sol-resume";
 
 export type SolRequest = {
 	command: "sol";
@@ -12,7 +12,8 @@ export type ParsedSolInput =
 	| SolRequest
 	| { command: "sol-read"; jobId?: string }
 	| { command: "sol-auth" }
-	| { command: "sol-followup"; jobId: string; prompt: string; files: string[]; wait: boolean };
+	| { command: "sol-followup"; jobId: string; prompt: string; files: string[]; wait: boolean }
+	| { command: "sol-resume"; jobId?: string; wait: boolean };
 
 const FLAG_ERROR = (message: string) => {
 	const error = new Error(message);
@@ -21,7 +22,7 @@ const FLAG_ERROR = (message: string) => {
 };
 
 export function parseSolSlash(text: string): { command: SolCommandName; args: string } | undefined {
-	const match = text.match(/^\/(sol(?:-read|-auth|-followup)?)(?:\s+([\s\S]*))?$/);
+	const match = text.match(/^\/(sol(?:-read|-auth|-followup|-resume)?)(?:\s+([\s\S]*))?$/);
 	if (!match) return undefined;
 	return { command: match[1] as SolCommandName, args: (match[2] ?? "").trim() };
 }
@@ -140,6 +141,19 @@ export function parseSolInput(text: string): ParsedSolInput | undefined {
 	if (parsed.command === "sol-auth") return { command: "sol-auth" };
 	if (parsed.command === "sol-read") return { command: "sol-read", jobId: parsed.args || undefined };
 	if (parsed.command === "sol-followup") return parseSolArgs(parsed.args, "sol-followup");
+	if (parsed.command === "sol-resume") {
+		// /sol-resume [job-id] [--bg]
+		const tokens = splitArgs(parsed.args);
+		let wait = true;
+		let jobId: string | undefined;
+		for (const token of tokens) {
+			if (token === "--bg" || token === "--async") wait = false;
+			else if (token === "--wait" || token === "--sync") wait = true;
+			else if (!jobId && !token.startsWith("-")) jobId = token;
+			else throw FLAG_ERROR(`Unknown /sol-resume flag: ${token}`);
+		}
+		return { command: "sol-resume", jobId, wait };
+	}
 	return parseSolArgs(parsed.args, "sol");
 }
 
@@ -154,6 +168,9 @@ export function formatSolUserCommand(input: ParsedSolInput): string {
 			.filter(Boolean)
 			.join(" ");
 		return `/sol-followup ${input.jobId}${flags ? ` ${flags}` : ""} ${input.prompt}`;
+	}
+	if (input.command === "sol-resume") {
+		return `/sol-resume${input.jobId ? ` ${input.jobId}` : ""}${input.wait ? "" : " --bg"}`;
 	}
 	const flags = [
 		input.wait ? "" : "--bg",

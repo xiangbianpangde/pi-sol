@@ -17,7 +17,7 @@ import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard
 import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
 import { MAX_IMAGE_BYTES, SOL_PRESET } from "../lib/sol/limits.ts";
 import { parseSolInput } from "../lib/sol/parse.ts";
-import { buildSolDispatchPrompt, buildSolStandingRule } from "../lib/sol/prompt.ts";
+import { buildSolDispatchPrompt, buildSolResumePrompt, buildSolStandingRule } from "../lib/sol/prompt.ts";
 
 describe("parseSolInput", () => {
 	it("parses a plain /sol prompt", () => {
@@ -374,5 +374,27 @@ describe("jobs + prompt", () => {
 
 	it("tells the in-Pi model, not the user, to own worker patches", () => {
 		assert.match(buildSolStandingRule(), /Never ask the user to run apply scripts/);
+	});
+
+	it("parses /sol-resume with and without a job id", () => {
+		assert.deepEqual(parseSolInput("/sol-resume"), { command: "sol-resume", jobId: undefined, wait: true });
+		assert.deepEqual(parseSolInput("/sol-resume abc123 --bg"), { command: "sol-resume", jobId: "abc123", wait: false });
+		assert.deepEqual(parseSolInput("/sol-resume abc123"), { command: "sol-resume", jobId: "abc123", wait: true });
+	});
+
+	it("builds a resume prompt that continues the interrupted conversation", () => {
+		const prompt = buildSolResumePrompt(
+			{ id: "job-1", conversationId: "conv-abc-123", chatUrl: "https://chatgpt.com/c/conv-abc-123" },
+			true,
+		);
+		assert.match(prompt, /conv-abc-123/);
+		assert.match(prompt, /chatGptConversationId/);
+		assert.match(prompt, /re-print the COMPLETE final answer/);
+		assert.match(prompt, /job-1/);
+	});
+
+	it("fails gracefully when the job has no conversationId", () => {
+		const prompt = buildSolResumePrompt({ id: "job-2" }, true);
+		assert.match(prompt, /no conversationId/);
 	});
 });

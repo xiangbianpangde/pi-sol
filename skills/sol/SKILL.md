@@ -3,7 +3,7 @@ name: sol
 description: Relay research and planning questions to ChatGPT web GPT-5.6 Sol High via /sol and pi-oracle. Use before solving hard problems, when the user runs /sol, or when the local model needs a web-Sol advisor. Never drive chatgpt.com with agent_browser.
 compatibility: Pi coding agent
 metadata:
-  version: "1.10.0"
+  version: "1.11.0"
   status: "active"
   layer: "task"
   priority: "30"
@@ -16,7 +16,7 @@ metadata:
 
 ## When to Use
 
-- The user runs `/sol`, `/sol-followup`, `/sol-read`, or `/sol-auth`
+- The user runs `/sol`, `/sol-followup`, `/sol-resume`, `/sol-read`, or `/sol-auth`
 - Before implementing a hard design, you want a second opinion from web GPT-5.6 Sol
 - The user wants to stay in Pi instead of switching to chatgpt.com
 
@@ -27,6 +27,7 @@ Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `
 ```text
 /sol [--bg] [--follow <job-id>] [--files a.pdf,src/a.ts] <prompt>
 /sol-followup <job-id> [--bg] [--files a,b] <prompt>
+/sol-resume [job-id] [--bg]
 /sol-read [job-id]
 /sol-auth
 /sol-diag [--last N] [--candidates]

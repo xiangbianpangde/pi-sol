@@ -9,7 +9,7 @@
  // Bare Instant is the legacy top-level family radio; compact Instant rows are versioned (Instant 5s / Instant 5.5).
  const COMPACT_INTELLIGENCE_CONTROL_PATTERN = /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i;
  const COMPACT_INTELLIGENCE_OPENER_PATTERN = /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i;
-@@ -97,8 +99,144 @@
+@@ -97,8 +99,174 @@
  
  /**
   * @param {string | undefined} value
@@ -62,18 +62,48 @@
 +  const surfaces = [];
 +  const kept = [];
 +  let hasComposer = false;
-+  let composerIndent = -1;
++  let composerContinuationDepth = -1; // depth of the MAIN composer textbox
++  let composerRegionActive = false;   // region active for lines AFTER the textbox
 +  let sidebarDepth = -1;
 +  let i = 0;
++  // A real agent-browser element line always carries an element reference
++  // ([ref=eNNN]).  User-authored text never carries one unless the user
++  // deliberately pastes accessibility-snapshot syntax — which is exactly what
++  // a /sol audit prompt does when it documents a counterexample.  The role
++  // regex therefore REQUIRES the ref marker: role-shaped markdown bullets
++  // (`- dialog "..."`, `- alert "rate limit"`, bare `- status`) can never
++  // become STRONG provider evidence (P1-4 / audit round 6).
++  const ROLE_WITH_REF = /^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s+"[^"]*"\s+\[ref=|\s+\[ref=)/i;
 +  const markComposer = (line, indent) => {
 +    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
 +      hasComposer = true;
-+      composerIndent = indent;
++      // agent-browser renders a multi-line composer value as bare lines at
++      // indent 0 after the textbox element.  From the NEXT line onward,
++      // everything is user-authored until a REAL element line (ref marker at
++      // indent >= composer depth) shows up — that is the next page element.
++      composerContinuationDepth = indent;
 +    }
 +  };
 +  while (i < lines.length) {
 +    const line = lines[i];
 +    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
++    // Composer value-continuation region: after the composer textbox, every
++    // line that is shallower than the composer (indent < composer depth), or
++    // at the composer's depth WITHOUT a ref marker, is part of the composer
++    // VALUE (user-authored).  Only a real element line (ref marker) at indent
++    // >= the composer's indent ends the region.  This check runs BEFORE
++    // markComposer on the current line, so the textbox line itself is never
++    // swallowed by the region it creates (audit round 6 P1).
++    if (composerRegionActive) {
++      const hasRef = /\[ref=/i.test(line);
++      if (indent < composerContinuationDepth || (indent >= composerContinuationDepth && !hasRef)) {
++        kept.push(line);
++        i += 1;
++        continue;
++      }
++      // Real element at/beyond composer depth: the composer value region ends.
++      composerRegionActive = false;
++    }
 +    if (sidebarDepth >= 0) {
 +      if (indent <= sidebarDepth) sidebarDepth = -1;
 +      else { i += 1; continue; }
@@ -84,18 +114,16 @@
 +      continue;
 +    }
 +    markComposer(line, indent);
-+    // Composer-depth tracking: once we've seen the composer textbox, its
-+    // value continuation subtree (deeper-indented lines) is user-authored
-+    // text.  Skip roleMatch for those lines even if they happen to look like
-+    // `- dialog "title"` inside the prompt (P1-4).
-+    if (composerIndent >= 0 && indent > composerIndent) {
-+      kept.push(line);
-+      i += 1;
-+      continue;
++    // If markComposer just recorded the main composer, activate the region
++    // for subsequent lines (only the main composer textbox creates a region).
++    if (composerContinuationDepth >= 0) {
++      composerRegionActive = true;
 +    }
-+    // provider error surface role: match the role word followed by whitespace,
-+    // end of line, or a bracket (handles both named and unnamed roles)
-+    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s+"|\s+\[ref=|\s*$)/i);
++    // provider error surface role: a REAL element must carry its element
++    // reference marker ([ref=...]).  This excludes literal user text that
++    // happens to start with `- role` (e.g. a markdown list in the user's
++    // prompt) — P1-4 / audit round 6.
++    const roleMatch = line.match(ROLE_WITH_REF);
 +    if (roleMatch) {
 +      // Positive-scope collection over the WHOLE error-role subtree: we only
 +      // keep descendant lines whose accessibility kind is paragraph or a
@@ -112,7 +140,9 @@
 +          const childLine = lines[i];
 +          if (childLine.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(childLine))) {
 +            hasComposer = true;
-+            composerIndent = childIndent; // track composer in subtree
++            // Inner textbox inside an error-role subtree: mark composer but do
++            // NOT create a continuation region (only the main composer
++            // textbox's region extends beyond its subtree).
 +          } else {
 +            const childKind = childLine.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
 +            const kindName = childKind ? childKind[1] : "";
@@ -154,10 +184,12 @@
  export function stripChatGptResponseChrome(value) {
    return String(value || "")
      .split("\n")
-@@ -256,8 +394,51 @@
+@@ -254,10 +422,53 @@
+   return entries.some(
+     (entry) => entry.kind === "button" && /click to remove/i.test(String(entry.label || "")) && parseComposerChipSelection(entry.label),
    );
- }
- 
++}
++
 +function hasLegacyCompactIntelligenceMenu(entries) {
 +  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +    || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && Boolean(parseCompactIntelligenceSelection(entry.label)));
@@ -177,8 +209,8 @@
 +    }
 +    return false;
 +  });
-+}
-+
+ }
+ 
 +function detectPowerSliderSelection(entries) {
 +  if (!isPowerSliderCompactMenu(entries)) return undefined;
 +  for (const entry of entries) {
@@ -207,7 +239,7 @@
      || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && checkedState(entry) === true && compactSelectionFromEntry(entry, entries));
  }
  
-@@ -351,6 +532,9 @@
+@@ -351,6 +562,9 @@
    if (hasRemovableComposerModelChip(entries)) return undefined;
    if (hasLegacyEffortCombobox(entries)) return undefined;
  
@@ -217,7 +249,7 @@
    for (const entry of entries) {
      if (entry.kind !== "menuitemradio" || checkedState(entry) !== true) continue;
      const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: false });
-@@ -361,7 +545,7 @@
+@@ -361,7 +575,7 @@
  
    for (const entry of entries) {
      if (entry.kind !== "button") continue;
@@ -226,7 +258,7 @@
      if (!compactSelection) continue;
      return compactSelection;
    }
-@@ -444,6 +628,17 @@
+@@ -444,6 +658,17 @@
    /** @type {SnapshotEntry[]} */
    const entries = parseSnapshotEntries(snapshot);
    const normalizedEffort = effortLabel.toLowerCase();
@@ -244,7 +276,7 @@
    const compactClosedButtonsAllowed = !hasRemovableComposerModelChip(entries) && !hasLegacyEffortCombobox(entries) && !hasCompactIntelligenceMenuContext(entries);
    return entries.some((entry) => {
      if (entry.disabled) return false;
-@@ -496,20 +691,79 @@
+@@ -496,20 +721,79 @@
    const visibleCompactControls = entries.filter(
      (entry) => !entry.disabled && entry.kind === "menuitemradio" && compactSelectionFromEntry(entry, entries),
    );
@@ -285,25 +317,25 @@
 + */
 +export function snapshotHasChatGptStopControl(snapshot) {
 +  return CHATGPT_STOP_CONTROL_PATTERN.test(String(snapshot || ""));
-+}
-+
-+/**
-+ * @param {string} snapshot
-+ * @returns {boolean}
-+ */
+ }
+ 
+ /**
+  * @param {string} snapshot
+  * @returns {boolean}
+  */
 +export function snapshotHasChatGptSendReady(snapshot) {
 +  return parseSnapshotEntries(snapshot).some(
 +    (entry) => entry.kind === "button" && entry.label === "Send prompt" && !entry.disabled,
 +  );
- }
- 
- /**
++}
++
++/**
 + * After a reply finishes the empty composer shows Voice, not Send prompt.
 + * That idle chrome means ChatGPT is done; requiring Send prompt kept /sol
 + * polling for tens of minutes after the tab already had the answer.
-  * @param {string} snapshot
-  * @returns {boolean}
-  */
++ * @param {string} snapshot
++ * @returns {boolean}
++ */
 +export function snapshotHasChatGptComposerIdle(snapshot) {
 +  if (snapshotHasChatGptStopControl(snapshot)) return false;
 +  const entries = parseSnapshotEntries(snapshot);

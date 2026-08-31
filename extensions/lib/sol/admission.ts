@@ -148,6 +148,52 @@ async function sweepStaleStaging(stateDir: string): Promise<void> {
 }
 
 /**
+ * Move the current reclaim-token generation away and verify it is EXACTLY the
+ * observed (dead) generation.  Returns keep=true only when the caller may
+ * discard the moved dir and continue reclaiming.  When a newer LIVE
+ * generation replaced the fixed path between readOwner and this call, the
+ * moved dir is RESTORED (or cleaned up if the path was re-occupied), and
+ * keep=false — the caller does NOT own the token (audit round 6 P1-2).
+ * @internal exported for deterministic interleaving tests
+ */
+export async function moveReclaimCandidate(
+	tokenPath: string,
+	observed: Partial<LeaseOwner> | undefined,
+): Promise<{ moved: boolean; keep: boolean }> {
+	const { moved, trash } = await atomicRenameAway(tokenPath);
+	if (!moved) return { moved: false, keep: false };
+	const movedOwner = await readOwner(trash!);
+	if (movedOwner && observed && movedOwner.token === observed.token) {
+		await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+		return { moved: true, keep: true };
+	}
+	// Mismatch: a newer live generation was moved. Restore it so the current
+	// holder keeps authority; if the path was already re-occupied, drop the
+	// orphaned trash rather than leak a stale dir.
+	const restored = await rename(trash!, tokenPath)
+		.then(() => true)
+		.catch(() => false);
+	if (!restored) {
+		await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+	}
+	return { moved: true, keep: false };
+}
+
+/**
+ * Generation-safe release: only remove the fixed path while it is STILL our
+ * generation.  A concurrent reclaim may have replaced us with a newer live
+ * token; removing that would delete another holder's serialization token
+ * (audit round 6 P1-2).
+ * @internal exported for deterministic tests
+ */
+export async function releaseTokenGeneration(tokenPath: string, owner: LeaseOwner): Promise<void> {
+	const current = await readOwner(tokenPath);
+	if (current?.token === owner.token) {
+		await rm(tokenPath, { recursive: true, force: true }).catch(() => undefined);
+	}
+}
+
+/**
  * Acquire the reclaim token: an atomically-published directory that
  * serializes ALL mutations of the fixed lock path (stale reclaim and release).
  * Holding the token while verifying staleness and renaming binds the stale
@@ -169,18 +215,19 @@ async function acquireReclaimToken(stateDir: string): Promise<(() => Promise<voi
 			return async () => {
 				if (released) return;
 				released = true;
-				await rm(tokenPath, { recursive: true, force: true }).catch(() => undefined);
+				// Generation-safe release: only remove the fixed path while it is
+				// STILL our generation.  A concurrent reclaim may have replaced
+				// us with a newer live token; removing that would delete another
+				// holder's serialization token (audit round 6 P1-2).
+				await releaseTokenGeneration(tokenPath, owner);
 			};
 		}
 		// EEXIST: another process holds the token. Reclaim only if its owner
 		// is provably dead (atomic-published tokens always carry owner.json).
 		const existing = await readOwner(tokenPath);
 		if (existing && !pidAlive(Number(existing.pid))) {
-			const { moved, trash } = await atomicRenameAway(tokenPath);
-			if (moved) {
-				await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
-				continue;
-			}
+			const { moved, keep } = await moveReclaimCandidate(tokenPath, existing);
+			if (moved && keep) continue; // safe: the dead generation is gone; try publishing ours
 		}
 		return undefined;
 	}

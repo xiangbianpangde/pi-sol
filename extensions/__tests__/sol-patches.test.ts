@@ -190,4 +190,37 @@ describe("ensureSolOraclePatches", () => {
 			rmSync(vendor, { recursive: true, force: true });
 		}
 	});
+
+	it("carries a marker for the audit round 6 sanitizer fix so old workers redeploy (P1-3)", () => {
+		// The ROLE_WITH_REF constant must be a helper marker: a round-5 worker
+		// that has every older marker but lacks ROLE_WITH_REF must fail
+		// missingMarkers() and get the new vendor worker copied back.
+		assert.ok(SOL_PATCH_MARKERS.helpers.some((m) => m.includes("ROLE_WITH_REF")), "ROLE_WITH_REF missing from SOL_PATCH_MARKERS.helpers");
+		assert.match(readFileSync(join(VENDOR, "chatgpt-ui-helpers.mjs"), "utf8"), /ROLE_WITH_REF/);
+	});
+
+	it("detects that a round-5 helper (no ROLE_WITH_REF) is missing the audit round 6 marker", () => {
+		const { root, worker } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			// Seed the worker with current vendor copies (as an installed,
+			// previously-patched worker would have), then strip ROLE_WITH_REF to
+			// simulate a round-5 helper. run-job keeps all markers so only the
+			// missing helper marker can drive redeploy.
+			for (const name of WORKER_FILES) copyFileSync(join(vendor, name), join(worker, name));
+			const fullHelpers = readFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "utf8");
+			const oldHelpers = fullHelpers.replace(/const ROLE_WITH_REF[^;]+;/, "");
+			assert.notEqual(oldHelpers, fullHelpers, "fixture must actually strip ROLE_WITH_REF");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), oldHelpers);
+			const result = ensureSolOraclePatches({ root, vendor });
+			// The old worker must be detected as missing the marker and restored
+			// with the vendored helper (copy back), not accepted as-is.
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true);
+			assert.match(readFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "utf8"), /ROLE_WITH_REF/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
 });

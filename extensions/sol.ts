@@ -268,9 +268,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		// Longer retry budget on shutdown, and only drop leases that were
 		// actually released so we never forget a still-held lock.
-		for (const lease of [...submitLeases.values()]) {
+		for (const [toolCallId, lease] of [...submitLeases.entries()]) {
 			const released = await releaseSolSubmitLease(lease, { maxAttempts: 100, retryMs: 100 });
-			if (released) submitLeases.delete(lease);
+			if (released) submitLeases.delete(toolCallId);
 		}
 	});
 

@@ -1,6 +1,30 @@
 # sol CHANGELOG
 
-## 1.8.0 - 2026-08-31
+## 1.9.0 - 2026-08-31
+
+- **Sol audit round 6 (8438259 fixes 3 P1 + 1 P2 + 1 P3; re-audited at d415ef11)**:
+  - P1 exact-role-shaped markdown: the role regex now REQUIRES the element
+    reference marker (`[ref=...]`) and the composer value-continuation region
+    (bare lines after the textbox until the next real element) swallows every
+    line without a ref marker — `- dialog "..."`, `- alert "rate limit"`, bare
+    `- status`, even `- alert [ref=...]` lookalikes in a /sol prompt can no
+    longer become STRONG provider evidence.
+  - P1 reclaim-token generation binding: moveReclaimCandidate verifies the
+    moved dir is EXACTLY the observed dead generation before discarding it;
+    a stale proof for an older generation now restores a newer live token
+    instead of deleting it. releaseTokenGeneration only removes the path while
+    it is still our generation.
+  - P1 sanitizer deployment marker: ROLE_WITH_REF added to
+    SOL_PATCH_MARKERS.helpers so an old worker (all Power-slider markers
+    present, missing ROLE_WITH_REF) is detected and redeployed.
+  - P2 composer region scope: region ends at the next real element line, so
+    sibling containers' nested provider alerts are no longer swallowed.
+  - P3: session_shutdown deletes leases by toolCallId key, not lease object.
+  - Tests: 116/116 (generation-binding reclaim race, old-holder release,
+    exact-role-shaped markdown, fake-ref lookalike, sibling-subtree alert,
+    region-end, deployment-marker redeploy).
+
+ - 2026-08-31
 
 - **Sol audit round 5 (186690d2, FAIL 4 P1 → fixes)**:
   - P1 atomic publish: submit lock and reclaim token are now published by

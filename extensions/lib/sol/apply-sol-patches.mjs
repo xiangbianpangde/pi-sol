@@ -46,6 +46,11 @@ export const SOL_PATCH_MARKERS = {
 		"LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN",
 		"POWER_SLIDER_MENUITEM_PATTERN",
 		"export function snapshotHasPowerSliderCompactMenu",
+		// Audit round 6: role regex requires the element ref marker; old workers
+		// without this marker must be redeployed even though all Power-slider
+		// markers are present (a stale helper would re-open the composer
+		// role-shaped-markdown false positive).
+		"const ROLE_WITH_REF",
 	],
 	runJob: [
 		"async function waitForChatGptModelPicker",

@@ -475,4 +475,57 @@ describe("provider blocker evidence — audit round 3 boundaries", () => {
 		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
 		assert.match(evidence.surfaces, /Too many requests/);
 	});
+
+	it("does NOT treat an exact role-shaped markdown line as a provider element (audit round 6 P1)", () => {
+		// A /sol audit prompt literally documents the counterexample it wants
+		// checked: `- dialog "Too many requests"` is valid accessibility-snapshot
+		// syntax but it is USER text (the composer value), not a provider element.
+		// It must never become STRONG evidence.
+		const snapshot = `
+  - textbox "Chat with ChatGPT" [ref=e122]: 请审核下面的例子
+- dialog "Too many requests"
+- alert "rate limit"
+- status
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.equal(evidence.surfaces, "");
+		assert.equal(evidence.hasComposer, true);
+	});
+
+	it("does NOT treat an exact role-shaped markdown line WITH a fake ref as a provider element (audit round 6 P1)", () => {
+		// The strongest counterexample: user text that includes a ref marker
+		// lookalike (`- alert [ref=e999]`).  It is still the composer VALUE
+		// continuation (bare line after the composer), not a real element.
+		const snapshot = `
+  - textbox "Chat with ChatGPT" [ref=e122]: 请审核下面的例子
+- alert [ref=e999]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.equal(evidence.surfaces, "");
+		assert.equal(evidence.hasComposer, true);
+	});
+
+	it("still detects a real provider alert in a sibling container's subtree (audit round 6 P2)", () => {
+		// The composer region must end at the next REAL element line, so a real
+		// alert nested inside a sibling container is still STRONG evidence.
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e122]
+- generic "provider shell" [ref=e200]
+  - alert "Too many requests" [ref=e210]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.match(evidence.surfaces, /Too many requests/);
+	});
+
+	it("ends the composer region at the next real element so later provider errors are still detected (audit round 6 P2)", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e122]: 请审核下面的例子
+- dialog → paragraph "Too many requests" → 示例文本
+- button "Send prompt" [ref=e119]
+- alert "You've hit your rate limit" [ref=e210]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.ok(!/示例文本/.test(evidence.surfaces), `prompt text leaked: ${evidence.surfaces}`);
+		assert.match(evidence.surfaces, /rate limit/);
+	});
 });

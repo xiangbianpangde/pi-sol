@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { acquireSolSubmitLease, releaseSolSubmitLease } from "../lib/sol/admission.ts";
+import { acquireSolSubmitLease, moveReclaimCandidate, releaseSolSubmitLease, releaseTokenGeneration } from "../lib/sol/admission.ts";
 import { stageSolFiles, validateSolFileMeta } from "../lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard.ts";
 import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
@@ -330,6 +330,50 @@ describe("jobs + prompt", () => {
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("binds reclaim to the observed generation: a stale proof cannot delete a newer live token (audit round 6 P1-2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		try {
+			// R1 and R2 both read dead token A; R2 renames A away and publishes
+			// live token B. R1's stale proof for A must NOT be able to delete B.
+			const tokenPath = join(stateDir, "pi-sol-submit.reclaim-token");
+			await mkdir(tokenPath, { recursive: true });
+			await writeFile(join(tokenPath, "owner.json"), JSON.stringify({ token: "A", pid: 999999, createdAt: new Date().toISOString() }));
+			// R1 already read A (observed=dead A). R2 now moves it away and
+			// publishes live B.
+			const r2 = await moveReclaimCandidate(tokenPath, { token: "A" });
+			assert.equal(r2.moved, true);
+			assert.equal(r2.keep, true); // matched the observed dead generation
+			await mkdir(tokenPath, { recursive: true });
+			await writeFile(join(tokenPath, "owner.json"), JSON.stringify({ token: "B", pid: process.pid, createdAt: new Date().toISOString() }));
+			// R1 resumes with its stale proof for A; the fixed path now holds B.
+			const r1 = await moveReclaimCandidate(tokenPath, { token: "A" });
+			assert.equal(r1.moved, true);
+			assert.equal(r1.keep, false); // generation mismatch — must not claim
+			// The live generation B must still be in place (restored), and its
+			// owner file intact.
+			const after = JSON.parse(await (await import("node:fs/promises")).readFile(join(tokenPath, "owner.json"), "utf8"));
+			assert.equal(after.token, "B");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("releases only its own generation: an old holder cannot delete a newer live token (audit round 6 P1-2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		try {
+			const tokenPath = join(stateDir, "pi-sol-submit.reclaim-token");
+			await mkdir(tokenPath, { recursive: true });
+			// Old holder's release closure runs while a NEWER live token B
+			// occupies the path.
+			await writeFile(join(tokenPath, "owner.json"), JSON.stringify({ token: "B", pid: process.pid, createdAt: new Date().toISOString() }));
+			await releaseTokenGeneration(tokenPath, { token: "old", pid: process.pid, createdAt: new Date().toISOString() });
+			const after = JSON.parse(await (await import("node:fs/promises")).readFile(join(tokenPath, "owner.json"), "utf8"));
+			assert.equal(after.token, "B", "newer live token must survive an old holder's release");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
 		}
 	});
 

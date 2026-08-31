@@ -148,18 +148,48 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
   const surfaces = [];
   const kept = [];
   let hasComposer = false;
-  let composerIndent = -1;
+  let composerContinuationDepth = -1; // depth of the MAIN composer textbox
+  let composerRegionActive = false;   // region active for lines AFTER the textbox
   let sidebarDepth = -1;
   let i = 0;
+  // A real agent-browser element line always carries an element reference
+  // ([ref=eNNN]).  User-authored text never carries one unless the user
+  // deliberately pastes accessibility-snapshot syntax — which is exactly what
+  // a /sol audit prompt does when it documents a counterexample.  The role
+  // regex therefore REQUIRES the ref marker: role-shaped markdown bullets
+  // (`- dialog "..."`, `- alert "rate limit"`, bare `- status`) can never
+  // become STRONG provider evidence (P1-4 / audit round 6).
+  const ROLE_WITH_REF = /^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s+"[^"]*"\s+\[ref=|\s+\[ref=)/i;
   const markComposer = (line, indent) => {
     if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
       hasComposer = true;
-      composerIndent = indent;
+      // agent-browser renders a multi-line composer value as bare lines at
+      // indent 0 after the textbox element.  From the NEXT line onward,
+      // everything is user-authored until a REAL element line (ref marker at
+      // indent >= composer depth) shows up — that is the next page element.
+      composerContinuationDepth = indent;
     }
   };
   while (i < lines.length) {
     const line = lines[i];
     const indent = (line.match(/^\s*/)?.[0].length ?? 0);
+    // Composer value-continuation region: after the composer textbox, every
+    // line that is shallower than the composer (indent < composer depth), or
+    // at the composer's depth WITHOUT a ref marker, is part of the composer
+    // VALUE (user-authored).  Only a real element line (ref marker) at indent
+    // >= the composer's indent ends the region.  This check runs BEFORE
+    // markComposer on the current line, so the textbox line itself is never
+    // swallowed by the region it creates (audit round 6 P1).
+    if (composerRegionActive) {
+      const hasRef = /\[ref=/i.test(line);
+      if (indent < composerContinuationDepth || (indent >= composerContinuationDepth && !hasRef)) {
+        kept.push(line);
+        i += 1;
+        continue;
+      }
+      // Real element at/beyond composer depth: the composer value region ends.
+      composerRegionActive = false;
+    }
     if (sidebarDepth >= 0) {
       if (indent <= sidebarDepth) sidebarDepth = -1;
       else { i += 1; continue; }
@@ -170,18 +200,16 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
       continue;
     }
     markComposer(line, indent);
-    // Composer-depth tracking: once we've seen the composer textbox, its
-    // value continuation subtree (deeper-indented lines) is user-authored
-    // text.  Skip roleMatch for those lines even if they happen to look like
-    // `- dialog "title"` inside the prompt (P1-4).
-    if (composerIndent >= 0 && indent > composerIndent) {
-      kept.push(line);
-      i += 1;
-      continue;
+    // If markComposer just recorded the main composer, activate the region
+    // for subsequent lines (only the main composer textbox creates a region).
+    if (composerContinuationDepth >= 0) {
+      composerRegionActive = true;
     }
-    // provider error surface role: match the role word followed by whitespace,
-    // end of line, or a bracket (handles both named and unnamed roles)
-    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s+"|\s+\[ref=|\s*$)/i);
+    // provider error surface role: a REAL element must carry its element
+    // reference marker ([ref=...]).  This excludes literal user text that
+    // happens to start with `- role` (e.g. a markdown list in the user's
+    // prompt) — P1-4 / audit round 6.
+    const roleMatch = line.match(ROLE_WITH_REF);
     if (roleMatch) {
       // Positive-scope collection over the WHOLE error-role subtree: we only
       // keep descendant lines whose accessibility kind is paragraph or a
@@ -198,7 +226,9 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
           const childLine = lines[i];
           if (childLine.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(childLine))) {
             hasComposer = true;
-            composerIndent = childIndent; // track composer in subtree
+            // Inner textbox inside an error-role subtree: mark composer but do
+            // NOT create a continuation region (only the main composer
+            // textbox's region extends beyond its subtree).
           } else {
             const childKind = childLine.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
             const kindName = childKind ? childKind[1] : "";

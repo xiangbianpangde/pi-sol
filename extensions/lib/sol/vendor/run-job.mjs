@@ -46,6 +46,7 @@ import {
   autoSwitchToThinkingSelectionVisible,
   stripChatGptResponseChrome,
   sanitizeProviderBlockerSnapshot as sanitizeProviderBlockerSnapshotHelper,
+  classifyProviderBlockerEvidence,
 } from "./chatgpt-ui-helpers.mjs";
 import { assistantSnapshotSlice, conversationIdFromUrl, nextStableValueState, providerSendAccepted, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
 import { normalizeLoginProbeResult } from "./auth-flow-helpers.mjs";
@@ -1265,6 +1266,20 @@ function sanitizeProviderBlockerSnapshot(snapshot, job = currentJob) {
   });
 }
 
+function providerBlockerEvidence(job, snapshot) {
+  const labels = labelsForJob(job);
+  const { surfaces, fallback } = classifyProviderBlockerEvidence(snapshot, {
+    composerLabel: labels.composer,
+    isGrok: isGrokJob(job),
+  });
+  return {
+    // STRONG: provider error-role subtree explicitly reports a blocker.
+    strong: detectProviderVisibleBlockerText(surfaces),
+    // WEAK: no composer + no conversation chrome; needs consecutive frames.
+    weak: detectProviderVisibleBlockerText(fallback),
+  };
+}
+
 function providerTransientErrorMessage(job, snapshot, context) {
   // Rate-limit/outage detection only ever consults provider-owned error
   // surfaces, never user-authored conversation/composer/sidebar text.
@@ -1396,7 +1411,17 @@ async function sendAcceptanceState(job, baselineAssistantCount) {
     urlKnown: urlResult.ok,
     assistantCount: Math.max(baselineAssistantCount, messages.length),
     stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
-    transientErrorText: detectProviderVisibleBlockerText(sanitizeProviderBlockerSnapshot(snapshot, job)) || "",
+    transientErrorText: (() => {
+      const ev = providerBlockerEvidence(job, snapshot);
+      // Strong evidence (error-role subtree) is immediate; weak evidence
+      // (composer-absent fallback) is returned separately for multi-frame confirmation.
+      if (ev.strong) return ev.strong;
+      return "";
+    })(),
+    weakBlockerText: (() => {
+      const ev = providerBlockerEvidence(job, snapshot);
+      return ev.strong ? "" : ev.weak;
+    })(),
   };
 }
 
@@ -1413,11 +1438,18 @@ async function clickSend(job, baselineAssistantCount) {
 }
 
 async function waitForSendAccepted(job, beforeSend, options = {}) {
+  let weakBlockerFrames = 0;
   const timeoutAt = Date.now() + (options.timeoutMs || 15_000);
   while (Date.now() < timeoutAt) {
     await heartbeat();
     const afterSend = await sendAcceptanceState(job, beforeSend.assistantCount || 0);
     if (afterSend.transientErrorText) throw new Error(formatProviderTransientErrorMessage(job, afterSend.transientErrorText, "waiting for send acceptance"));
+    if (afterSend.weakBlockerText) {
+      weakBlockerFrames += 1;
+      if (weakBlockerFrames >= 3) {
+        throw new Error(formatProviderTransientErrorMessage(job, afterSend.weakBlockerText, "waiting for send acceptance (weak, 3 consecutive frames)"));
+      }
+    } else weakBlockerFrames = 0;
     if (providerSendAccepted(beforeSend, afterSend)) return true;
     await sleep(500);
   }
@@ -1922,6 +1954,7 @@ async function waitForStableChatUrl(job, previousChatUrl) {
 }
 
 async function waitForChatCompletion(job, baselineAssistantCount, options = {}) {
+  let weakBlockerFrames = 0;
   const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
   const baselineCopyCount = Number(options.baselineCopyCount || 0);
   const baselineLastText = String(options.baselineLastText || "");
@@ -1940,7 +1973,18 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
     const copyResponseCount = isGrokJob(job)
       ? (snapshot.match(/button "Copy"/g) || []).length
       : countChatGptCopyControls(snapshot);
-    throwIfProviderTransientError(job, snapshot, "waiting for response completion");
+    {
+      const ev = providerBlockerEvidence(job, snapshot);
+      if (ev.strong) {
+        throw new Error(formatProviderTransientErrorMessage(job, ev.strong, "waiting for response completion"));
+      }
+      if (ev.weak) {
+        weakBlockerFrames += 1;
+        if (weakBlockerFrames >= 3) {
+          throw new Error(formatProviderTransientErrorMessage(job, ev.weak, "waiting for response completion (weak, 3 consecutive frames)"));
+        }
+      } else weakBlockerFrames = 0;
+    }
     const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
     const messages = await assistantMessages(job);
     const lastText = messages.at(-1)?.text || "";

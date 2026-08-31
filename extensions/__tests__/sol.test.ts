@@ -194,6 +194,68 @@ describe("jobs + prompt", () => {
 		}
 	});
 
+	it("does not release a newer generation when given an old token", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "gen-b", pid: process.pid, createdAt: new Date().toISOString() }));
+			// A stale release carrying an old token must NOT remove the live generation B.
+			await releaseSolSubmitLease({ path: lock, token: "gen-a" });
+			const owner = JSON.parse(await (await import("node:fs/promises")).readFile(join(lock, "owner.json"), "utf8"));
+			assert.equal(owner.token, "gen-b");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("concurrent releases of the same lease are generation-safe", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "gen-b", pid: process.pid, createdAt: new Date().toISOString() }));
+			const lease = { path: lock, token: "gen-b" };
+			await Promise.all([releaseSolSubmitLease(lease), releaseSolSubmitLease(lease)]);
+			// After both releases, a fresh acquire must succeed (no residue).
+			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(acquired.acquired, true);
+			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("a stale reclaim cannot delete a live generation that appeared after staleness check", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// Simulate the audit race: R1 and R2 both observe stale A, R2 reclaims A
+			// and creates live B. R1 must NOT be able to rename+delete B.
+			// Under the new protocol the reclaim token serializes mutations, so a
+			// second acquire sees live B and returns busy.
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "dead-a", pid: 999999, createdAt: new Date().toISOString() }));
+			const old = new Date(Date.now() - 16 * 60 * 1000);
+			await utimes(lock, old, old);
+			// R2 wins the first acquire: reclaims A, creates live B.
+			const r2 = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(r2.acquired, true);
+			// Now live B exists. R1 (another acquire) must be blocked and B must survive.
+			const r1 = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(r1.acquired, false);
+			if (r2.acquired) await releaseSolSubmitLease(r2.lease);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("blocks admission while another ChatGPT job is active and recovers after it ends", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));

@@ -125,13 +125,34 @@ const CONVERSATION_CHROME_PATTERNS = Object.freeze([
  * @param {{ composerLabel: string; isGrok?: boolean }} labels
  * @returns {string}
  */
-export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGrok = false }) {
+/**
+ * Classify provider blocker evidence in an accessibility snapshot.
+ *
+ * Returns structured evidence so callers can apply different thresholds:
+ * - `surfaces`: full subtree text of provider-owned error roles
+ *   (alert/status/dialog/banner/log). Matching here is STRONG evidence:
+ *   provider UI explicitly reported a rate-limit/outage.
+ * - `fallback`: sidebar-stripped page text, populated ONLY when the page has
+ *   no composer AND no conversation chrome (Copy/Stop/Edit/Share/…). This is
+ *   WEAK evidence: a transient post-send rerender may briefly lack both, so
+ *   callers must require several consecutive frames before treating it as a
+ *   real full-page outage. User conversation text is never returned as strong
+ *   evidence.
+ *
+ * @param {string} snapshot agent-browser `snapshot -i` accessibility text
+ * @param {{ composerLabel: string; isGrok?: boolean }} labels
+ * @returns {{ surfaces: string; fallback: string; hasComposer: boolean }}
+ */
+export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGrok = false }) {
   const lines = String(snapshot || "").split("\n");
   const surfaces = [];
   const kept = [];
   let hasComposer = false;
   let sidebarDepth = -1;
   let i = 0;
+  const markComposer = (line) => {
+    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) hasComposer = true;
+  };
   while (i < lines.length) {
     const line = lines[i];
     const indent = (line.match(/^\s*/)?.[0].length ?? 0);
@@ -144,38 +165,52 @@ export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGro
       i += 1;
       continue;
     }
-    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
-      hasComposer = true;
-    }
+    markComposer(line);
     // provider error surface role: match the role word followed by whitespace,
     // end of line, or a bracket (handles both named and unnamed roles)
     const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
     if (roleMatch) {
-      // Collect this line plus all descendant lines (greater indentation)
+      // Collect this line plus all descendant lines (greater indentation).
+      // Composer detection still runs inside the subtree (a textbox nested in
+      // a dialog must count as the composer).
       surfaces.push(line);
       i += 1;
       while (i < lines.length) {
         const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
-        if (childIndent > indent) { surfaces.push(lines[i]); i += 1; }
-        else break;
+        if (childIndent > indent) {
+          markComposer(lines[i]);
+          surfaces.push(lines[i]);
+          i += 1;
+        } else break;
       }
       continue;
     }
     kept.push(line);
     i += 1;
   }
-  const surfaceText = surfaces.join("\n");
-  if (/(too many requests|rate limit)/i.test(surfaceText)) return surfaceText;
-  // Full-page outage fallback: only when the page has no composer AND no
-  // conversation chrome.  A transient UI rerender (e.g., after send) may
-  // temporarily lack the composer but still show conversation controls;
-  // scanning the full page in that case would re-introduce the false positive.
+  // Weak fallback: only when the page has no composer AND no conversation
+  // chrome. A transient UI rerender may briefly lack the composer while still
+  // showing user text; the caller must require multiple consecutive frames.
   const hasConversationChrome = lines.some((l) => CONVERSATION_CHROME_PATTERNS.some((p) => l.includes(p)));
-  if (!hasComposer && !hasConversationChrome) return kept.join("\n");
-  return "";
+  const fallback = !hasComposer && !hasConversationChrome ? kept.join("\n") : "";
+  return { surfaces: surfaces.join("\n"), fallback, hasComposer };
 }
 
-
+/**
+ * Positive-scope provider blocker sanitization (strong evidence only).
+ *
+ * Returns the error-surface subtree text for immediate rate-limit/outage
+ * detection. User-authored conversation/composer/sidebar text never
+ * participates. For weak (composer-absent) evidence, use
+ * `classifyProviderBlockerEvidence` and require consecutive frames.
+ *
+ * @param {string} snapshot agent-browser `snapshot -i` accessibility text
+ * @param {{ composerLabel: string; isGrok?: boolean }} labels
+ * @returns {string}
+ */
+export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGrok = false }) {
+  return classifyProviderBlockerEvidence(snapshot, { composerLabel, isGrok }).surfaces;
+}
 export function stripChatGptResponseChrome(value) {
   return String(value || "")
     .split("\n")

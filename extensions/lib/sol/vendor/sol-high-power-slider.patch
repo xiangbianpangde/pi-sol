@@ -9,10 +9,12 @@
  // Bare Instant is the legacy top-level family radio; compact Instant rows are versioned (Instant 5s / Instant 5.5).
  const COMPACT_INTELLIGENCE_CONTROL_PATTERN = /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i;
  const COMPACT_INTELLIGENCE_OPENER_PATTERN = /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i;
-@@ -99,6 +101,81 @@
+@@ -97,8 +99,118 @@
+ 
+ /**
   * @param {string | undefined} value
-  * @returns {string}
-  */
++ * @returns {string}
++ */
 +export const PROVIDER_ERROR_SURFACE_KINDS = Object.freeze(["alert", "status", "dialog", "banner", "log"]);
 +
 +const CONVERSATION_CHROME_PATTERNS = Object.freeze([
@@ -37,13 +39,34 @@
 + * @param {{ composerLabel: string; isGrok?: boolean }} labels
 + * @returns {string}
 + */
-+export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGrok = false }) {
++/**
++ * Classify provider blocker evidence in an accessibility snapshot.
++ *
++ * Returns structured evidence so callers can apply different thresholds:
++ * - `surfaces`: full subtree text of provider-owned error roles
++ *   (alert/status/dialog/banner/log). Matching here is STRONG evidence:
++ *   provider UI explicitly reported a rate-limit/outage.
++ * - `fallback`: sidebar-stripped page text, populated ONLY when the page has
++ *   no composer AND no conversation chrome (Copy/Stop/Edit/Share/…). This is
++ *   WEAK evidence: a transient post-send rerender may briefly lack both, so
++ *   callers must require several consecutive frames before treating it as a
++ *   real full-page outage. User conversation text is never returned as strong
++ *   evidence.
++ *
++ * @param {string} snapshot agent-browser `snapshot -i` accessibility text
++ * @param {{ composerLabel: string; isGrok?: boolean }} labels
++ * @returns {{ surfaces: string; fallback: string; hasComposer: boolean }}
++ */
++export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGrok = false }) {
 +  const lines = String(snapshot || "").split("\n");
 +  const surfaces = [];
 +  const kept = [];
 +  let hasComposer = false;
 +  let sidebarDepth = -1;
 +  let i = 0;
++  const markComposer = (line) => {
++    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) hasComposer = true;
++  };
 +  while (i < lines.length) {
 +    const line = lines[i];
 +    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
@@ -56,45 +79,61 @@
 +      i += 1;
 +      continue;
 +    }
-+    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
-+      hasComposer = true;
-+    }
++    markComposer(line);
 +    // provider error surface role: match the role word followed by whitespace,
 +    // end of line, or a bracket (handles both named and unnamed roles)
 +    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
 +    if (roleMatch) {
-+      // Collect this line plus all descendant lines (greater indentation)
++      // Collect this line plus all descendant lines (greater indentation).
++      // Composer detection still runs inside the subtree (a textbox nested in
++      // a dialog must count as the composer).
 +      surfaces.push(line);
 +      i += 1;
 +      while (i < lines.length) {
 +        const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
-+        if (childIndent > indent) { surfaces.push(lines[i]); i += 1; }
-+        else break;
++        if (childIndent > indent) {
++          markComposer(lines[i]);
++          surfaces.push(lines[i]);
++          i += 1;
++        } else break;
 +      }
 +      continue;
 +    }
 +    kept.push(line);
 +    i += 1;
 +  }
-+  const surfaceText = surfaces.join("\n");
-+  if (/(too many requests|rate limit)/i.test(surfaceText)) return surfaceText;
-+  // Full-page outage fallback: only when the page has no composer AND no
-+  // conversation chrome.  A transient UI rerender (e.g., after send) may
-+  // temporarily lack the composer but still show conversation controls;
-+  // scanning the full page in that case would re-introduce the false positive.
++  // Weak fallback: only when the page has no composer AND no conversation
++  // chrome. A transient UI rerender may briefly lack the composer while still
++  // showing user text; the caller must require multiple consecutive frames.
 +  const hasConversationChrome = lines.some((l) => CONVERSATION_CHROME_PATTERNS.some((p) => l.includes(p)));
-+  if (!hasComposer && !hasConversationChrome) return kept.join("\n");
-+  return "";
++  const fallback = !hasComposer && !hasConversationChrome ? kept.join("\n") : "";
++  return { surfaces: surfaces.join("\n"), fallback, hasComposer };
 +}
 +
-+
++/**
++ * Positive-scope provider blocker sanitization (strong evidence only).
++ *
++ * Returns the error-surface subtree text for immediate rate-limit/outage
++ * detection. User-authored conversation/composer/sidebar text never
++ * participates. For weak (composer-absent) evidence, use
++ * `classifyProviderBlockerEvidence` and require consecutive frames.
++ *
++ * @param {string} snapshot agent-browser `snapshot -i` accessibility text
++ * @param {{ composerLabel: string; isGrok?: boolean }} labels
+  * @returns {string}
+  */
++export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGrok = false }) {
++  return classifyProviderBlockerEvidence(snapshot, { composerLabel, isGrok }).surfaces;
++}
  export function stripChatGptResponseChrome(value) {
    return String(value || "")
      .split("\n")
-@@ -256,8 +333,51 @@
+@@ -254,10 +366,53 @@
+   return entries.some(
+     (entry) => entry.kind === "button" && /click to remove/i.test(String(entry.label || "")) && parseComposerChipSelection(entry.label),
    );
- }
- 
++}
++
 +function hasLegacyCompactIntelligenceMenu(entries) {
 +  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +    || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && Boolean(parseCompactIntelligenceSelection(entry.label)));
@@ -135,8 +174,8 @@
 +    if (parsed) return parsed;
 +  }
 +  return undefined;
-+}
-+
+ }
+ 
  function hasCompactIntelligenceMenuContext(entries) {
 -  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +  if (isPowerSliderCompactMenu(entries)) return false;
@@ -144,7 +183,7 @@
      || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && checkedState(entry) === true && compactSelectionFromEntry(entry, entries));
  }
  
-@@ -351,6 +471,9 @@
+@@ -351,6 +506,9 @@
    if (hasRemovableComposerModelChip(entries)) return undefined;
    if (hasLegacyEffortCombobox(entries)) return undefined;
  
@@ -154,7 +193,7 @@
    for (const entry of entries) {
      if (entry.kind !== "menuitemradio" || checkedState(entry) !== true) continue;
      const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: false });
-@@ -361,7 +484,7 @@
+@@ -361,7 +519,7 @@
  
    for (const entry of entries) {
      if (entry.kind !== "button") continue;
@@ -163,7 +202,7 @@
      if (!compactSelection) continue;
      return compactSelection;
    }
-@@ -444,6 +567,17 @@
+@@ -444,6 +602,17 @@
    /** @type {SnapshotEntry[]} */
    const entries = parseSnapshotEntries(snapshot);
    const normalizedEffort = effortLabel.toLowerCase();
@@ -181,7 +220,7 @@
    const compactClosedButtonsAllowed = !hasRemovableComposerModelChip(entries) && !hasLegacyEffortCombobox(entries) && !hasCompactIntelligenceMenuContext(entries);
    return entries.some((entry) => {
      if (entry.disabled) return false;
-@@ -496,20 +630,79 @@
+@@ -496,8 +665,8 @@
    const visibleCompactControls = entries.filter(
      (entry) => !entry.disabled && entry.kind === "menuitemradio" && compactSelectionFromEntry(entry, entries),
    );
@@ -192,15 +231,10 @@
    );
    const hasIntelligenceHeading = entries.some((entry) => entry.kind === "heading" && normalizeText(entry.label) === "Intelligence" && !entry.disabled);
    const hasEffortCombobox = entries.some(
-     (entry) => entry.kind === "combobox" && EFFORT_LABELS.has(entry.value || "") && !entry.disabled,
-   );
-   return visibleFamilies.size >= 2 || visibleRadioFamilies.size >= 2 || visibleCompactControls.length >= 2 || hasCompactIntelligenceMenu || hasIntelligenceHeading || hasEffortCombobox;
-+}
-+
-+/**
-+ * @param {string} snapshot
-+ * @returns {boolean}
-+ */
+@@ -510,6 +679,65 @@
+  * @param {string} snapshot
+  * @returns {boolean}
+  */
 +export function snapshotHasPowerSliderCompactMenu(snapshot) {
 +  return isPowerSliderCompactMenu(parseSnapshotEntries(snapshot));
 +}
@@ -209,17 +243,17 @@
 +  const compactSelection = detectCompactIntelligenceSelection(parseSnapshotEntries(snapshot));
 +  if (!compactSelection) return undefined;
 +  return compactSelection.compactTier || compactSelection.modelFamily;
- }
- 
++}
++
 +const CHATGPT_STOP_CONTROL_PATTERN = /button "Stop (?:streaming|answering|generating)"/i;
 +const CHATGPT_COPY_CONTROL_PATTERN = /button "Copy(?: response| message)?"/g;
 +
- /**
++/**
 + * True only for the live stop control. Do not match those words inside the reply body —
 + * that kept waitForChatCompletion running for minutes after the tab already showed the answer.
-  * @param {string} snapshot
-  * @returns {boolean}
-  */
++ * @param {string} snapshot
++ * @returns {boolean}
++ */
 +export function snapshotHasChatGptStopControl(snapshot) {
 +  return CHATGPT_STOP_CONTROL_PATTERN.test(String(snapshot || ""));
 +}
@@ -280,7 +314,7 @@
  export declare function snapshotCanSafelySkipModelConfiguration(snapshot: string, selection: OracleUiSelection): boolean;
 --- a/extensions/oracle/worker/run-job.mjs
 +++ b/extensions/oracle/worker/run-job.mjs
-@@ -34,11 +34,18 @@
+@@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
    snapshotHasModelOpener,
@@ -296,10 +330,11 @@
    autoSwitchToThinkingSelectionVisible,
    stripChatGptResponseChrome,
 +  sanitizeProviderBlockerSnapshot as sanitizeProviderBlockerSnapshotHelper,
++  classifyProviderBlockerEvidence,
  } from "./chatgpt-ui-helpers.mjs";
  import { assistantSnapshotSlice, conversationIdFromUrl, nextStableValueState, providerSendAccepted, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
  import { normalizeLoginProbeResult } from "./auth-flow-helpers.mjs";
-@@ -84,7 +91,7 @@
+@@ -84,7 +92,7 @@
  const MODEL_CONFIGURATION_SETTLE_TIMEOUT_MS = 20_000;
  const MODEL_CONFIGURATION_SETTLE_POLL_MS = 250;
  const MODEL_CONFIGURATION_CLOSE_RETRY_MS = 1_000;
@@ -308,7 +343,7 @@
  const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
    (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
  ) || "agent-browser";
-@@ -706,7 +713,11 @@
+@@ -706,7 +714,11 @@
  
  async function ensureBrowserConnected(job) {
    if (!browserStarted || cleaningUpBrowser) return;
@@ -321,7 +356,7 @@
    if (status.connected === false) {
      throw new Error("The isolated oracle browser disconnected during the job.");
    }
-@@ -1065,7 +1076,9 @@
+@@ -1065,7 +1077,9 @@
      return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
    }
  
@@ -332,7 +367,7 @@
    if (outageText) {
      return { state: "transient_outage_error", message: `ChatGPT is showing a transient outage/rate-limit page: ${outageText}` };
    }
-@@ -1244,8 +1257,18 @@
+@@ -1244,8 +1258,32 @@
    return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
  }
  
@@ -346,6 +381,20 @@
 +  });
 +}
 +
++function providerBlockerEvidence(job, snapshot) {
++  const labels = labelsForJob(job);
++  const { surfaces, fallback } = classifyProviderBlockerEvidence(snapshot, {
++    composerLabel: labels.composer,
++    isGrok: isGrokJob(job),
++  });
++  return {
++    // STRONG: provider error-role subtree explicitly reports a blocker.
++    strong: detectProviderVisibleBlockerText(surfaces),
++    // WEAK: no composer + no conversation chrome; needs consecutive frames.
++    weak: detectProviderVisibleBlockerText(fallback),
++  };
++}
++
 +function providerTransientErrorMessage(job, snapshot, context) {
 +  // Rate-limit/outage detection only ever consults provider-owned error
 +  // surfaces, never user-authored conversation/composer/sidebar text.
@@ -353,18 +402,47 @@
    if (!errorText) return "";
    return formatProviderTransientErrorMessage(job, errorText, context);
  }
-@@ -1372,8 +1395,8 @@
+@@ -1372,8 +1410,18 @@
      url: urlResult.url,
      urlKnown: urlResult.ok,
      assistantCount: Math.max(baselineAssistantCount, messages.length),
 -    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming"),
 -    transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
 +    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
-+    transientErrorText: detectProviderVisibleBlockerText(sanitizeProviderBlockerSnapshot(snapshot, job)) || "",
++    transientErrorText: (() => {
++      const ev = providerBlockerEvidence(job, snapshot);
++      // Strong evidence (error-role subtree) is immediate; weak evidence
++      // (composer-absent fallback) is returned separately for multi-frame confirmation.
++      if (ev.strong) return ev.strong;
++      return "";
++    })(),
++    weakBlockerText: (() => {
++      const ev = providerBlockerEvidence(job, snapshot);
++      return ev.strong ? "" : ev.weak;
++    })(),
    };
  }
  
-@@ -1428,6 +1451,37 @@
+@@ -1390,11 +1438,18 @@
+ }
+ 
+ async function waitForSendAccepted(job, beforeSend, options = {}) {
++  let weakBlockerFrames = 0;
+   const timeoutAt = Date.now() + (options.timeoutMs || 15_000);
+   while (Date.now() < timeoutAt) {
+     await heartbeat();
+     const afterSend = await sendAcceptanceState(job, beforeSend.assistantCount || 0);
+     if (afterSend.transientErrorText) throw new Error(formatProviderTransientErrorMessage(job, afterSend.transientErrorText, "waiting for send acceptance"));
++    if (afterSend.weakBlockerText) {
++      weakBlockerFrames += 1;
++      if (weakBlockerFrames >= 3) {
++        throw new Error(formatProviderTransientErrorMessage(job, afterSend.weakBlockerText, "waiting for send acceptance (weak, 3 consecutive frames)"));
++      }
++    } else weakBlockerFrames = 0;
+     if (providerSendAccepted(beforeSend, afterSend)) return true;
+     await sleep(500);
+   }
+@@ -1428,6 +1483,37 @@
    return Boolean(dismissed);
  }
  
@@ -402,7 +480,7 @@
  async function openModelConfiguration(job) {
    const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
    let lastSnapshot = "";
-@@ -1451,6 +1505,9 @@
+@@ -1451,6 +1537,9 @@
        throwIfProviderTransientError(job, after, "opening model configuration");
        if (snapshotHasModelConfigurationUi(after)) return after;
        if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
@@ -412,7 +490,7 @@
  
        const configureEntry = findEntry(
          after,
-@@ -1465,6 +1522,9 @@
+@@ -1465,6 +1554,9 @@
          throwIfProviderTransientError(job, postConfigure, "opening model configuration");
          if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
          if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
@@ -422,7 +500,7 @@
        }
      }
  
-@@ -1526,14 +1586,49 @@
+@@ -1526,14 +1618,49 @@
    throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
  }
  
@@ -473,7 +551,7 @@
    await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
    let familySnapshot = await openModelConfiguration(job);
    let verificationSnapshot = familySnapshot;
-@@ -1553,7 +1648,21 @@
+@@ -1553,7 +1680,21 @@
    } else if (familyAlreadySelectedInUi) {
      await log("Model family already appears selected; verifying effort-specific settings");
    } else if (!familyEntry) {
@@ -496,7 +574,7 @@
    }
  
    let compactSelectionVerifiedAfterClick = false;
-@@ -1577,7 +1686,7 @@
+@@ -1577,7 +1718,7 @@
      }
    }
  
@@ -505,7 +583,7 @@
      const effortLabel = requestedEffortLabel(job.selection);
      if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
        const opened = await openEffortDropdown(job);
-@@ -1626,7 +1735,7 @@
+@@ -1626,7 +1767,7 @@
      }
    }
  
@@ -514,12 +592,13 @@
    if (!stronglyVerified) {
      throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
    }
-@@ -1812,24 +1921,37 @@
+@@ -1812,24 +1953,49 @@
    return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
  }
  
 -async function waitForChatCompletion(job, baselineAssistantCount) {
 +async function waitForChatCompletion(job, baselineAssistantCount, options = {}) {
++  let weakBlockerFrames = 0;
    const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
 +  const baselineCopyCount = Number(options.baselineCopyCount || 0);
 +  const baselineLastText = String(options.baselineLastText || "");
@@ -537,10 +616,22 @@
 +    const composerIdle = isGrokJob(job) ? false : snapshotHasChatGptComposerIdle(snapshot);
      const hasRetryButton = snapshot.includes('button "Retry"');
 -    const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
+-    throwIfProviderTransientError(job, snapshot, "waiting for response completion");
 +    const copyResponseCount = isGrokJob(job)
 +      ? (snapshot.match(/button "Copy"/g) || []).length
 +      : countChatGptCopyControls(snapshot);
-     throwIfProviderTransientError(job, snapshot, "waiting for response completion");
++    {
++      const ev = providerBlockerEvidence(job, snapshot);
++      if (ev.strong) {
++        throw new Error(formatProviderTransientErrorMessage(job, ev.strong, "waiting for response completion"));
++      }
++      if (ev.weak) {
++        weakBlockerFrames += 1;
++        if (weakBlockerFrames >= 3) {
++          throw new Error(formatProviderTransientErrorMessage(job, ev.weak, "waiting for response completion (weak, 3 consecutive frames)"));
++        }
++      } else weakBlockerFrames = 0;
++    }
      const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
      const messages = await assistantMessages(job);
 -    const targetMessage = messages[baselineAssistantCount];
@@ -557,7 +648,7 @@
  
      if (!hasStopStreaming && hasRetryButton && responseFailureText) {
        if (!retriedAfterFailure) {
-@@ -2370,7 +2492,10 @@
+@@ -2370,7 +2536,10 @@
      }));
      await uploadArchive(currentJob);
      await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
@@ -569,7 +660,7 @@
      await log(`Assistant response count before send: ${baselineAssistantCount}`);
      await clickSend(currentJob, baselineAssistantCount);
      await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
-@@ -2391,7 +2516,7 @@
+@@ -2391,7 +2560,7 @@
        patch: awaitingResponsePatch,
      }));
  

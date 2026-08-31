@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+	classifyProviderBlockerEvidence,
 	countChatGptCopyControls,
 	effortSelectionVisible,
 	sanitizeProviderBlockerSnapshot,
@@ -266,8 +267,12 @@ describe("provider blocker snapshot sanitizer (P1-2/P1-3 regression)", () => {
 - heading "Too many requests" [level=1, ref=e1]
 - paragraph "Please try again later" [ref=e2]
 `;
+		// Strong (surfaces) is empty; the weak fallback carries the page text for
+		// multi-frame confirmation by the worker.
 		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
-		assert.match(out, /Too many requests/);
+		assert.equal(out, "");
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.match(evidence.fallback, /Too many requests/);
 	});
 });
 
@@ -324,6 +329,75 @@ describe("provider blocker sanitizer — audit round 2 boundaries (P1-3)", () =>
 - paragraph "Please try again later" [ref=e2]
 `;
 		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
-		assert.match(out, /Too many requests/);
+		assert.equal(out, ""); // strong evidence is empty; fallback is weak signal
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.match(evidence.fallback, /Too many requests/);
+	});
+});
+
+describe("provider blocker evidence — audit round 3 boundaries", () => {
+	const labels = { composerLabel: "Chat with ChatGPT" };
+
+	it("does not leak user text when composer and chrome are both transiently absent", () => {
+		const snapshot = `
+- generic "请审核 rate limit 的处理" [ref=e112]
+- heading "Sol 正在生成" [ref=e133]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		// Strong surfaces must be empty; the weak fallback must NOT be auto-trusted —
+		// it is only returned for multi-frame confirmation, and the caller decides.
+		assert.equal(evidence.surfaces, "");
+		assert.ok(!/rate limit/i.test(evidence.surfaces));
+	});
+
+	it("detects a composer nested inside an error-role subtree (hasComposer must update)", () => {
+		const snapshot = `
+- dialog "shell" [ref=e1]
+  - textbox "Chat with ChatGPT" [ref=e2]
+- generic "请检查 rate limit 问题" [ref=e3]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.equal(evidence.hasComposer, true);
+		// Because the composer exists, the weak fallback is disabled — user text
+		// cannot re-enter detection through the fallback.
+		assert.equal(evidence.fallback, "");
+	});
+
+	it("collects 3+ level descendant text inside an error role", () => {
+		const snapshot = `
+- alert "Usage warning" [ref=e1]
+  - generic [ref=e2]
+    - group [ref=e3]
+      - paragraph "Too many requests. Try again later." [ref=e4]
+- textbox "Chat with ChatGPT" [ref=e5]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.match(evidence.surfaces, /Too many requests/);
+	});
+
+	it("collects status and log role subtrees", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e1]
+- status "notice" [ref=e2]
+  - paragraph "rate limit approaching" [ref=e3]
+- log "audit" [ref=e4]
+  - paragraph "Too many requests logged" [ref=e5]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.match(evidence.surfaces, /rate limit/);
+		assert.match(evidence.surfaces, /Too many requests/);
+	});
+
+	it("does not scan user text when the page is a normal conversation (strong surfaces only)", () => {
+		const snapshot = `
+- navigation "Chat history" [ref=e3]
+  - link "rate limit 讨论" [ref=e26]
+- generic "请审核 rate limit 的处理" [ref=e112]
+- textbox "Chat with ChatGPT" [ref=e122]
+- button "Send prompt" [ref=e119]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.equal(evidence.surfaces, "");
+		assert.equal(evidence.fallback, ""); // composer present → fallback disabled
 	});
 });

@@ -1,6 +1,25 @@
 # sol CHANGELOG
 
-## 1.5.1 - 2026-08-31
+## 1.6.0 - 2026-08-31
+
+- **Sol audit round 3 (e89f638, FAIL → fixes applied)**:
+  - P1 stale-proof/generation binding: stale reclaim now runs under an exclusive
+    reclaim token (private mkdir). Holding the token between staleness
+    verification and rename binds the stale proof to the exact generation being
+    removed; an old stale proof can never rename+delete a newer live lock.
+  - P1 composer-absent fallback: sanitizer now returns structured evidence —
+    STRONG (error-role subtree text, immediate) vs WEAK (composer-absent +
+    no-conversation-chrome fallback). The worker requires 3 consecutive weak
+    frames before treating it as a real full-page outage, so a transient
+    post-send rerender cannot re-inject user text into the rate-limit detector.
+  - Fixed hasComposer detection when the composer textbox is nested inside an
+    error-role subtree (dialog), and added status/log role coverage.
+  - Tests: concurrent same-lease release generation safety, old-token release
+    against a newer generation, stale-reclaim-vs-live-generation race, 3+ level
+    descendant collection, composer-in-dialog, status/log subtrees,
+    composer+chrome transiently absent. 98/98 pass.
+
+ - 2026-08-31
 
 - **Sol audit round 2 (17215b7, FAIL → fixes applied)**:
   - P1 stale-reclaim bug: stale locks (dead PID + TTL) could never be reclaimed

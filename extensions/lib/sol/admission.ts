@@ -25,6 +25,7 @@ import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.
  *   reclaimed, so SIGSTOP / slow disk / sleep cannot break an active submit.
  */
 const SUBMIT_LOCK_NAME = "pi-sol-submit.lock";
+const RECLAIM_TOKEN_NAME = "pi-sol-submit.reclaim-token";
 const SUBMIT_LOCK_TTL_MS = 15 * 60 * 1000;
 
 export type SolSubmitLease = {
@@ -84,9 +85,11 @@ async function isStaleLock(path: string): Promise<boolean> {
 }
 
 /**
- * Atomically move the lock to a unique trash path. Only one contender can win
- * the rename, which serializes concurrent stale reclaims. Returns true when
- * the caller moved it (and should delete the trash).
+ * Atomically move the target path to a unique trash path. Only one contender
+ * can win a rename of the SAME current generation; however a stale proof taken
+ * earlier does not bind to a later generation. All callers must hold the
+ * reclaim token (see below) so that no other process can replace the path
+ * between staleness verification and this rename.
  */
 async function atomicRenameAway(path: string): Promise<{ moved: boolean; trash?: string }> {
 	const trash = `${path}.trash.${process.pid}.${randomUUID()}`;
@@ -96,6 +99,29 @@ async function atomicRenameAway(path: string): Promise<{ moved: boolean; trash?:
 	} catch {
 		return { moved: false };
 	}
+}
+
+/**
+ * Acquire the reclaim token: a private mkdir that serializes ALL mutations of
+ * the fixed lock path (stale reclaim and release). Holding this token while
+ * verifying staleness and renaming binds the stale proof to the exact
+ * generation being removed — no other process can replace the path in between,
+ * so an old stale proof can never delete a newer live generation.
+ * Returns a release function, or undefined when another process holds the token.
+ */
+async function acquireReclaimToken(stateDir: string): Promise<(() => Promise<void>) | undefined> {
+	const tokenPath = join(stateDir, RECLAIM_TOKEN_NAME);
+	try {
+		await mkdir(tokenPath, { mode: 0o700 });
+	} catch {
+		return undefined;
+	}
+	let released = false;
+	return async () => {
+		if (released) return;
+		released = true;
+		await rm(tokenPath, { recursive: true, force: true }).catch(() => undefined);
+	};
 }
 
 function busyReason(activeJobs: SolJobSummary[]): string {
@@ -127,7 +153,7 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 		};
 	}
 	const token = randomUUID();
-	for (let attempt = 0; attempt < 3; attempt += 1) {
+	for (let attempt = 0; attempt < 4; attempt += 1) {
 		let created = false;
 		try {
 			await mkdir(path, { mode: 0o700 });
@@ -155,11 +181,23 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 			if (!(await isStaleLock(path))) {
 				return { acquired: false, reason: busyReason([]), activeJobs: listActiveSolJobs(jobsDir) };
 			}
-			// Atomic reclaim: rename the stale lock away (only one contender
-			// wins), delete it, then loop to mkdir fresh.
-			const { moved, trash } = await atomicRenameAway(path);
-			if (!moved) continue;
-			await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+			// Serialize the reclaim: only one process at a time may mutate the
+			// fixed lock path. Holding the token between staleness verification
+			// and rename binds the stale proof to the exact generation being
+			// removed — an older stale proof can never delete a newer live lock.
+			const releaseToken = await acquireReclaimToken(stateDir);
+			if (!releaseToken) continue; // another reclaimer in progress; retry
+			try {
+				// Re-verify under the token: the path can only be the generation
+				// we just verified (no other process can replace it while we hold
+				// the token). If it is no longer stale, someone already recovered.
+				if (!(await isStaleLock(path))) continue;
+				const { moved, trash } = await atomicRenameAway(path);
+				if (!moved) continue;
+				await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+			} finally {
+				await releaseToken();
+			}
 		}
 	}
 	return { acquired: false, reason: busyReason([]), activeJobs: listActiveSolJobs(jobsDir) };

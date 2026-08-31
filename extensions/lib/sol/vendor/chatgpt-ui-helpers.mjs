@@ -103,17 +103,23 @@ export function buildAllowedChatGptOrigins(chatUrl, authUrl) {
  */
 export const PROVIDER_ERROR_SURFACE_KINDS = Object.freeze(["alert", "status", "dialog", "banner", "log"]);
 
+const CONVERSATION_CHROME_PATTERNS = Object.freeze([
+  "Copy message", "Copy response", "Edit message", "Share prompt",
+  "Stop answering", "Stop streaming",
+]);
+
 /**
  * Positive-scope provider blocker sanitization (pure, testable).
  *
  * Returns candidate text for rate-limit/outage detection:
- * - Prefer explicit semantic error surfaces (alert/status/dialog/banner/log),
- *   which are provider-owned and never contain user conversation text.
- * - If the page has NO composer (full-page outage replacing the app), fall back
- *   to the sidebar-stripped snapshot so real error pages are still detected.
- * - When a composer is present, user conversation/composer/sidebar text is never
- *   consulted, so a prompt or reply that merely mentions "rate limit"/"Too many
- *   requests" cannot trigger a false failure.
+ * - Collects the full accessibility subtree of every provider-owned error
+ *   surface (alert/status/dialog/banner/log), including descendant text that
+ *   may contain the actual blocker keyword.
+ * - Handles unnamed roles where the child holds the semantic text.
+ * - When the composer is absent, does NOT blindly scan the whole page: only
+ *   falls back to the sidebar-stripped snapshot when conversation chrome
+ *   (Copy message/Stop answering etc.) is also absent, which is strong
+ *   evidence of a full-page outage rather than a transient UI rerender.
  *
  * @param {string} snapshot agent-browser `snapshot -i` accessibility text
  * @param {{ composerLabel: string; isGrok?: boolean }} labels
@@ -125,29 +131,50 @@ export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGro
   const kept = [];
   let hasComposer = false;
   let sidebarDepth = -1;
-  for (const line of lines) {
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
     const indent = (line.match(/^\s*/)?.[0].length ?? 0);
     if (sidebarDepth >= 0) {
       if (indent <= sidebarDepth) sidebarDepth = -1;
-      else continue; // skip sidebar subtree (user-controlled chat titles)
+      else { i += 1; continue; }
     }
     if (line.includes('navigation "Chat history"')) {
       sidebarDepth = indent;
+      i += 1;
       continue;
     }
     if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
       hasComposer = true;
     }
-    const kindMatch = line.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
-    const kind = kindMatch ? kindMatch[1] : "";
-    if (PROVIDER_ERROR_SURFACE_KINDS.includes(kind)) surfaces.push(line);
-    else kept.push(line);
+    // provider error surface role: match the role word followed by whitespace,
+    // end of line, or a bracket (handles both named and unnamed roles)
+    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
+    if (roleMatch) {
+      // Collect this line plus all descendant lines (greater indentation)
+      surfaces.push(line);
+      i += 1;
+      while (i < lines.length) {
+        const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
+        if (childIndent > indent) { surfaces.push(lines[i]); i += 1; }
+        else break;
+      }
+      continue;
+    }
+    kept.push(line);
+    i += 1;
   }
-  if (/too many requests|rate limit/i.test(surfaces.join("\n"))) return surfaces.join("\n");
-  // Full-page outage: no composer, conversation replaced, only sidebar remains.
-  if (!hasComposer) return kept.join("\n");
+  const surfaceText = surfaces.join("\n");
+  if (/(too many requests|rate limit)/i.test(surfaceText)) return surfaceText;
+  // Full-page outage fallback: only when the page has no composer AND no
+  // conversation chrome.  A transient UI rerender (e.g., after send) may
+  // temporarily lack the composer but still show conversation controls;
+  // scanning the full page in that case would re-introduce the false positive.
+  const hasConversationChrome = lines.some((l) => CONVERSATION_CHROME_PATTERNS.some((p) => l.includes(p)));
+  if (!hasComposer && !hasConversationChrome) return kept.join("\n");
   return "";
 }
+
 
 export function stripChatGptResponseChrome(value) {
   return String(value || "")

@@ -270,3 +270,60 @@ describe("provider blocker snapshot sanitizer (P1-2/P1-3 regression)", () => {
 		assert.match(out, /Too many requests/);
 	});
 });
+
+describe("provider blocker sanitizer — audit round 2 boundaries (P1-3)", () => {
+	const labels = { composerLabel: "Chat with ChatGPT" };
+
+	it("collects error-role subtree text (child paragraph carries the keyword)", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e1]
+- alert "Usage warning" [ref=e2]
+  - paragraph "Too many requests. Try again later." [ref=e3]
+- button "Send prompt" [ref=e4]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /Too many requests/);
+	});
+
+	it("handles an unnamed error role whose child carries the blocker text", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e1]
+- alert [ref=e2]
+  - paragraph "You've hit your rate limit" [ref=e3]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /rate limit/);
+	});
+
+	it("collects dialog/banner/log subtrees too", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e1]
+- dialog "Error" [ref=e2]
+  - paragraph "Something went wrong: rate limit" [ref=e3]
+- banner "notice" [ref=e4]
+  - paragraph "Too many requests" [ref=e5]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /rate limit/);
+		assert.match(out, /Too many requests/);
+	});
+
+	it("does not scan user conversation when the composer is temporarily absent (rerender)", () => {
+		const snapshot = `
+- generic "请审核 rate limit 的处理" [ref=e112]
+- button "Copy message" [ref=e113]
+- button "Stop answering" [ref=e209]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.ok(!/rate limit/i.test(out), `user text leaked without composer: ${out}`);
+	});
+
+	it("still falls back to the page for a true full-page outage (no composer, no conversation chrome)", () => {
+		const snapshot = `
+- heading "Too many requests" [level=1, ref=e1]
+- paragraph "Please try again later" [ref=e2]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /Too many requests/);
+	});
+});

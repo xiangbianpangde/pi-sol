@@ -9,23 +9,29 @@
  // Bare Instant is the legacy top-level family radio; compact Instant rows are versioned (Instant 5s / Instant 5.5).
  const COMPACT_INTELLIGENCE_CONTROL_PATTERN = /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i;
  const COMPACT_INTELLIGENCE_OPENER_PATTERN = /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i;
-@@ -99,6 +101,54 @@
+@@ -99,6 +101,81 @@
   * @param {string | undefined} value
   * @returns {string}
   */
 +export const PROVIDER_ERROR_SURFACE_KINDS = Object.freeze(["alert", "status", "dialog", "banner", "log"]);
 +
++const CONVERSATION_CHROME_PATTERNS = Object.freeze([
++  "Copy message", "Copy response", "Edit message", "Share prompt",
++  "Stop answering", "Stop streaming",
++]);
++
 +/**
 + * Positive-scope provider blocker sanitization (pure, testable).
 + *
 + * Returns candidate text for rate-limit/outage detection:
-+ * - Prefer explicit semantic error surfaces (alert/status/dialog/banner/log),
-+ *   which are provider-owned and never contain user conversation text.
-+ * - If the page has NO composer (full-page outage replacing the app), fall back
-+ *   to the sidebar-stripped snapshot so real error pages are still detected.
-+ * - When a composer is present, user conversation/composer/sidebar text is never
-+ *   consulted, so a prompt or reply that merely mentions "rate limit"/"Too many
-+ *   requests" cannot trigger a false failure.
++ * - Collects the full accessibility subtree of every provider-owned error
++ *   surface (alert/status/dialog/banner/log), including descendant text that
++ *   may contain the actual blocker keyword.
++ * - Handles unnamed roles where the child holds the semantic text.
++ * - When the composer is absent, does NOT blindly scan the whole page: only
++ *   falls back to the sidebar-stripped snapshot when conversation chrome
++ *   (Copy message/Stop answering etc.) is also absent, which is strong
++ *   evidence of a full-page outage rather than a transient UI rerender.
 + *
 + * @param {string} snapshot agent-browser `snapshot -i` accessibility text
 + * @param {{ composerLabel: string; isGrok?: boolean }} labels
@@ -37,39 +43,58 @@
 +  const kept = [];
 +  let hasComposer = false;
 +  let sidebarDepth = -1;
-+  for (const line of lines) {
++  let i = 0;
++  while (i < lines.length) {
++    const line = lines[i];
 +    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
 +    if (sidebarDepth >= 0) {
 +      if (indent <= sidebarDepth) sidebarDepth = -1;
-+      else continue; // skip sidebar subtree (user-controlled chat titles)
++      else { i += 1; continue; }
 +    }
 +    if (line.includes('navigation "Chat history"')) {
 +      sidebarDepth = indent;
++      i += 1;
 +      continue;
 +    }
 +    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
 +      hasComposer = true;
 +    }
-+    const kindMatch = line.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
-+    const kind = kindMatch ? kindMatch[1] : "";
-+    if (PROVIDER_ERROR_SURFACE_KINDS.includes(kind)) surfaces.push(line);
-+    else kept.push(line);
++    // provider error surface role: match the role word followed by whitespace,
++    // end of line, or a bracket (handles both named and unnamed roles)
++    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
++    if (roleMatch) {
++      // Collect this line plus all descendant lines (greater indentation)
++      surfaces.push(line);
++      i += 1;
++      while (i < lines.length) {
++        const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
++        if (childIndent > indent) { surfaces.push(lines[i]); i += 1; }
++        else break;
++      }
++      continue;
++    }
++    kept.push(line);
++    i += 1;
 +  }
-+  if (/too many requests|rate limit/i.test(surfaces.join("\n"))) return surfaces.join("\n");
-+  // Full-page outage: no composer, conversation replaced, only sidebar remains.
-+  if (!hasComposer) return kept.join("\n");
++  const surfaceText = surfaces.join("\n");
++  if (/(too many requests|rate limit)/i.test(surfaceText)) return surfaceText;
++  // Full-page outage fallback: only when the page has no composer AND no
++  // conversation chrome.  A transient UI rerender (e.g., after send) may
++  // temporarily lack the composer but still show conversation controls;
++  // scanning the full page in that case would re-introduce the false positive.
++  const hasConversationChrome = lines.some((l) => CONVERSATION_CHROME_PATTERNS.some((p) => l.includes(p)));
++  if (!hasComposer && !hasConversationChrome) return kept.join("\n");
 +  return "";
 +}
++
 +
  export function stripChatGptResponseChrome(value) {
    return String(value || "")
      .split("\n")
-@@ -254,10 +304,53 @@
-   return entries.some(
-     (entry) => entry.kind === "button" && /click to remove/i.test(String(entry.label || "")) && parseComposerChipSelection(entry.label),
+@@ -256,8 +333,51 @@
    );
-+}
-+
+ }
+ 
 +function hasLegacyCompactIntelligenceMenu(entries) {
 +  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +    || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && Boolean(parseCompactIntelligenceSelection(entry.label)));
@@ -110,8 +135,8 @@
 +    if (parsed) return parsed;
 +  }
 +  return undefined;
- }
- 
++}
++
  function hasCompactIntelligenceMenuContext(entries) {
 -  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +  if (isPowerSliderCompactMenu(entries)) return false;
@@ -119,7 +144,7 @@
      || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && checkedState(entry) === true && compactSelectionFromEntry(entry, entries));
  }
  
-@@ -351,6 +444,9 @@
+@@ -351,6 +471,9 @@
    if (hasRemovableComposerModelChip(entries)) return undefined;
    if (hasLegacyEffortCombobox(entries)) return undefined;
  
@@ -129,7 +154,7 @@
    for (const entry of entries) {
      if (entry.kind !== "menuitemradio" || checkedState(entry) !== true) continue;
      const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: false });
-@@ -361,7 +457,7 @@
+@@ -361,7 +484,7 @@
  
    for (const entry of entries) {
      if (entry.kind !== "button") continue;
@@ -138,7 +163,7 @@
      if (!compactSelection) continue;
      return compactSelection;
    }
-@@ -444,6 +540,17 @@
+@@ -444,6 +567,17 @@
    /** @type {SnapshotEntry[]} */
    const entries = parseSnapshotEntries(snapshot);
    const normalizedEffort = effortLabel.toLowerCase();
@@ -156,7 +181,7 @@
    const compactClosedButtonsAllowed = !hasRemovableComposerModelChip(entries) && !hasLegacyEffortCombobox(entries) && !hasCompactIntelligenceMenuContext(entries);
    return entries.some((entry) => {
      if (entry.disabled) return false;
-@@ -496,20 +603,79 @@
+@@ -496,20 +630,79 @@
    const visibleCompactControls = entries.filter(
      (entry) => !entry.disabled && entry.kind === "menuitemradio" && compactSelectionFromEntry(entry, entries),
    );
@@ -184,25 +209,25 @@
 +  const compactSelection = detectCompactIntelligenceSelection(parseSnapshotEntries(snapshot));
 +  if (!compactSelection) return undefined;
 +  return compactSelection.compactTier || compactSelection.modelFamily;
-+}
-+
+ }
+ 
 +const CHATGPT_STOP_CONTROL_PATTERN = /button "Stop (?:streaming|answering|generating)"/i;
 +const CHATGPT_COPY_CONTROL_PATTERN = /button "Copy(?: response| message)?"/g;
 +
-+/**
+ /**
 + * True only for the live stop control. Do not match those words inside the reply body —
 + * that kept waitForChatCompletion running for minutes after the tab already showed the answer.
-+ * @param {string} snapshot
-+ * @returns {boolean}
-+ */
-+export function snapshotHasChatGptStopControl(snapshot) {
-+  return CHATGPT_STOP_CONTROL_PATTERN.test(String(snapshot || ""));
- }
- 
- /**
   * @param {string} snapshot
   * @returns {boolean}
   */
++export function snapshotHasChatGptStopControl(snapshot) {
++  return CHATGPT_STOP_CONTROL_PATTERN.test(String(snapshot || ""));
++}
++
++/**
++ * @param {string} snapshot
++ * @returns {boolean}
++ */
 +export function snapshotHasChatGptSendReady(snapshot) {
 +  return parseSnapshotEntries(snapshot).some(
 +    (entry) => entry.kind === "button" && entry.label === "Send prompt" && !entry.disabled,

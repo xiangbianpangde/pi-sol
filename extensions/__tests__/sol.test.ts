@@ -3,7 +3,7 @@
  * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -149,6 +149,45 @@ describe("jobs + prompt", () => {
 			for (const result of results) {
 				if (result.acquired) await releaseSolSubmitLease(result.lease);
 			}
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reclaims a stale lock whose owner PID is dead and TTL elapsed", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "dead-token", pid: 999999, createdAt: new Date().toISOString() }));
+			// Backdate the lock dir mtime beyond the 15-minute TTL.
+			const old = new Date(Date.now() - 16 * 60 * 1000);
+			await utimes(lock, old, old);
+			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(acquired.acquired, true);
+			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("never reclaims a lock whose owner PID is still alive even past TTL", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "live-token", pid: process.pid, createdAt: new Date().toISOString() }));
+			const old = new Date(Date.now() - 16 * 60 * 1000);
+			await utimes(lock, old, old);
+			const blocked = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(blocked.acquired, false);
+			// The live owner's lock must survive untouched.
+			const owner = JSON.parse(await (await import("node:fs/promises")).readFile(join(lock, "owner.json"), "utf8"));
+			assert.equal(owner.token, "live-token");
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });

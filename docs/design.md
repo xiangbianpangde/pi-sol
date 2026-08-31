@@ -43,10 +43,10 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 The admission path is intentionally separate from browser ownership and conversation leases:
 
 1. The `tool_call` hook sees `oracle_submit` before execution.
-2. For ChatGPT (the `/sol` provider), it atomically creates `pi-sol-submit.lock` under `$PI_ORACLE_JOBS_DIR`.
-3. It reads durable `oracle-*/job.json` records and blocks when any job is still open.
+2. For ChatGPT (the `/sol` provider), it atomically creates `pi-sol-submit.lock` under the per-user private state dir (`PI_SOL_STATE_DIR`, default `~/.pi/agent/state`).
+3. It reads durable `oracle-*/job.json` records from `$PI_ORACLE_JOBS_DIR` and blocks when any job is still open (malformed records fail closed; other users' job dirs are ignored).
 4. The block reason names the active job and tells the model to stop and use `/sol-read <job-id>`; it never changes the preset or silently retries.
-5. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease. A 15-minute TTL makes crashed locks recoverable.
+5. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease by removing the fixed lock path only when the owner token still matches. Crashed locks are reclaimed atomically (rename to a unique trash path) only after the owner PID is provably dead and the TTL elapsed.
 
 This closes the race between separate Pi processes while retaining pi-oracle's own same-`conversationId` lease for explicit follow-ups.
 

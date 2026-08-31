@@ -10,16 +10,19 @@ import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.
  * sessions. pi-oracle can run isolated jobs concurrently, but ChatGPT's
  * account-level rate limit makes concurrent /sol submissions unreliable.
  *
- * Lock protocol (audit-hardened, P1-4/P1-5):
+ * Lock protocol (audit-hardened):
  * - Coordination root lives in a per-user private state dir, never the shared
  *   /tmp namespace (prevents cross-user fake-lock / fake-job DoS).
- * - Stale reclaim and release are atomic: the fixed lock path is RENAMED to a
- *   unique trash path first (only one contender can win a rename), then the
- *   trash is deleted after owner-token verification. There is no
- *   "verify-then-rm" sequence on the fixed path, so a stale reclaimer can
- *   never delete a newer generation's lock.
+ * - Fresh mkdir is the atomic acquire primitive.
+ * - Release: read owner token at the fixed path; only the matching owner
+ *   removes it. A live owner's lock is never stale, so the read→rm window
+ *   cannot be hijacked by a reclaimer (a reclaimer only acts on a dead PID).
+ * - Stale reclaim: rename the lock to a unique trash path (atomic — only one
+ *   contender wins), delete it, then mkdir fresh. No token verification after
+ *   rename, because staleness (dead PID + TTL) was already proven first; the
+ *   rename only serializes concurrent reclaimers.
  * - Freshness = PID liveness (primary) + TTL (secondary). A live PID is never
- *   reclaimed even if the TTL elapsed (SIGSTOP/slow disk/sleep are safe).
+ *   reclaimed, so SIGSTOP / slow disk / sleep cannot break an active submit.
  */
 const SUBMIT_LOCK_NAME = "pi-sol-submit.lock";
 const SUBMIT_LOCK_TTL_MS = 15 * 60 * 1000;
@@ -68,7 +71,7 @@ async function readOwner(path: string): Promise<Partial<LeaseOwner> | undefined>
 	}
 }
 
-/** A lock is stale only when its owner PID is dead (TTL is a secondary guard). */
+/** A lock is stale only when its owner PID is dead AND the TTL elapsed. */
 async function isStaleLock(path: string): Promise<boolean> {
 	const owner = await readOwner(path);
 	if (owner && pidAlive(Number(owner.pid))) return false;
@@ -81,25 +84,18 @@ async function isStaleLock(path: string): Promise<boolean> {
 }
 
 /**
- * Atomically take the fixed lock path (by rename) and, only after verifying it
- * is the same generation we moved, delete it. Used for both stale reclaim and
- * release. Returns true when the caller moved-and-removed a lock.
+ * Atomically move the lock to a unique trash path. Only one contender can win
+ * the rename, which serializes concurrent stale reclaims. Returns true when
+ * the caller moved it (and should delete the trash).
  */
-async function atomicTakeAndRemove(path: string, expectedToken: string): Promise<boolean> {
+async function atomicRenameAway(path: string): Promise<{ moved: boolean; trash?: string }> {
 	const trash = `${path}.trash.${process.pid}.${randomUUID()}`;
 	try {
 		await rename(path, trash);
+		return { moved: true, trash };
 	} catch {
-		return false; // another contender already moved it, or it is gone
+		return { moved: false };
 	}
-	const owner = await readOwner(trash);
-	if (owner?.token && owner.token !== expectedToken) {
-		// We moved a different generation (newer lock). Put it back.
-		await rename(trash, path).catch(() => undefined);
-		return false;
-	}
-	await rm(trash, { recursive: true, force: true }).catch(() => undefined);
-	return true;
 }
 
 function busyReason(activeJobs: SolJobSummary[]): string {
@@ -122,6 +118,7 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 	const path = lockPath(stateDir);
 	try {
 		await mkdir(stateDir, { recursive: true, mode: 0o700 });
+		await chmodPrivate(stateDir);
 	} catch (error) {
 		return {
 			acquired: false,
@@ -139,7 +136,8 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 			await writeFile(join(path, "owner.json"), JSON.stringify(owner), { encoding: "utf8", mode: 0o600 });
 			const activeJobs = listActiveSolJobs(jobsDir);
 			if (activeJobs.length > 0) {
-				await atomicTakeAndRemove(path, token).catch(() => undefined);
+				// We own this fresh lock; remove it before reporting busy.
+				await rm(path, { recursive: true, force: true }).catch(() => undefined);
 				return { acquired: false, reason: busyReason(activeJobs), activeJobs };
 			}
 			return { acquired: true, lease: { path, token } };
@@ -153,19 +151,33 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 				};
 			}
 			// Another process holds the lock. Reclaim only when its owner is
-			// provably dead; otherwise return busy (never disturb a live submit).
+			// provably dead AND the TTL elapsed; otherwise return busy.
 			if (!(await isStaleLock(path))) {
 				return { acquired: false, reason: busyReason([]), activeJobs: listActiveSolJobs(jobsDir) };
 			}
-			// Atomic reclaim: rename the stale lock away; if we win, loop and mkdir fresh.
-			const reclaimed = await atomicTakeAndRemove(path, "");
-			if (!reclaimed) continue;
+			// Atomic reclaim: rename the stale lock away (only one contender
+			// wins), delete it, then loop to mkdir fresh.
+			const { moved, trash } = await atomicRenameAway(path);
+			if (!moved) continue;
+			await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
 		}
 	}
 	return { acquired: false, reason: busyReason([]), activeJobs: listActiveSolJobs(jobsDir) };
 }
 
-/** Release only the lease identified by the owner token, atomically. */
+/** Release the lease: remove the fixed lock path only if it is still ours. */
 export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<void> {
-	await atomicTakeAndRemove(lease.path, lease.token).catch(() => undefined);
+	try {
+		const owner = await readOwner(lease.path);
+		if (owner?.token !== lease.token) return; // not our generation; never touch it
+		await rm(lease.path, { recursive: true, force: true });
+	} catch {
+		// Path already gone or unreadable — nothing safe to do.
+	}
+}
+
+/** Tighten an existing (not just newly created) state dir to 0700. */
+async function chmodPrivate(dir: string): Promise<void> {
+	const { chmod } = await import("node:fs/promises");
+	await chmod(dir, 0o700).catch(() => undefined);
 }

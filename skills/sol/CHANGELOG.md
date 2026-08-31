@@ -1,6 +1,30 @@
 # sol CHANGELOG
 
-## 1.5.0 - 2026-08-31
+## 1.5.1 - 2026-08-31
+
+- **Sol audit round 2 (17215b7, FAIL → fixes applied)**:
+  - P1 stale-reclaim bug: stale locks (dead PID + TTL) could never be reclaimed
+    because the reclaim path passed an empty expected-token that never matched a
+    real UUID owner. Reclaim now renames the lock to a unique trash path first
+    (atomic, serializes concurrent reclaimers) and deletes it without token
+    verification — staleness was already proven before the rename.
+  - P1 generation race: release no longer renames-then-verifies (which could
+    briefly move a newer generation's lock). Release reads the owner token at
+    the fixed path and only removes it when it is still ours; a live owner is
+    never stale so the read→rm window cannot be hijacked.
+  - P1 sanitizer scope: now collects the full subtree of each provider error
+    surface (alert/status/dialog/banner/log) including descendant text, and
+    handles unnamed roles. The composer-absent fallback now requires the
+    absence of conversation chrome (Copy message/Stop answering/…) so a
+    transient post-send rerender cannot re-scan user text as a blocker.
+  - P2 state-dir permissions: existing (not just created) state dir is chmod
+    0700 on acquire.
+  - P2 tests: added stale-reclaim (dead PID reclaims; live PID never reclaims),
+    error-role subtree, unnamed role, dialog/banner subtree, and composer-absent
+    rerender regression tests. 90/90 pass.
+  - docs/design.md admission section updated to match the new protocol.
+
+ - 2026-08-31
 
 - **Audit-driven refactor (Sol round on a3594c2+59d09e9, FAIL → fixes applied)**:
   - P1-1 deployment: `sanitizeProviderBlockerSnapshot` added to `SOL_PATCH_MARKERS.runJob` so already-patched workers redeploy the new sanitizer on next `ensureSolOraclePatches()`.

@@ -1,6 +1,28 @@
 # sol CHANGELOG
 
-## 1.9.1 - 2026-08-31
+## 1.10.0 - 2026-08-31
+
+- **Parallel /sol submissions (maxConcurrentJobs=2, mirroring pi-oracle)**:
+  - pi-sol admission is no longer globally serialized. pi-oracle already runs
+    each job in its own isolated browser runtime profile cloned from a single
+    auth seed profile; the pi-sol admission layer now mirrors pi-oracle's
+    maxConcurrentJobs (default 2) instead of rejecting all concurrent jobs.
+  - Sol audit (31a862aa, FAIL → 1 P1 + 3 P2) and follow-up
+    (2b629644, CONDITIONAL PASS → 2 P2) all fixed:
+    - P1 atomic capacity: authoritative active-job re-scan happens AFTER
+      acquiring the coordination lock; pre-lock scan is a fast-path
+      optimization only.
+    - P2-C2 cleanup failure: fresh lock is verified-removed before any
+      non-success exit; scan failure after publishing cleans the lock and
+      fails closed (no live-PID wedge).
+    - P2 600ms wait → 20×250ms (5s) with latency contract.
+    - P2 busyReason rm -rf advice removed.
+    - P2 strict config (JSON number only, rejects true/"2").
+    - docs/design.md updated from "serialized" to "bounded-concurrency".
+  - Tests: 121/121 (deterministic in-lock recheck, scan-fail cleanup,
+    strict config typing, parallel admission transitions).
+
+ - 2026-08-31
 
 - **Audit round 7 (after 0647f4cb incomplete → self-verified model's thinking notes)**:
   - Restore-failure keep-trash: moveReclaimCandidate now KEEPS a displaced live

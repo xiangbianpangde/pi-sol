@@ -154,6 +154,23 @@ async function atomicPublishLock(stagingDir: string, fixedPath: string, owner: L
 	}
 }
 
+/**
+ * Remove our own freshly-published coordination lock and VERIFY the removal,
+ * or escalate loudly.  We never swallow a cleanup failure: a leaked live-PID
+ * lock (owner alive → never stale) would wedge all future /sol admissions
+ * until this Pi exits (audit round P2-C2).
+ */
+async function removeOwnFreshLockOrThrow(path: string): Promise<void> {
+	try {
+		await rm(path, { recursive: true, force: true });
+	} catch (error) {
+		throw new Error(`Cannot remove own coordination lock ${path}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (existsSync(path)) {
+		throw new Error(`Coordination lock ${path} still exists after removal; refusing to forget ownership`);
+	}
+}
+
 /** Create a unique staging dir next to the fixed path (same filesystem). */
 async function createStagingDir(stateDir: string): Promise<string> {
 	const staging = join(stateDir, `.staging-${process.pid}-${randomUUID()}`);
@@ -305,6 +322,7 @@ export async function acquireSolSubmitLease(
 	stateDir = getSolStateDir(),
 	jobsDir = getOracleJobsDir(),
 	maxConcurrentJobs = oracleMaxConcurrentJobs(),
+	scanActive: (jobsDir: string) => SolJobSummary[] = listActiveSolJobs,
 ): Promise<SolSubmitAdmission> {
 	const path = lockPath(stateDir);
 	try {
@@ -319,7 +337,7 @@ export async function acquireSolSubmitLease(
 	}
 	await sweepStaleStaging(stateDir);
 	const token = randomUUID();
-	const activeJobs = listActiveSolJobs(jobsDir);
+	const activeJobs = scanActive(jobsDir);
 	if (activeJobs.length >= maxConcurrentJobs) {
 		return { acquired: false, reason: busyReason(activeJobs), activeJobs };
 	}
@@ -348,7 +366,7 @@ export async function acquireSolSubmitLease(
 			// 250ms × 20 attempts = 5s window (audit round P2-2: 600ms had no
 			// reliable latency contract; 5s covers cold spawn / fs / IPC).
 			await new Promise((r) => setTimeout(r, 250));
-			const active = listActiveSolJobs(jobsDir);
+			const active = scanActive(jobsDir);
 			if (active.length >= maxConcurrentJobs) {
 				return { acquired: false, reason: busyReason(active), activeJobs: active };
 			}
@@ -359,9 +377,28 @@ export async function acquireSolSubmitLease(
 		// atomic with the reservation.  A contender that passed an earlier
 		// pre-lock scan cannot slip past the limit while the previous holder
 		// completed its submit and released (audit round P1).
-		const active = listActiveSolJobs(jobsDir);
+		let active: SolJobSummary[];
+		try {
+			active = scanActive(jobsDir);
+		} catch (error) {
+			// A scan failure right after we published our OWN fresh lock must
+			// not leave a live-PID wedge (nobody owns the lease, yet the PID
+			// is alive so it can never be reclaimed as stale).  Clean our
+			// generation and fail closed; escalate loudly if cleanup fails
+			// (audit round P2-C2-1).
+			await removeOwnFreshLockOrThrow(path);
+			return {
+				acquired: false,
+				reason: `Cannot scan active /sol jobs after acquiring the coordination lock: ${error instanceof Error ? error.message : String(error)}`,
+				activeJobs: [],
+			};
+		}
 		if (active.length >= maxConcurrentJobs) {
-			await rm(path, { recursive: true, force: true }).catch(() => undefined);
+			// Confirm our own generation is removed before reporting busy;
+			// never swallow a cleanup failure (a leaked live-PID lock would
+			// wedge all future /sol admissions until this Pi exits).
+			// audit round P2-C2-2.
+			await removeOwnFreshLockOrThrow(path);
 			return { acquired: false, reason: busyReason(active), activeJobs: active };
 		}
 		return { acquired: true, lease: { path, token } };

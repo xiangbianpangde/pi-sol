@@ -498,23 +498,49 @@ describe("jobs + prompt", () => {
 		}
 	});
 
-	it("leaves no coordination lock behind when capacity is reached after lock acquisition (audit P1 atomicity)", async () => {
+	it("re-checks capacity AFTER acquiring the coordination lock and cleans its own lock (audit P1 atomicity)", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
 		try {
-			// Two active jobs already exceed maxConcurrentJobs=2.
-			for (const id of ["active", "active2"]) {
-				const dir = join(jobsDir, `oracle-${id}`);
-				await mkdir(dir, { recursive: true });
-				await writeFile(join(dir, "job.json"), JSON.stringify({ id, status: "waiting", selection: { provider: "chatgpt" } }));
-			}
-			const blocked = await acquireSolSubmitLease(stateDir, jobsDir, 2);
+			// Deterministic interleaving: the pre-lock scan sees 1 active job
+			// (below cap 2); between the pre-lock scan and the in-lock
+			// authoritative re-scan, the previous holder completes its submit
+			// and a SECOND job becomes durable (J1+J2 = 2 active).  The
+			// in-lock re-scan must reject the third submission and must not
+			// leave the freshly-published coordination lock behind.
+			let calls = 0;
+			const scanActive = () => {
+				calls += 1;
+				const job = (id: string) => ({ id, status: "waiting", provider: "chatgpt", dir: "" });
+				return calls === 1 ? [job("j1")] : [job("j1"), job("j2")];
+			};
+			const blocked = await acquireSolSubmitLease(stateDir, jobsDir, 2, scanActive as never);
 			assert.equal(blocked.acquired, false);
-			// The freshly-published coordination lock must have been removed
-			// before returning busy — no residue for the next contender to
-			// misinterpret as a live holder.
+			assert.ok(calls >= 2, `in-lock authoritative re-scan must run, got ${calls} scan(s)`);
+			if (!blocked.acquired) assert.match(blocked.reason, /concurrency limit/);
 			const lock = join(stateDir, "pi-sol-submit.lock");
-			assert.equal(existsSync(lock), false, "coordination lock must not linger after a capacity-rejected acquire");
+			assert.equal(existsSync(lock), false, "coordination lock must not linger after an in-lock capacity rejection");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed and cleans its own lock when the in-lock job scan throws (audit P2-C2-1)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			let calls = 0;
+			const scanActive = () => {
+				calls += 1;
+				if (calls === 1) return []; // pre-lock scan passes
+				throw new Error("jobs dir vanished");
+			};
+			const result = await acquireSolSubmitLease(stateDir, jobsDir, 2, scanActive as never);
+			assert.equal(result.acquired, false);
+			if (!result.acquired) assert.match(result.reason, /Cannot scan active/);
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			assert.equal(existsSync(lock), false, "no live-PID lock may linger after an in-lock scan failure");
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });

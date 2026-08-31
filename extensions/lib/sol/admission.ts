@@ -107,24 +107,43 @@ async function atomicRenameAway(path: string): Promise<{ moved: boolean; trash?:
  * verifying staleness and renaming binds the stale proof to the exact
  * generation being removed — no other process can replace the path in between,
  * so an old stale proof can never delete a newer live generation.
- * Returns a release function, or undefined when another process holds the token.
+ *
+ * The token records its owner (PID). If the owner died, the token itself is
+ * stale and is reclaimed atomically (rename to a unique trash path), so a
+ * crash while holding the token cannot wedge future reclaims forever.
+ * Returns a release function, or undefined when another live process holds it.
  */
 async function acquireReclaimToken(stateDir: string): Promise<(() => Promise<void>) | undefined> {
 	const tokenPath = join(stateDir, RECLAIM_TOKEN_NAME);
-	try {
-		await mkdir(tokenPath, { mode: 0o700 });
-	} catch {
-		return undefined;
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		try {
+			await mkdir(tokenPath, { mode: 0o700 });
+		} catch {
+			// EEXIST: another process (maybe crashed) holds the token. Reclaim
+			// it only when the recorded owner is provably dead.
+			const owner = await readOwner(tokenPath);
+			if (owner && !pidAlive(Number(owner.pid))) {
+				const { moved, trash } = await atomicRenameAway(tokenPath);
+				if (moved) {
+					await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+					continue; // retry mkdir now that the dead token is gone
+				}
+			}
+			return undefined;
+		}
+		const owner: LeaseOwner = { token: randomUUID(), pid: process.pid, createdAt: new Date().toISOString() };
+		await writeFile(join(tokenPath, "owner.json"), JSON.stringify(owner), { encoding: "utf8", mode: 0o600 });
+		let released = false;
+		return async () => {
+			if (released) return;
+			released = true;
+			await rm(tokenPath, { recursive: true, force: true }).catch(() => undefined);
+		};
 	}
-	let released = false;
-	return async () => {
-		if (released) return;
-		released = true;
-		await rm(tokenPath, { recursive: true, force: true }).catch(() => undefined);
-	};
+	return undefined;
 }
 
-function busyReason(activeJobs: SolJobSummary[]): string {
+function busyReason(activeJobs: SolJobSummary[], lockPath?: string): string {
 	if (activeJobs.length > 0) {
 		const shown = activeJobs
 			.slice(0, 3)
@@ -133,7 +152,10 @@ function busyReason(activeJobs: SolJobSummary[]): string {
 		const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
 		return `Another ChatGPT /sol job is active: ${shown}${suffix}. Wait for it to finish, then use /sol-read <job-id>. Do not retry this submission.`;
 	}
-	return "Another Pi session is currently admitting a ChatGPT /sol submission. Wait briefly and retry after it finishes. Do not open a second submission.";
+	const recovery = lockPath
+		? ` If you are sure no other /sol is running, remove the stale lock: rm -rf ${lockPath}`
+		: "";
+	return `Another Pi session is currently admitting a ChatGPT /sol submission. Wait briefly and retry after it finishes. Do not open a second submission.${recovery}`;
 }
 
 /** Acquire a short-lived cross-Pi admission lease before oracle_submit.
@@ -179,7 +201,7 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 			// Another process holds the lock. Reclaim only when its owner is
 			// provably dead AND the TTL elapsed; otherwise return busy.
 			if (!(await isStaleLock(path))) {
-				return { acquired: false, reason: busyReason([]), activeJobs: listActiveSolJobs(jobsDir) };
+				return { acquired: false, reason: busyReason([], path), activeJobs: listActiveSolJobs(jobsDir) };
 			}
 			// Serialize the reclaim: only one process at a time may mutate the
 			// fixed lock path. Holding the token between staleness verification
@@ -200,7 +222,7 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 			}
 		}
 	}
-	return { acquired: false, reason: busyReason([]), activeJobs: listActiveSolJobs(jobsDir) };
+	return { acquired: false, reason: busyReason([], path), activeJobs: listActiveSolJobs(jobsDir) };
 }
 
 /** Release the lease: remove the fixed lock path only if it is still ours. */
@@ -215,7 +237,14 @@ export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<void
 }
 
 /** Tighten an existing (not just newly created) state dir to 0700. */
+/** Tighten an existing (not just newly created) state dir to 0700. Fail closed
+ * when the private-permission invariant cannot be established: a shared or
+ * world-readable coordination root would defeat the cross-user DoS protection. */
 async function chmodPrivate(dir: string): Promise<void> {
-	const { chmod } = await import("node:fs/promises");
-	await chmod(dir, 0o700).catch(() => undefined);
+	const { chmod, stat } = await import("node:fs/promises");
+	await chmod(dir, 0o700);
+	const info = await stat(dir);
+	if ((info.mode & 0o777) !== 0o700) {
+		throw new Error(`coordination state dir ${dir} is not private (mode ${(info.mode & 0o777).toString(8)}); refusing to continue`);
+	}
 }

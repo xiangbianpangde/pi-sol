@@ -67,6 +67,12 @@ Before installing, ensure you have:
 - A ChatGPT **Plus** account logged in via your local Chrome
 - Node.js **22 or newer**
 - Chrome interface language set to **English** before running `/sol-auth`
+- A C/C++ toolchain (Xcode Command Line Tools on macOS) — `/sol` admission uses the native `fs-ext` addon for kernel-level `flock`, which is built during install
+
+> [!IMPORTANT]
+> **`PI_SOL_STATE_DIR` must live on a local filesystem with reliable OS advisory-locking semantics.**
+>
+> `/sol` admission takes an exclusive `flock(2)` on a lock file under that directory. Network/distributed/FUSE-like filesystems (NFS/SMB/etc.) are not supported unless their locking semantics have been explicitly validated — flock on such mounts may silently degrade or fail, which would break the cross-Pi admission guarantee.
 
 > [!IMPORTANT]
 > **Chrome must use an English UI for ChatGPT authentication.**
@@ -90,7 +96,7 @@ cd pi-sol
 ./scripts/install.sh
 ```
 
-The installer copies the extension, the skill, and the vendored patch files into your Pi configuration (`~/.pi/agent/`).
+The installer copies the extension, the skill, and the vendored patch files into your Pi configuration (`~/.pi/agent/`), and installs the native `fs-ext` addon there. If a live Pi process is detected (process title `pi` or `pi-coding-agent` in argv), the installer refuses to proceed — upgrading from the pre-`ac52249` pathname protocol to the kernel-flock protocol is a **stop-the-world** operation, because the two coordination protocols share no mutex and could double-admit jobs if both were running. Close all Pi sessions first, or set `PI_SOL_FORCE_UPGRADE=1` to override (not recommended).
 
 ### 2. Reload Pi
 

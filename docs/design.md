@@ -51,6 +51,8 @@ The admission path is intentionally separate from browser ownership and conversa
 
 Because this is a kernel lock, an OLD Pi process using the pre-ac52249 pathname protocol shares NO mutex with a new flock-based process. Upgrading across that boundary is a stop-the-world operation: close all Pi sessions before installing (the installer refuses while Pi processes are detected unless `PI_SOL_FORCE_UPGRADE=1`).
 
+**Filesystem support boundary.** `PI_SOL_STATE_DIR` must live on a filesystem on which the host OS provides reliable flock/advisory-locking semantics. Network/distributed/FUSE-like filesystems (NFS/SMB/etc.) are not supported unless their locking semantics have been explicitly validated — flock on such mounts may silently degrade or fail, which would break the cross-Pi admission guarantee. There is deliberately no pathname-based fallback for unsupported filesystems: a fallback would reintroduce the audit P1 TOCTOU that the kernel flock was chosen to eliminate.
+
 This closes the race between separate Pi processes while retaining pi-oracle's own same-`conversationId` lease for explicit follow-ups.
 
 Operator is the in-Pi model, not the human.

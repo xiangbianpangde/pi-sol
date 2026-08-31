@@ -10,7 +10,10 @@ DEST="${PI_AGENT_HOME:-$HOME/.pi/agent}"
 # protocol (<ac52249).  These are NOT wire-compatible — an old Pi process
 # using the old pathname lock and a new process using the kernel flock have
 # no shared mutex.  Detect live Pi processes and refuse, unless overridden.
-PI_PIDS="$(pgrep -f 'pi-coding-agent' 2>/dev/null || true)"
+# Pi sets process.title = "pi" (APP_NAME), but argv may also contain
+# "pi-coding-agent" in the module path; match both forms.
+PI_PIDS="$(pgrep -x pi 2>/dev/null || true)
+$(pgrep -f 'pi-coding-agent' 2>/dev/null || true)"
 if [ -n "$PI_PIDS" ]; then
   echo ""
   echo "WARNING: Pi processes detected (PIDs: $(echo "$PI_PIDS" | tr '\n' ' '))."
@@ -27,7 +30,7 @@ if [ -n "$PI_PIDS" ]; then
   echo "To override (only if you are SURE no old Pi will run concurrently):"
   echo "  PI_SOL_FORCE_UPGRADE=1 $0"
   echo ""
-  if [ -z "${PI_SOL_FORCE_UPGRADE:-}" ]; then
+  if [ "${PI_SOL_FORCE_UPGRADE:-}" != "1" ]; then
     exit 1
   fi
   echo "Override active — upgrading with live Pi processes (not recommended)."

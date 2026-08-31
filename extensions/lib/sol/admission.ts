@@ -1,4 +1,5 @@
 import { mkdir, readFile, rename, rm, stat, writeFile, readdir } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -6,9 +7,34 @@ import { randomUUID } from "node:crypto";
 import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.ts";
 
 /**
- * ChatGPT account admission is intentionally serialized across local Pi
- * sessions. pi-oracle can run isolated jobs concurrently, but ChatGPT's
- * account-level rate limit makes concurrent /sol submissions unreliable.
+ * Max concurrent ChatGPT /sol jobs, mirrored from pi-oracle's
+ * browser.maxConcurrentJobs (default 2).  /sol submissions are NO LONGER
+ * globally serialized: pi-oracle runs each job in its own isolated browser
+ * runtime profile cloned from one auth seed profile, so concurrent jobs are
+ * safe.  Our admission layer only enforces the same upper bound (fail-fast,
+ * friendly message) and coordinates the brief oracle_submit call.
+ */
+export function oracleMaxConcurrentJobs(env = process.env): number {
+	const fromEnv = Number(env.PI_SOL_MAX_CONCURRENT_JOBS);
+	if (Number.isInteger(fromEnv) && fromEnv >= 1 && fromEnv <= 32) return fromEnv;
+	try {
+		const cfgPath = join(env.HOME ?? homedir(), ".pi", "agent", "extensions", "oracle.json");
+		if (existsSync(cfgPath)) {
+			const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+			const value = Number(cfg?.browser?.maxConcurrentJobs);
+			if (Number.isInteger(value) && value >= 1 && value <= 32) return value;
+		}
+	} catch { /* fall back to the pi-oracle default */ }
+	return 2;
+}
+
+/**
+ * ChatGPT /sol admission now supports CONCURRENT jobs (maxConcurrentJobs,
+ * default 2, mirroring pi-oracle). pi-oracle runs each job in its own
+ * isolated browser runtime profile cloned from a single auth seed profile,
+ * so concurrent jobs do not share a browser session.  This admission layer
+ * enforces the upper bound fail-fast (friendly message instead of a queued
+ * wait) and coordinates the brief oracle_submit call itself.
  *
  * Lock protocol (audit-hardened, round 5):
  * - Coordination root lives in a per-user private state dir (PI_SOL_STATE_DIR,
@@ -260,19 +286,23 @@ function busyReason(activeJobs: SolJobSummary[], lockPath?: string): string {
 			.map((job) => `${job.id} (${job.status})`)
 			.join(", ");
 		const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
-		return `Another ChatGPT /sol job is active: ${shown}${suffix}. Wait for it to finish, then use /sol-read <job-id>. Do not retry this submission.`;
+		return `ChatGPT /sol concurrency limit reached: active jobs ${shown}${suffix}. Wait for one to finish, then use /sol-read <job-id> and retry.`;
 	}
 	const recovery = lockPath
-		? ` If you are sure no other /sol is running, remove the stale lock: rm -rf ${lockPath}`
+		? ` If you are sure no other /sol is running, remove the stale coordination lock: rm -rf ${lockPath}`
 		: "";
-	return `Another Pi session is currently admitting a ChatGPT /sol submission. Wait briefly and retry after it finishes. Do not open a second submission.${recovery}`;
+	return `Another Pi session is currently admitting a ChatGPT /sol submission; the admission coordination lock is briefly held. Wait briefly and retry.${recovery}`;
 }
 
 /** Acquire a short-lived cross-Pi admission lease before oracle_submit.
  * @param stateDir - per-user private dir for the lock (default: ~/.pi/agent/state)
  * @param jobsDir - oracle job storage dir for active-job scan (default: getOracleJobsDir())
  */
-export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir = getOracleJobsDir()): Promise<SolSubmitAdmission> {
+export async function acquireSolSubmitLease(
+	stateDir = getSolStateDir(),
+	jobsDir = getOracleJobsDir(),
+	maxConcurrentJobs = oracleMaxConcurrentJobs(),
+): Promise<SolSubmitAdmission> {
 	const path = lockPath(stateDir);
 	try {
 		await mkdir(stateDir, { recursive: true, mode: 0o700 });
@@ -286,45 +316,40 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 	}
 	await sweepStaleStaging(stateDir);
 	const token = randomUUID();
-	for (let attempt = 0; attempt < 4; attempt += 1) {
+	const activeJobs = listActiveSolJobs(jobsDir);
+	if (activeJobs.length >= maxConcurrentJobs) {
+		return { acquired: false, reason: busyReason(activeJobs), activeJobs };
+	}
+	for (let attempt = 0; attempt < 6; attempt += 1) {
 		const staging = await createStagingDir(stateDir);
 		const owner: LeaseOwner = { token, pid: process.pid, createdAt: new Date().toISOString() };
 		const published = await atomicPublishLock(staging, path, owner);
 		if (!published) {
-			// EEXIST: another process holds the lock. Reclaim only when its
-			// owner is provably dead AND the TTL elapsed; otherwise busy.
-			if (!(await isStaleLock(path))) {
-				return { acquired: false, reason: busyReason([], path), activeJobs: listActiveSolJobs(jobsDir) };
+			// EEXIST: another process holds the coordination lock.  In
+			// parallel mode we do NOT reject a live holder — the oracle_submit
+			// call is brief and the lock is released quickly.  Reclaim a stale
+			// lock (crashed owner) so the path doesn't wedge.  Otherwise wait
+			// briefly, re-check the upper bound, and retry.
+			if (await isStaleLock(path)) {
+				const releaseToken = await acquireReclaimToken(stateDir);
+				if (!releaseToken) continue;
+				try {
+					const observed = await readOwner(path);
+					if (!observed || !(await isStaleLock(path))) continue;
+					const { moved, keep } = await moveReclaimCandidate(path, observed);
+					if (!moved || !keep) continue;
+				} finally { await releaseToken(); }
+				continue;
 			}
-			// Serialize the reclaim under the reclaim token: only one process
-			// may mutate the fixed lock path at a time.
-			const releaseToken = await acquireReclaimToken(stateDir);
-			if (!releaseToken) continue; // another reclaimer in progress; retry
-			try {
-				// Re-verify under the token: read the CURRENT owner and confirm
-				// the lock is still stale before touching it.
-				const observed = await readOwner(path);
-				if (!observed || !(await isStaleLock(path))) continue;
-				// Generation-bound move (audit round 7): even if the reclaim
-				// token were double-held (a paused holder whose live token was
-				// displaced), the SUBMIT LOCK itself is only removed when the
-				// moved dir is exactly the stale generation we observed.  A
-				// newer live lock is restored/kept, never deleted — the
-				// submit-lock split-brain cannot re-open.
-				const { moved, keep } = await moveReclaimCandidate(path, observed);
-				if (!moved || !keep) continue;
-			} finally {
-				await releaseToken();
+			// Live holder: wait for the brief oracle_submit call to release it.
+			await new Promise((r) => setTimeout(r, 100));
+			const active = listActiveSolJobs(jobsDir);
+			if (active.length >= maxConcurrentJobs) {
+				return { acquired: false, reason: busyReason(active), activeJobs: active };
 			}
 			continue;
 		}
-		// Fresh lock atomically published to the fixed path.
-		const activeJobs = listActiveSolJobs(jobsDir);
-		if (activeJobs.length > 0) {
-			// We own this fresh lock; remove it before reporting busy.
-			await rm(path, { recursive: true, force: true }).catch(() => undefined);
-			return { acquired: false, reason: busyReason(activeJobs), activeJobs };
-		}
+		// Fresh lock atomically published.
 		return { acquired: true, lease: { path, token } };
 	}
 	return { acquired: false, reason: busyReason([], path), activeJobs: listActiveSolJobs(jobsDir) };

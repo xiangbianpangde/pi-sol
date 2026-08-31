@@ -92,7 +92,7 @@ describe("sol extension registration", () => {
 		}
 	});
 
-	it("blocks a second ChatGPT submission when another Pi session is active", async () => {
+	it("allows a second ChatGPT submission while one Pi session is active; blocks only at the concurrency limit", async () => {
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-active-jobs-"));
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-active-state-"));
 		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
@@ -108,13 +108,27 @@ describe("sol extension registration", () => {
 			);
 			const { handlers } = loadSol();
 			const toolCall = handlers.get("tool_call") as ToolHandler;
-			const blocked = await toolCall({
+			// One active job is below the default limit (2): admission succeeds.
+			const admitted = await toolCall({
 				toolCallId: "call-2",
 				toolName: "oracle_submit",
 				input: { provider: "chatgpt", prompt: "second" },
 			});
+			assert.notEqual(admitted?.block, true);
+			// Second active job reaches the limit: now it must block fail-fast.
+			const activeDir2 = join(jobsDir, "oracle-active2");
+			await mkdir(activeDir2, { recursive: true });
+			await writeFile(
+				join(activeDir2, "job.json"),
+				JSON.stringify({ id: "active2", status: "waiting", selection: { provider: "chatgpt" } }),
+			);
+			const blocked = await toolCall({
+				toolCallId: "call-3",
+				toolName: "oracle_submit",
+				input: { provider: "chatgpt", prompt: "third" },
+			});
 			assert.equal(blocked?.block, true);
-			assert.match(String(blocked?.reason), /active.*active.*waiting|active.*waiting/i);
+			assert.match(String(blocked?.reason), /concurrency limit/i);
 		} finally {
 			if (previousJobsDir === undefined) delete process.env.PI_ORACLE_JOBS_DIR;
 			else process.env.PI_ORACLE_JOBS_DIR = previousJobsDir;

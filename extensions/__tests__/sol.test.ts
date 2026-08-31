@@ -448,18 +448,28 @@ describe("jobs + prompt", () => {
 		}
 	});
 
-	it("blocks admission while another ChatGPT job is active and recovers after it ends", async () => {
+	it("allows a second job while one ChatGPT job is active, blocks at the concurrency limit, recovers after one ends (parallel mode)", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
 		try {
 			const activeDir = join(jobsDir, "oracle-active");
 			await mkdir(activeDir, { recursive: true });
 			await writeFile(join(activeDir, "job.json"), JSON.stringify({ id: "active", status: "waiting", selection: { provider: "chatgpt" } }));
+			// One active job is below the default limit (2): admission succeeds.
+			const admitted = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(admitted.acquired, true);
+			if (admitted.acquired) await releaseSolSubmitLease(admitted.lease);
+
+			// Two active jobs reach the limit (maxConcurrentJobs=2): blocked.
+			const activeDir2 = join(jobsDir, "oracle-active2");
+			await mkdir(activeDir2, { recursive: true });
+			await writeFile(join(activeDir2, "job.json"), JSON.stringify({ id: "active2", status: "waiting", selection: { provider: "chatgpt" } }));
 			const blocked = await acquireSolSubmitLease(stateDir, jobsDir);
 			assert.equal(blocked.acquired, false);
-			if (!blocked.acquired) assert.match(blocked.reason, /active/);
+			if (!blocked.acquired) assert.match(blocked.reason, /concurrency limit/);
 
-			await rm(activeDir, { recursive: true, force: true });
+			// One job ends → admission succeeds again.
+			await rm(activeDir2, { recursive: true, force: true });
 			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
 			assert.equal(acquired.acquired, true);
 			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);

@@ -4,11 +4,13 @@
 
 | Layer | Owns |
 |---|---|
-| `extensions/sol.ts` | Slash commands, file staging, ChatGPT URL guard, patch restore |
+| `extensions/sol.ts` | Slash commands, file staging, ChatGPT URL guard, cross-Pi submit admission, patch restore |
 | Local Pi model | `oracle_preflight` / `oracle_auth` / `oracle_submit` / `oracle_read` |
 | pi-oracle worker | Isolated Chrome, ChatGPT UI, High selection, upload, response |
 
 The extension never drives chatgpt.com. `agent_browser` on ChatGPT hosts is blocked so it cannot steal the oracle session.
+
+Before `oracle_submit`, `lib/sol/admission.ts` takes a short atomic local lease and inspects `$PI_ORACLE_JOBS_DIR` for active ChatGPT jobs (`queued`, `preparing`, `submitted`, `waiting`). This deliberately serializes ChatGPT account submissions across local Pi processes: pi-oracle may support isolated-profile concurrency, but the ChatGPT account-level rate limit makes concurrent `/sol` submissions unsafe. Terminal jobs do not block; a bounded TTL recovers a lease after a crashed Pi process.
 
 ## ChatGPT Plus UI (2026-08)
 
@@ -35,5 +37,17 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 
 - Installed version == vendored `0.7.20` and markers missing → copy vendor worker files back.
 - Installed version != `0.7.20` → refuse. A newer worker must be re-vendored, not clobbered.
+
+## Cross-session submission admission
+
+The admission path is intentionally separate from browser ownership and conversation leases:
+
+1. The `tool_call` hook sees `oracle_submit` before execution.
+2. For ChatGPT (the `/sol` provider), it atomically creates `pi-sol-submit.lock` under `$PI_ORACLE_JOBS_DIR`.
+3. It reads durable `oracle-*/job.json` records and blocks when any job is still open.
+4. The block reason names the active job and tells the model to stop and use `/sol-read <job-id>`; it never changes the preset or silently retries.
+5. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease. A 15-minute TTL makes crashed locks recoverable.
+
+This closes the race between separate Pi processes while retaining pi-oracle's own same-`conversationId` lease for explicit follow-ups.
 
 Operator is the in-Pi model, not the human.

@@ -35,6 +35,7 @@
 - 🎯 **Guaranteed High Reasoning**: Uses the fixed `thinking_extended` (Plus High) preset; **never silently falls back** to Instant or Standard.
 - 📁 **Strict Opt-in File Staging**: Only user-specified files (`--files a,b`) are sent. Repositories are never auto-archived.
 - 🛡️ **Session Guard**: Automatically blocks `agent_browser` on ChatGPT domains to avoid browser session collisions.
+- 🔒 **Cross-Pi Admission**: Serializes ChatGPT submissions across local Pi sessions and reports the active job instead of silently colliding.
 - 🔄 **Self-Healing Patches**: Automatically manages compatibility patches for ChatGPT Plus High UI (2026-08 compact & Power-slider).
 - ⏳ **Sync & Background Modes**: Block for immediate reasoning answers or run `--bg` jobs with persistent `/sol-read` retrieval.
 
@@ -148,6 +149,7 @@ After verifying the smoke test, ask a real question:
 | `/sol-followup <job-id> [--bg] [--files a,b] <prompt>` | Continue an existing `/sol` ChatGPT conversation thread. |
 | `/sol-read [job-id]` | Read a saved job result. Defaults to the latest discovered `oracle-*` job. |
 | `/sol-auth` | Sync ChatGPT cookies from local Chrome into pi-oracle's isolated browser seed. |
+| `/sol-diag [--last N] [--candidates]` | Inspect record-only trigger diagnostics. |
 
 > `/sol --follow <job-id> <prompt>` and `/sol-followup <job-id> <prompt>` **both continue an existing `/sol` ChatGPT thread**. Use whichever form is more convenient.
 
@@ -157,6 +159,8 @@ After verifying the smoke test, ask a real question:
 - **`--bg`**: Submits in the background and returns a job ID; read it later with `/sol-read <job-id>`.
 - **`--files a,b`**: Attach only explicitly listed files. Repositories are never auto-archived.
 - **`--follow <job-id>`**: Continue an existing ChatGPT thread from an earlier `/sol` turn.
+
+ChatGPT submissions are serialized across local Pi sessions. If another `/sol` job is queued or running, the new submission is blocked with its job ID; wait for it to finish and use `/sol-read <job-id>`. This is an account-level rate-limit safeguard, not a limitation on pi-oracle's isolated browser profiles.
 
 ---
 
@@ -253,6 +257,12 @@ ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. `
 - Images: **20 MiB** | Spreadsheets: **50 MiB** | Text/Docs: **20 MiB** proxy limit.
 - **Rejected locally**: Executables and installers (`.exe`, `.dmg`, `.apk`, ...).
 
+### Cross-session submission admission
+- A short atomic lease protects the `oracle_submit` handoff across local Pi processes.
+- Active `job.json` states (`queued`, `preparing`, `submitted`, `waiting`) are treated as busy.
+- Terminal jobs do not block new work; crashed admission locks are reclaimed after a bounded TTL.
+- A rate-limit error remains an account quota condition: do not bypass it by changing presets.
+
 ---
 
 ## Troubleshooting
@@ -313,7 +323,19 @@ Check that:
 </details>
 
 <details>
-<summary><b>6. <code>agent_browser</code> refuses to open chatgpt.com</b></summary>
+<summary><b>6. Another <code>/sol</code> job is active</b></summary>
+
+<br/>
+
+This is intentional cross-Pi admission control. Wait for the reported job to finish, then inspect it with:
+```text
+/sol-read <job-id>
+```
+Do not retry repeatedly or open ChatGPT in `agent_browser`. If the eventual error says `rate limit`, the ChatGPT account quota window is exhausted and must be allowed to recover.
+</details>
+
+<details>
+<summary><b>7. <code>agent_browser</code> refuses to open chatgpt.com</b></summary>
 
 <br/>
 
@@ -375,7 +397,7 @@ pi-sol/
 │   ├── lib/sol/                 # Parsers, guard, file staging, patches
 │   └── __tests__/               # Node test suite
 ├── skills/
-│   └── sol/SKILL.md             # In-Pi agent operational guide
+│   └── sol/                     # In-Pi agent operational guide + changelog
 └── scripts/
     ├── install.sh               # Install to ~/.pi/agent
     ├── record-demo.tape         # Automated VHS demo script

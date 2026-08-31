@@ -4,15 +4,17 @@
  * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-patches.test.ts
  */
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
-import { ensureSolOraclePatches, SOL_PATCH_MARKERS } from "../lib/sol/patches.ts";
+import { ensureSolOraclePatches, SOL_PATCH_FILE, SOL_PATCH_MARKERS } from "../lib/sol/patches.ts";
 
 const VENDOR = join(dirname(fileURLToPath(import.meta.url)), "../lib/sol/vendor");
+const WORKER_FILES = ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs"];
 
 function fakeOracleRoot(version = "0.7.20") {
 	const root = mkdtempSync(join(tmpdir(), "sol-oracle-"));
@@ -20,6 +22,28 @@ function fakeOracleRoot(version = "0.7.20") {
 	mkdirSync(worker, { recursive: true });
 	writeFileSync(join(root, "package.json"), JSON.stringify({ name: "pi-oracle", version }));
 	return { root, worker };
+}
+
+/** Temp vendor dir seeded from the real vendor copies (patch file included). */
+function fakeVendorDir() {
+	const vendor = mkdtempSync(join(tmpdir(), "sol-vendor-"));
+	for (const name of [...WORKER_FILES, "ORACLE_VERSION", SOL_PATCH_FILE]) {
+		copyFileSync(join(VENDOR, name), join(vendor, name));
+	}
+	return vendor;
+}
+
+/** Worker files as pristine upstream: vendor content with the patch reversed. */
+function writePristineWorker(root, worker, vendor) {
+	for (const name of WORKER_FILES) {
+		copyFileSync(join(vendor, name), join(worker, name));
+	}
+	const reversed = spawnSync(
+		"patch",
+		["-R", "-p1", "-s", "-t", "--no-backup-if-mismatch", "-d", root, "-i", join(vendor, SOL_PATCH_FILE)],
+		{ encoding: "utf8" },
+	);
+	assert.equal(reversed.status, 0, `patch -R failed: ${reversed.stderr}`);
 }
 
 describe("ensureSolOraclePatches", () => {
@@ -96,5 +120,65 @@ describe("ensureSolOraclePatches", () => {
 	it("ships vendor copies next to the extension", () => {
 		assert.equal(existsSync(join(VENDOR, "run-job.mjs")), true);
 		assert.equal(existsSync(join(VENDOR, "chatgpt-ui-helpers.mjs")), true);
+		assert.equal(existsSync(join(VENDOR, SOL_PATCH_FILE)), true);
+	});
+
+	it("re-applies the patch to a newer pristine pi-oracle instead of overwriting it", () => {
+		const { root, worker } = fakeOracleRoot("0.8.0");
+		const vendor = fakeVendorDir();
+		try {
+			writePristineWorker(root, worker, vendor);
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true);
+			assert.equal(result.revendored, true);
+			assert.equal(readFileSync(join(vendor, "ORACLE_VERSION"), "utf8").trim(), "0.8.0");
+			assert.equal(readFileSync(join(vendor, "previous", "ORACLE_VERSION"), "utf8").trim(), "0.7.20");
+			for (const needle of SOL_PATCH_MARKERS.runJob) {
+				assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("fails loudly when the patch does not apply to a newer pi-oracle", () => {
+		const { root, worker } = fakeOracleRoot("0.8.0");
+		const vendor = fakeVendorDir();
+		try {
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "UPSTREAM_0_8_0\n");
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.equal(result.restored, false);
+			assert.match(String(result.error), /0\.8\.0/);
+			assert.match(String(result.error), /patch/i);
+			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /UPSTREAM_0_8_0/);
+			assert.equal(readFileSync(join(vendor, "ORACLE_VERSION"), "utf8").trim(), "0.7.20");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects restored worker files that fail node --check", () => {
+		const { root, worker } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
+			// Vendor copy carries all markers but is syntactically broken.
+			const broken = `${SOL_PATCH_MARKERS.runJob.join("\n")}\nasync function broken( {\n`;
+			writeFileSync(join(vendor, "run-job.mjs"), broken);
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.match(String(result.error), /node --check/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
 	});
 });

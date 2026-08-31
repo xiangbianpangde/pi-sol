@@ -11,6 +11,7 @@ export function getOracleJobsDir(env = process.env): string {
 export type SolJobSummary = {
 	id: string;
 	status: string;
+	provider?: string;
 	error?: string;
 	responsePath?: string;
 	responsePreview?: string;
@@ -31,6 +32,8 @@ export function readSolJob(jobIdOrDir: string, jobsDir = getOracleJobsDir()): So
 		const raw = JSON.parse(readFileSync(jobPath, "utf8")) as {
 			id?: string;
 			status?: string;
+			provider?: string;
+			selection?: { provider?: string };
 			error?: string;
 			responsePath?: string;
 			chatUrl?: string;
@@ -48,6 +51,7 @@ export function readSolJob(jobIdOrDir: string, jobsDir = getOracleJobsDir()): So
 		return {
 			id: raw.id ?? jobIdOrDir,
 			status: raw.status ?? "unknown",
+			provider: raw.provider ?? raw.selection?.provider,
 			error: raw.error,
 			responsePath,
 			responsePreview,
@@ -70,6 +74,21 @@ export function listRecentSolJobIds(limit = 5, jobsDir = getOracleJobsDir()): st
 		.reverse()
 		.slice(0, limit)
 		.map((dir) => dir.replace(/^.*oracle-/, ""));
+}
+
+const ACTIVE_SOL_JOB_STATUSES = new Set(["queued", "preparing", "submitted", "waiting"]);
+
+/** Jobs that can still consume ChatGPT account/browser capacity. */
+export function listActiveSolJobs(jobsDir = getOracleJobsDir()): SolJobSummary[] {
+	if (!existsSync(jobsDir)) return [];
+	return readdirSync(jobsDir)
+		.filter((name) => name.startsWith("oracle-"))
+		.map((name) => join(jobsDir, name))
+		.filter((dir) => existsSync(join(dir, "job.json")))
+		.map((dir) => readSolJob(dir, jobsDir))
+		.filter((job): job is SolJobSummary => Boolean(job))
+		.filter((job) => ACTIVE_SOL_JOB_STATUSES.has(job.status) && job.provider !== "grok")
+		.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 export function formatSolJobSummary(job: SolJobSummary): string {

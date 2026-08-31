@@ -8,9 +8,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
+import { acquireSolSubmitLease, releaseSolSubmitLease } from "../lib/sol/admission.ts";
 import { stageSolFiles, validateSolFileMeta } from "../lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard.ts";
-import { formatSolJobSummary, readSolJob } from "../lib/sol/jobs.ts";
+import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
 import { MAX_IMAGE_BYTES, SOL_PRESET } from "../lib/sol/limits.ts";
 import { parseSolInput } from "../lib/sol/parse.ts";
 import { buildSolDispatchPrompt, buildSolStandingRule } from "../lib/sol/prompt.ts";
@@ -121,6 +122,56 @@ describe("guard", () => {
 });
 
 describe("jobs + prompt", () => {
+	it("lists only active ChatGPT jobs for admission", async () => {
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		try {
+			for (const [id, status, provider] of [
+				["active", "waiting", "chatgpt"],
+				["done", "complete", "chatgpt"],
+				["grok", "waiting", "grok"],
+			] as const) {
+				const dir = join(jobsDir, `oracle-${id}`);
+				await mkdir(dir, { recursive: true });
+				await writeFile(join(dir, "job.json"), JSON.stringify({ id, status, selection: { provider } }));
+			}
+			assert.deepEqual(listActiveSolJobs(jobsDir).map((job) => job.id), ["active"]);
+		} finally {
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("allows only one simultaneous admission across Pi processes", async () => {
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		try {
+			const results = await Promise.all([acquireSolSubmitLease(jobsDir), acquireSolSubmitLease(jobsDir)]);
+			assert.equal(results.filter((result) => result.acquired).length, 1);
+			for (const result of results) {
+				if (result.acquired) await releaseSolSubmitLease(result.lease);
+			}
+		} finally {
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("blocks admission while another ChatGPT job is active and recovers after it ends", async () => {
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		try {
+			const activeDir = join(jobsDir, "oracle-active");
+			await mkdir(activeDir, { recursive: true });
+			await writeFile(join(activeDir, "job.json"), JSON.stringify({ id: "active", status: "waiting", selection: { provider: "chatgpt" } }));
+			const blocked = await acquireSolSubmitLease(jobsDir);
+			assert.equal(blocked.acquired, false);
+			if (!blocked.acquired) assert.match(blocked.reason, /active/);
+
+			await rm(activeDir, { recursive: true, force: true });
+			const acquired = await acquireSolSubmitLease(jobsDir);
+			assert.equal(acquired.acquired, true);
+			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
+		} finally {
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("reads a fake oracle job", async () => {
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
 		try {
@@ -150,6 +201,7 @@ describe("jobs + prompt", () => {
 		assert.match(text, /oracle_auth/);
 		assert.match(text, /Do not archive the whole repository/);
 		assert.match(text, /Never retry Instant\/Standard/);
+		assert.match(text, /submissions are serialized across local Pi sessions/);
 		assert.match(text, /Never tell the user to run apply scripts/);
 		assert.match(text, /\.pi\/sol-staging\/x\/a\.ts/);
 	});

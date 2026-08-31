@@ -4,10 +4,13 @@
  */
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+
+// Keep record-only /sol trigger diagnostics inert during this load test.
+process.env.PI_SOL_TRIGGER_LOG = "off";
 
 import solExtension from "../sol.ts";
 
@@ -16,7 +19,7 @@ type StartHandler = (
 	ctx: { cwd: string },
 ) => Promise<{ systemPrompt?: string; message?: { content?: string; display?: boolean; customType?: string } } | undefined>;
 
-type ToolHandler = (event: { toolName: string; input: unknown }) => Promise<{ block?: boolean; reason?: string } | undefined>;
+type ToolHandler = (event: { toolCallId?: string; toolName: string; input: unknown }) => Promise<{ block?: boolean; reason?: string } | undefined>;
 
 function loadSol() {
 	const commands = new Map<string, { description: string; handler: Function }>();
@@ -89,10 +92,38 @@ describe("sol extension registration", () => {
 		}
 	});
 
+	it("blocks a second ChatGPT submission when another Pi session is active", async () => {
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-active-jobs-"));
+		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
+		process.env.PI_ORACLE_JOBS_DIR = jobsDir;
+		try {
+			const activeDir = join(jobsDir, "oracle-active");
+			await mkdir(activeDir, { recursive: true });
+			await writeFile(
+				join(activeDir, "job.json"),
+				JSON.stringify({ id: "active", status: "waiting", selection: { provider: "chatgpt" } }),
+			);
+			const { handlers } = loadSol();
+			const toolCall = handlers.get("tool_call") as ToolHandler;
+			const blocked = await toolCall({
+				toolCallId: "call-2",
+				toolName: "oracle_submit",
+				input: { provider: "chatgpt", prompt: "second" },
+			});
+			assert.equal(blocked?.block, true);
+			assert.match(String(blocked?.reason), /active.*active.*waiting|active.*waiting/i);
+		} finally {
+			if (previousJobsDir === undefined) delete process.env.PI_ORACLE_JOBS_DIR;
+			else process.env.PI_ORACLE_JOBS_DIR = previousJobsDir;
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("blocks agent_browser from opening ChatGPT", async () => {
 		const { handlers } = loadSol();
 		const toolCall = handlers.get("tool_call") as ToolHandler;
 		const blocked = await toolCall({
+			toolCallId: "browser-1",
 			toolName: "agent_browser",
 			input: { args: ["open", "https://chatgpt.com/"] },
 		});

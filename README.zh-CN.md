@@ -35,6 +35,7 @@
 - 🎯 **锁定 High 推理档位**：固定使用 `thinking_extended`（Plus High）预设，**绝不静默降级**至 Instant 或 Standard。
 - 📁 **严格文件显式暂存**：仅发送通过 `--files a,b` 明确指定的文件，绝不自动打包或上传全项目代码。
 - 🛡️ **浏览器会话防冲突**：自动拦截 `agent_browser` 访问 ChatGPT 域名，防止双重自动化抢占登录态。
+- 🔒 **跨 Pi 提交仲裁**：跨本机多个 Pi 会话串行化 ChatGPT 提交，遇到占用时明确报告任务，不再静默冲突退出。
 - 🔄 **自动补丁维护**：内置适配 2026-08 ChatGPT Plus 紧凑型 UI 与 Power-slider 滑块的 worker 补丁与自动恢复机制。
 - ⏳ **同步与后台双模式**：支持阻塞等待实时解答，也支持 `--bg` 后台提交并在稍后通过 `/sol-read` 查阅。
 
@@ -148,6 +149,7 @@ cd pi-sol
 | `/sol-followup <job-id> [--bg] [--files a,b] <prompt>` | 继续之前的 `/sol` ChatGPT 对话上下文。 |
 | `/sol-read [job-id]` | 读取已保存的任务结果。未指定 ID 时默认读取最新发现的 `oracle-*` 任务。 |
 | `/sol-auth` | 将本地 Chrome 的 ChatGPT 登录 Cookie 同步到 pi-oracle 隔离环境。 |
+| `/sol-diag [--last N] [--candidates]` | 查看只记录、不改变行为的触发诊断日志。 |
 
 > `/sol --follow <job-id> <prompt>` 和 `/sol-followup <job-id> <prompt>` **均可用于继续已有会话**，按个人习惯选用即可。
 
@@ -157,6 +159,8 @@ cd pi-sol
 - **`--bg`**：后台提交任务并立即返回任务 ID，稍后使用 `/sol-read <job-id>` 查看。
 - **`--files a,b`**：仅附加明确列出的文件。绝不自动全量扫描或打包仓库。
 - **`--follow <job-id>`**：跟随上一次 `/sol` 调用的对话线索。
+
+ChatGPT 提交会在本机多个 Pi 会话之间串行化。如果已有 `/sol` 任务排队或运行，新提交会被阻止并显示任务 ID；等待完成后使用 `/sol-read <job-id>`。这是针对账号级限流的保护，不是 pi-oracle 隔离浏览器 profile 的并发限制。
 
 ---
 
@@ -248,6 +252,12 @@ ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻
 - 图片上限 **20 MiB** | 表格上限 **50 MiB** | 文本上限 **20 MiB**。
 - **本地拦截**：常见可执行程序与安装包（`.exe`, `.dmg`, `.apk` 等）。
 
+### 跨会话提交仲裁
+- 使用短时原子租约保护 `oracle_submit` 的跨 Pi 进程交接。
+- `queued`、`preparing`、`submitted`、`waiting` 状态的 `job.json` 会被视为正在占用。
+- 终态任务不阻塞新任务；Pi 崩溃遗留的提交锁会在有限 TTL 后回收。
+- 如果最终错误是 `rate limit`，仍表示账号配额窗口耗尽，不能通过切换模型档位绕过。
+
 ---
 
 ## 故障排查
@@ -308,7 +318,19 @@ ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻
 </details>
 
 <details>
-<summary><b>6. <code>agent_browser</code> 拒绝打开 chatgpt.com</b></summary>
+<summary><b>6. 提示另一个 <code>/sol</code> 任务正在运行</b></summary>
+
+<br/>
+
+这是有意的跨 Pi 提交仲裁。等待提示中的任务完成，然后查看：
+```text
+/sol-read <job-id>
+```
+不要反复重试，也不要用 `agent_browser` 直接打开 ChatGPT。如果最终提示 `rate limit`，应等待 ChatGPT 账号配额窗口恢复。
+</details>
+
+<details>
+<summary><b>7. <code>agent_browser</code> 拒绝打开 chatgpt.com</b></summary>
 
 <br/>
 

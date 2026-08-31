@@ -1,0 +1,454 @@
+--- a/extensions/oracle/worker/chatgpt-ui-helpers.mjs
++++ b/extensions/oracle/worker/chatgpt-ui-helpers.mjs
+@@ -30,6 +30,8 @@
+ const PRO_THINKING_EFFORT_COMBOBOX_LABEL = "Pro thinking effort";
+ const EFFORT_LABELS = new Set(["Light", "Standard", "Extended", "Heavy"]);
+ const COMPACT_INTELLIGENCE_MENU_PATTERN = /(?:Intelligence.*Instant.*Medium.*High.*Pro|^(?:Instant|Medium|High|Extra High|Pro(?: Standard| Extended)?)$)/i;
++const LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN = /Intelligence.*Instant.*Medium.*High.*Pro/i;
++const POWER_SLIDER_MENUITEM_PATTERN = /^(?:Power|Show advanced options)$/i;
+ // Bare Instant is the legacy top-level family radio; compact Instant rows are versioned (Instant 5s / Instant 5.5).
+ const COMPACT_INTELLIGENCE_CONTROL_PATTERN = /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i;
+ const COMPACT_INTELLIGENCE_OPENER_PATTERN = /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i;
+@@ -256,8 +258,51 @@
+   );
+ }
+ 
++function hasLegacyCompactIntelligenceMenu(entries) {
++  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
++    || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && Boolean(parseCompactIntelligenceSelection(entry.label)));
++}
++
++function isPowerSliderCompactMenu(entries) {
++  if (hasLegacyCompactIntelligenceMenu(entries)) return false;
++  const hasPowerChrome = entries.some((entry) => {
++    if (entry.disabled || entry.kind !== "menuitem") return false;
++    return POWER_SLIDER_MENUITEM_PATTERN.test(normalizeChipLabel(entry.label));
++  });
++  if (!hasPowerChrome) return false;
++  return entries.some((entry) => {
++    if (entry.disabled) return false;
++    if (entry.kind === "menu" || entry.kind === "button") {
++      return Boolean(parseCompactIntelligenceSelection(entry.label)) || /^Instant$/i.test(normalizeChipLabel(entry.label));
++    }
++    return false;
++  });
++}
++
++function detectPowerSliderSelection(entries) {
++  if (!isPowerSliderCompactMenu(entries)) return undefined;
++  for (const entry of entries) {
++    if (entry.disabled || entry.kind !== "button") continue;
++    const parsed = parseCompactIntelligenceSelection(entry.label);
++    if (parsed) return parsed;
++    if (/^Instant$/i.test(normalizeChipLabel(entry.label))) {
++      return {
++        modelFamily: /** @type {OracleUiModelFamily} */ ("instant"),
++        compactTier: "instant",
++      };
++    }
++  }
++  for (const entry of entries) {
++    if (entry.disabled || entry.kind !== "menu") continue;
++    const parsed = parseCompactIntelligenceSelection(entry.label);
++    if (parsed) return parsed;
++  }
++  return undefined;
++}
++
+ function hasCompactIntelligenceMenuContext(entries) {
+-  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
++  if (isPowerSliderCompactMenu(entries)) return false;
++  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
+     || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && checkedState(entry) === true && compactSelectionFromEntry(entry, entries));
+ }
+ 
+@@ -351,6 +396,9 @@
+   if (hasRemovableComposerModelChip(entries)) return undefined;
+   if (hasLegacyEffortCombobox(entries)) return undefined;
+ 
++  const powerSliderSelection = detectPowerSliderSelection(entries);
++  if (powerSliderSelection) return powerSliderSelection;
++
+   for (const entry of entries) {
+     if (entry.kind !== "menuitemradio" || checkedState(entry) !== true) continue;
+     const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: false });
+@@ -361,7 +409,7 @@
+ 
+   for (const entry of entries) {
+     if (entry.kind !== "button") continue;
+-    const compactSelection = compactSelectionFromEntry(entry, entries);
++    const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: true });
+     if (!compactSelection) continue;
+     return compactSelection;
+   }
+@@ -444,6 +492,17 @@
+   /** @type {SnapshotEntry[]} */
+   const entries = parseSnapshotEntries(snapshot);
+   const normalizedEffort = effortLabel.toLowerCase();
++  const powerSliderSelection = detectPowerSliderSelection(entries);
++  if (powerSliderSelection?.modelFamily === "thinking") {
++    return compactSelectionMatchesRequested(
++      {
++        modelFamily: "thinking",
++        effort: /** @type {import("./chatgpt-ui-helpers.d.mts").OracleUiEffort} */ (normalizedEffort),
++        autoSwitchToThinking: false,
++      },
++      powerSliderSelection,
++    );
++  }
+   const compactClosedButtonsAllowed = !hasRemovableComposerModelChip(entries) && !hasLegacyEffortCombobox(entries) && !hasCompactIntelligenceMenuContext(entries);
+   return entries.some((entry) => {
+     if (entry.disabled) return false;
+@@ -496,8 +555,8 @@
+   const visibleCompactControls = entries.filter(
+     (entry) => !entry.disabled && entry.kind === "menuitemradio" && compactSelectionFromEntry(entry, entries),
+   );
+-  const hasCompactIntelligenceMenu = entries.some(
+-    (entry) => !entry.disabled && entry.kind === "menu" && COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)),
++  const hasCompactIntelligenceMenu = !isPowerSliderCompactMenu(entries) && entries.some(
++    (entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)),
+   );
+   const hasIntelligenceHeading = entries.some((entry) => entry.kind === "heading" && normalizeText(entry.label) === "Intelligence" && !entry.disabled);
+   const hasEffortCombobox = entries.some(
+@@ -510,6 +569,65 @@
+  * @param {string} snapshot
+  * @returns {boolean}
+  */
++export function snapshotHasPowerSliderCompactMenu(snapshot) {
++  return isPowerSliderCompactMenu(parseSnapshotEntries(snapshot));
++}
++
++export function describeCompactComposerSelection(snapshot) {
++  const compactSelection = detectCompactIntelligenceSelection(parseSnapshotEntries(snapshot));
++  if (!compactSelection) return undefined;
++  return compactSelection.compactTier || compactSelection.modelFamily;
++}
++
++const CHATGPT_STOP_CONTROL_PATTERN = /button "Stop (?:streaming|answering|generating)"/i;
++const CHATGPT_COPY_CONTROL_PATTERN = /button "Copy(?: response| message)?"/g;
++
++/**
++ * True only for the live stop control. Do not match those words inside the reply body —
++ * that kept waitForChatCompletion running for minutes after the tab already showed the answer.
++ * @param {string} snapshot
++ * @returns {boolean}
++ */
++export function snapshotHasChatGptStopControl(snapshot) {
++  return CHATGPT_STOP_CONTROL_PATTERN.test(String(snapshot || ""));
++}
++
++/**
++ * @param {string} snapshot
++ * @returns {boolean}
++ */
++export function snapshotHasChatGptSendReady(snapshot) {
++  return parseSnapshotEntries(snapshot).some(
++    (entry) => entry.kind === "button" && entry.label === "Send prompt" && !entry.disabled,
++  );
++}
++
++/**
++ * After a reply finishes the empty composer shows Voice, not Send prompt.
++ * That idle chrome means ChatGPT is done; requiring Send prompt kept /sol
++ * polling for tens of minutes after the tab already had the answer.
++ * @param {string} snapshot
++ * @returns {boolean}
++ */
++export function snapshotHasChatGptComposerIdle(snapshot) {
++  if (snapshotHasChatGptStopControl(snapshot)) return false;
++  const entries = parseSnapshotEntries(snapshot);
++  const hasComposer = entries.some(
++    (entry) => entry.kind === "textbox" && entry.label === "Chat with ChatGPT" && !entry.disabled,
++  );
++  if (!hasComposer) return false;
++  if (snapshotHasChatGptSendReady(snapshot)) return true;
++  return entries.some((entry) => entry.kind === "button" && /^Start Voice$/i.test(String(entry.label || "")));
++}
++
++/**
++ * @param {string} snapshot
++ * @returns {number}
++ */
++export function countChatGptCopyControls(snapshot) {
++  return [...String(snapshot || "").matchAll(CHATGPT_COPY_CONTROL_PATTERN)].length;
++}
++
+ export function snapshotHasUsableComposerControls(snapshot) {
+   /** @type {SnapshotEntry[]} */
+   const entries = parseSnapshotEntries(snapshot);
+--- a/extensions/oracle/worker/chatgpt-ui-helpers.d.mts
++++ b/extensions/oracle/worker/chatgpt-ui-helpers.d.mts
+@@ -21,6 +21,12 @@
+ export declare function snapshotHasClosedCompactSelection(snapshot: string, selection: OracleUiSelection): boolean;
+ export declare function snapshotHasModelConfigurationUi(snapshot: string): boolean;
+ export declare function snapshotHasUsableComposerControls(snapshot: string): boolean;
++export declare function snapshotHasChatGptStopControl(snapshot: string): boolean;
++export declare function snapshotHasChatGptSendReady(snapshot: string): boolean;
++export declare function snapshotHasChatGptComposerIdle(snapshot: string): boolean;
++export declare function countChatGptCopyControls(snapshot: string): number;
++export declare function snapshotHasPowerSliderCompactMenu(snapshot: string): boolean;
++export declare function describeCompactComposerSelection(snapshot: string): string | undefined;
+ export declare function snapshotHasModelOpener(snapshot: string): boolean;
+ export declare function autoSwitchToThinkingSelectionVisible(snapshot: string): boolean | undefined;
+ export declare function snapshotCanSafelySkipModelConfiguration(snapshot: string, selection: OracleUiSelection): boolean;
+--- a/extensions/oracle/worker/run-job.mjs
++++ b/extensions/oracle/worker/run-job.mjs
+@@ -34,6 +34,12 @@
+   snapshotHasClosedCompactSelection,
+   snapshotHasModelConfigurationUi,
+   snapshotHasModelOpener,
++  snapshotHasPowerSliderCompactMenu,
++  describeCompactComposerSelection,
++  snapshotHasChatGptStopControl,
++  snapshotHasChatGptSendReady,
++  snapshotHasChatGptComposerIdle,
++  countChatGptCopyControls,
+   snapshotHasUsableComposerControls,
+   snapshotStronglyMatchesRequestedModel,
+   snapshotWeaklyMatchesRequestedModel,
+@@ -84,7 +90,7 @@
+ const MODEL_CONFIGURATION_SETTLE_TIMEOUT_MS = 20_000;
+ const MODEL_CONFIGURATION_SETTLE_POLL_MS = 250;
+ const MODEL_CONFIGURATION_CLOSE_RETRY_MS = 1_000;
+-const POST_SEND_SETTLE_MS = 15_000;
++const POST_SEND_SETTLE_MS = 2_000;
+ const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
+   (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
+ ) || "agent-browser";
+@@ -706,7 +712,11 @@
+ 
+ async function ensureBrowserConnected(job) {
+   if (!browserStarted || cleaningUpBrowser) return;
+-  const status = await streamStatus(job);
++  let status = await streamStatus(job);
++  if (status.connected === false) {
++    await sleep(1000);
++    status = await streamStatus(job);
++  }
+   if (status.connected === false) {
+     throw new Error("The isolated oracle browser disconnected during the job.");
+   }
+@@ -1372,7 +1382,7 @@
+     url: urlResult.url,
+     urlKnown: urlResult.ok,
+     assistantCount: Math.max(baselineAssistantCount, messages.length),
+-    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming"),
++    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
+     transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
+   };
+ }
+@@ -1427,7 +1437,38 @@
+   if (dismissed) await agentBrowser(job, "wait", "500");
+   return Boolean(dismissed);
+ }
++
++async function trySelectPowerSliderHigh(job) {
++  let snapshot = await snapshotText(job);
++  if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
+ 
++  const advanced = findEntry(
++    snapshot,
++    (candidate) => candidate.kind === "menuitem" && /show advanced options/i.test(String(candidate.label || "")) && !candidate.disabled,
++  );
++  if (advanced) {
++    await clickRef(job, advanced.ref);
++    await agentBrowser(job, "wait", "800");
++    snapshot = await snapshotText(job);
++    if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
++    const high = findEntry(
++      snapshot,
++      (candidate) => ["menuitem", "menuitemradio", "button", "radio"].includes(candidate.kind || "")
++        && /^(?:High(?:\s+15\s*[–-]\s*60s)?)$/i.test(String(candidate.label || "").replace(/\s+/g, " ").trim())
++        && !candidate.disabled,
++    );
++    if (high) {
++      await clickRef(job, high.ref);
++      await agentBrowser(job, "wait", "800");
++      snapshot = await snapshotText(job);
++      if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
++    }
++  }
++
++  const visible = describeCompactComposerSelection(snapshot) || "unknown";
++  throw new Error(`ChatGPT Power slider is ${visible}, not GPT-5.6 Sol High. /sol requires thinking_extended. Open Advanced → High and retry.`);
++}
++
+ async function openModelConfiguration(job) {
+   const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
+   let lastSnapshot = "";
+@@ -1451,6 +1492,9 @@
+       throwIfProviderTransientError(job, after, "opening model configuration");
+       if (snapshotHasModelConfigurationUi(after)) return after;
+       if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
++      if (snapshotHasPowerSliderCompactMenu(after) || /menuitem "Show advanced options"/i.test(after)) {
++        return trySelectPowerSliderHigh(job);
++      }
+ 
+       const configureEntry = findEntry(
+         after,
+@@ -1465,6 +1509,9 @@
+         throwIfProviderTransientError(job, postConfigure, "opening model configuration");
+         if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
+         if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
++        if (snapshotHasPowerSliderCompactMenu(postConfigure) || /menuitem "Show advanced options"/i.test(postConfigure)) {
++          return trySelectPowerSliderHigh(job);
++        }
+       }
+     }
+ 
+@@ -1526,14 +1573,49 @@
+   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
+ }
+ 
++async function waitForChatGptModelPicker(job, timeoutMs = 20_000) {
++  const deadline = Date.now() + timeoutMs;
++  let lastSnapshot = "";
++  while (Date.now() < deadline) {
++    lastSnapshot = await snapshotText(job);
++    if (snapshotCanSafelySkipModelConfiguration(lastSnapshot, job.selection)) return lastSnapshot;
++    if (snapshotHasModelOpener(lastSnapshot) || snapshotHasModelConfigurationUi(lastSnapshot)) return lastSnapshot;
++    if (snapshotHasUsableComposerControls(lastSnapshot)) {
++      await agentBrowser(job, "wait", "1000");
++      continue;
++    }
++    await agentBrowser(job, "wait", "500");
++  }
++  return lastSnapshot;
++}
++
+ async function configureModel(job) {
+   if (isGrokJob(job)) return configureGrokModel(job);
+-  const initialSnapshot = await snapshotText(job);
++  let assumedDefaultThinkingFallback = false;
++  let initialSnapshot = await snapshotText(job);
++  if (
++    snapshotHasUsableComposerControls(initialSnapshot)
++    && !snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)
++    && !snapshotHasModelOpener(initialSnapshot)
++    && !snapshotHasModelConfigurationUi(initialSnapshot)
++  ) {
++    await log("Composer is ready but the model picker has not hydrated yet; waiting before configuration");
++    initialSnapshot = await waitForChatGptModelPicker(job);
++  }
+   if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
+     await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
+     return;
+   }
+ 
++  if (snapshotHasPowerSliderCompactMenu(initialSnapshot) || /menuitem "Show advanced options"/i.test(initialSnapshot) || /menuitem "Power"/i.test(initialSnapshot)) {
++    await log(`Power-slider compact UI visible; selecting High instead of the legacy Instant/Thinking/Pro sheet`);
++    initialSnapshot = await trySelectPowerSliderHigh(job);
++    if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
++      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
++      return;
++    }
++  }
++
+   await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
+   let familySnapshot = await openModelConfiguration(job);
+   let verificationSnapshot = familySnapshot;
+@@ -1553,7 +1635,21 @@
+   } else if (familyAlreadySelectedInUi) {
+     await log("Model family already appears selected; verifying effort-specific settings");
+   } else if (!familyEntry) {
+-    throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
++    // ChatGPT 新 UI：首页 headless 初始快照往往没有渲染出模型选择控件（如 High 按钮），
++    // 而默认档位就是 GPT-5.6 Sol High (= thinking family, extended)。找不到控件时按默认档位继续，
++    // 不再报错；只在非默认 family (pro/instant) 下才严格报错。
++    if (job.selection.modelFamily === "thinking") {
++      const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
++      if (visible && visible !== "high") {
++        throw new Error(`Could not find model family control for thinking; visible compact selection is ${visible}, not High`);
++      }
++      await log(`Model family control not found for thinking; assuming default ChatGPT High selection (family=thinking effort=extended) and continuing`);
++      familySnapshot = initialSnapshot;
++      verificationSnapshot = initialSnapshot;
++      assumedDefaultThinkingFallback = true;
++    } else {
++      throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
++    }
+   }
+ 
+   let compactSelectionVerifiedAfterClick = false;
+@@ -1577,7 +1673,7 @@
+     }
+   }
+ 
+-  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick) {
++  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick && !assumedDefaultThinkingFallback) {
+     const effortLabel = requestedEffortLabel(job.selection);
+     if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
+       const opened = await openEffortDropdown(job);
+@@ -1626,7 +1722,7 @@
+     }
+   }
+ 
+-  const stronglyVerified = compactSelectionVerifiedAfterClick || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
++  const stronglyVerified = compactSelectionVerifiedAfterClick || assumedDefaultThinkingFallback || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
+   if (!stronglyVerified) {
+     throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
+   }
+@@ -1812,24 +1908,37 @@
+   return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
+ }
+ 
+-async function waitForChatCompletion(job, baselineAssistantCount) {
++async function waitForChatCompletion(job, baselineAssistantCount, options = {}) {
+   const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
++  const baselineCopyCount = Number(options.baselineCopyCount || 0);
++  const baselineLastText = String(options.baselineLastText || "");
+   let lastCompletionSignature = "";
+   let stableCount = 0;
+   let retriedAfterFailure = false;
++  let lastStatusLogAt = 0;
+ 
+   while (Date.now() < timeoutAt) {
+     await heartbeat();
+     const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
+-    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming");
++    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot);
++    const sendReady = isGrokJob(job) ? false : snapshotHasChatGptSendReady(snapshot);
++    const composerIdle = isGrokJob(job) ? false : snapshotHasChatGptComposerIdle(snapshot);
+     const hasRetryButton = snapshot.includes('button "Retry"');
+-    const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
++    const copyResponseCount = isGrokJob(job)
++      ? (snapshot.match(/button "Copy"/g) || []).length
++      : countChatGptCopyControls(snapshot);
+     throwIfProviderTransientError(job, snapshot, "waiting for response completion");
+     const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
+     const messages = await assistantMessages(job);
+-    const targetMessage = messages[baselineAssistantCount];
++    const lastText = messages.at(-1)?.text || "";
++    const progressed = messages.length > baselineAssistantCount || (Boolean(lastText) && lastText !== baselineLastText);
++    const targetMessage = messages[baselineAssistantCount] || (progressed ? messages.at(-1) : undefined);
+     const targetText = targetMessage?.text || "";
+-    const hasTargetCopyResponse = copyResponseCount > baselineAssistantCount;
++    const hasTargetCopyResponse = copyResponseCount > baselineCopyCount || (!hasStopStreaming && composerIdle && progressed && Boolean(targetText));
++    if (Date.now() - lastStatusLogAt >= 15_000) {
++      lastStatusLogAt = Date.now();
++      await log(`Completion poll: stop=${hasStopStreaming} idle=${composerIdle} sendReady=${sendReady} copy=${copyResponseCount}/${baselineCopyCount} msgs=${messages.length}/${baselineAssistantCount} text=${targetText.length} progressed=${progressed}`);
++    }
+ 
+     if (!hasStopStreaming && hasRetryButton && responseFailureText) {
+       if (!retriedAfterFailure) {
+@@ -2370,7 +2479,10 @@
+     }));
+     await uploadArchive(currentJob);
+     await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
+-    const baselineAssistantCount = (await assistantMessages(currentJob)).length;
++    const baselineMessages = await assistantMessages(currentJob);
++    const baselineAssistantCount = baselineMessages.length;
++    const baselineLastText = baselineMessages.at(-1)?.text || "";
++    const baselineCopyCount = countChatGptCopyControls(await snapshotText(currentJob));
+     await log(`Assistant response count before send: ${baselineAssistantCount}`);
+     await clickSend(currentJob, baselineAssistantCount);
+     await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
+@@ -2391,7 +2503,7 @@
+       patch: awaitingResponsePatch,
+     }));
+ 
+-    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount);
++    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount, { baselineCopyCount, baselineLastText });
+     if (isGrokJob(currentJob) && !currentJob.conversationId) {
+       const stableGrokChatUrl = await waitForStableChatUrl(currentJob, undefined);
+       const stableGrokConversationId = conversationIdFromUrl(stableGrokChatUrl);

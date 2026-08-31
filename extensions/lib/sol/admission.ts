@@ -96,32 +96,20 @@ async function chmodPrivate(dir: string): Promise<void> {
  * fd in the lease and releases it in releaseSolSubmitLease; on process death
  * the kernel drops the lock automatically.
  */
-function tryTakeFlock(lockPath: string, waitMs: number): number | undefined {
+function tryTakeFlock(lockPath: string): number | undefined {
+	// Try ONCE with LOCK_NB.  The caller owns the bounded async retry loop
+	// (sleep between attempts), so we never busy-spin the event loop
+	// (audit round P2-3).
 	const fd = openSync(lockPath, "a+", 0o600);
-	const deadline = Date.now() + waitMs;
-	for (;;) {
-		try {
-			fsExt.flockSync(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB);
-			return fd;
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException)?.code;
-			if (code !== "EWOULDBLOCK" && code !== "EAGAIN") {
-				closeSync(fd);
-				throw error;
-			}
-			if (Date.now() >= deadline) {
-				closeSync(fd);
-				return undefined;
-			}
-			const waited = Math.min(LOCK_RETRY_MS, deadline - Date.now());
-			// We cannot block the event loop; busy-wait with small synchronous
-			// sleep is inappropriate, so loop with an async pause via the caller.
-			// This helper is sync; see acquireSolSubmitLease for the async loop.
-			if (waited <= 0) break;
-		}
+	try {
+		fsExt.flockSync(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB);
+		return fd;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException)?.code;
+		closeSync(fd);
+		if (code !== "EWOULDBLOCK" && code !== "EAGAIN") throw error;
+		return undefined;
 	}
-	closeSync(fd);
-	return undefined;
 }
 
 /**
@@ -163,14 +151,16 @@ export async function acquireSolSubmitLease(
 		return { acquired: false, reason: busyReason(pre), activeJobs: pre };
 	}
 
-	// Wait for the kernel flock (bounded).
+	// Wait for the kernel flock (bounded).  Use fd === undefined checks —
+	// fd 0 is a valid descriptor (e.g. when stdin is closed) and must not be
+	// treated as "not acquired" (audit round P2-1).
 	let fd: number | undefined;
 	const deadline = Date.now() + LOCK_WAIT_MS;
-	while (!fd && Date.now() < deadline) {
-		fd = tryTakeFlock(lockPath, Math.min(LOCK_RETRY_MS, deadline - Date.now()));
-		if (!fd) await sleep(LOCK_RETRY_MS);
+	while (fd === undefined && Date.now() < deadline) {
+		fd = tryTakeFlock(lockPath);
+		if (fd === undefined) await sleep(LOCK_RETRY_MS);
 	}
-	if (!fd) {
+	if (fd === undefined) {
 		return { acquired: false, reason: busyReason([], lockPath), activeJobs: scanActive(jobsDir) };
 	}
 
@@ -202,14 +192,25 @@ export async function acquireSolSubmitLease(
  * Always succeeds (close is authoritative); returns true once the fd is
  * closed so the caller drops the lease from its map.
  */
+const RELEASED_LEASES = new WeakSet<SolSubmitLease>();
+
 export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<boolean> {
+	// One-shot release (audit round P2-2): a lease is released exactly once.
+	// Once unlock/close has been attempted, ownership is gone — the fd must
+	// never be reused by a later event, because the kernel may have recycled
+	// the numeric descriptor.  Return true (dropped from the map) either way;
+	// a close failure is a diagnostic, not a reason to keep retrying a raw fd.
+	if (RELEASED_LEASES.has(lease)) return true;
+	RELEASED_LEASES.add(lease);
 	try {
 		fsExt.flockSync(lease.fd, fsExt.constants.LOCK_UN);
 	} catch { /* close releases the lock anyway */ }
 	try {
 		closeSync(lease.fd);
-		return true;
 	} catch {
-		return false;
+		// The fd may already be gone (kernel closed it on our exit path, or a
+		// recycled descriptor).  We still report success: the lease is
+		// consumed and must not be retried.
 	}
+	return true;
 }

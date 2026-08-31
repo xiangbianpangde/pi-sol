@@ -160,7 +160,7 @@ After verifying the smoke test, ask a real question:
 - **`--files a,b`**: Attach only explicitly listed files. Repositories are never auto-archived.
 - **`--follow <job-id>`**: Continue an existing ChatGPT thread from an earlier `/sol` turn.
 
-ChatGPT submissions are serialized across local Pi sessions. If another `/sol` job is queued or running, the new submission is blocked with its job ID; wait for it to finish and use `/sol-read <job-id>`. This is an account-level rate-limit safeguard, not a limitation on pi-oracle's isolated browser profiles.
+ChatGPT submissions allow up to `maxConcurrentJobs` (default 2) concurrent `/sol` jobs across local Pi sessions; each job runs in its own isolated browser runtime profile. When the concurrency limit is reached, the new submission is blocked with the active job IDs; wait for one to finish and use `/sol-read <job-id>`. This is an account-level rate-limit safeguard, not a limitation on pi-oracle's isolated browser profiles.
 
 ---
 
@@ -260,7 +260,7 @@ ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. `
 ### Cross-session submission admission
 - A short atomic lease protects the `oracle_submit` handoff across local Pi processes.
 - Active `job.json` states (`queued`, `preparing`, `submitted`, `waiting`) are treated as busy.
-- Terminal jobs do not block new work; crashed admission locks are reclaimed after a bounded TTL.
+- Terminal jobs do not block new work. The admission lock is a kernel-level flock: it is released automatically when the holding process exits or crashes (no TTL, no stale-lock reclamation).
 - A rate-limit error remains an account quota condition: do not bypass it by changing presets.
 
 ---

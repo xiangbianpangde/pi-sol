@@ -10,7 +10,7 @@
 
 The extension never drives chatgpt.com. `agent_browser` on ChatGPT hosts is blocked so it cannot steal the oracle session.
 
-Before `oracle_submit`, `lib/sol/admission.ts` takes a short atomic local lease and inspects `$PI_ORACLE_JOBS_DIR` for active ChatGPT jobs (`queued`, `preparing`, `submitted`, `waiting`). This bounds ChatGPT account submissions across local Pi processes to `maxConcurrentJobs` (default 2, mirrored from pi-oracle's `browser.maxConcurrentJobs`): pi-oracle runs each job in its own isolated browser runtime profile cloned from a single auth seed profile, so concurrent `/sol` submissions are safe up to the provider's account-level capacity. Terminal jobs do not block; a bounded TTL recovers a lease after a crashed Pi process.
+Before `oracle_submit`, `lib/sol/admission.ts` takes a short kernel-level admission lease (an exclusive `flock(2)` on a lock file, via `fs-ext`) and inspects `$PI_ORACLE_JOBS_DIR` for active ChatGPT jobs (`queued`, `preparing`, `submitted`, `waiting`). This bounds ChatGPT account submissions across local Pi processes to `maxConcurrentJobs` (default 2, mirrored from pi-oracle's `browser.maxConcurrentJobs`): pi-oracle runs each job in its own isolated browser runtime profile cloned from a single auth seed profile, so concurrent `/sol` submissions are safe up to the provider's account-level capacity. Terminal jobs do not block. The kernel automatically releases the flock when the holding process exits or crashes — there is no TTL, no owner.json, and no stale-lock reclamation.
 
 ## ChatGPT Plus UI (2026-08)
 
@@ -40,13 +40,16 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 
 ## Cross-session submission admission
 
-The admission path is intentionally separate from browser ownership and conversation leases:
+The admission path is intentionally separate from browser ownership and conversation leases, and mutual exclusion is a KERNEL flock (not a pathname protocol):
 
 1. The `tool_call` hook sees `oracle_submit` before execution.
-2. For ChatGPT (the `/sol` provider), it atomically creates `pi-sol-submit.lock` under the per-user private state dir (`PI_SOL_STATE_DIR`, default `~/.pi/agent/state`).
-3. It reads durable `oracle-*/job.json` records from `$PI_ORACLE_JOBS_DIR` and blocks only when the concurrency limit is reached (malformed records fail closed; other users' job dirs are ignored).
+2. For ChatGPT (the `/sol` provider), it opens `pi-sol-admission.lock` under the per-user private state dir (`PI_SOL_STATE_DIR`, default `~/.pi/agent/state`) and takes an exclusive non-blocking `flock(2)`, retrying on a bounded 5s window.
+3. It reads durable `oracle-*/job.json` records from `$PI_ORACLE_JOBS_DIR` and blocks only when the concurrency limit is reached (malformed records fail closed; other users' job dirs are ignored). The authoritative capacity check runs while holding the flock, so the decision is atomic with the reservation.
 4. The block reason names the active job and tells the model to stop and use `/sol-read <job-id>`; it never changes the preset or silently retries.
-5. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease by removing the fixed lock path only when the owner token still matches. Crashed locks are reclaimed atomically (rename to a unique trash path) only after the owner PID is provably dead and the TTL elapsed.
+5. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease by unlocking and closing the fd (one-shot; the kernel drops the lock on close).
+6. Process death auto-releases the flock — no TTL, no owner.json, no stale reclaim, no trash sweep. Never delete the lock path manually.
+
+Because this is a kernel lock, an OLD Pi process using the pre-ac52249 pathname protocol shares NO mutex with a new flock-based process. Upgrading across that boundary is a stop-the-world operation: close all Pi sessions before installing (the installer refuses while Pi processes are detected unless `PI_SOL_FORCE_UPGRADE=1`).
 
 This closes the race between separate Pi processes while retaining pi-oracle's own same-`conversationId` lease for explicit follow-ups.
 

@@ -249,11 +249,11 @@ export default function (pi: ExtensionAPI) {
 	const releaseSubmitLeaseFor = async (toolCallId: string): Promise<void> => {
 		const lease = submitLeases.get(toolCallId);
 		if (!lease) return;
-		// If release cannot acquire the reclaim token (another process is
-		// mid-mutation), it returns false — KEEP the lease so a later event
-		// (tool_execution_end / session_shutdown) retries instead of wedging.
-		const released = await releaseSolSubmitLease(lease);
-		if (released) submitLeases.delete(toolCallId);
+		// Kernel-flock release is one-shot: unlock + close the fd.  The kernel
+		// drops the lock on close (or process death), so there is no retry
+		// state machine — once released, drop the lease from the map.
+		await releaseSolSubmitLease(lease);
+		submitLeases.delete(toolCallId);
 	};
 
 	// Release the cross-session admission lease as soon as oracle_submit
@@ -266,11 +266,11 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "oracle_submit") await releaseSubmitLeaseFor(event.toolCallId);
 	});
 	pi.on("session_shutdown", async () => {
-		// Longer retry budget on shutdown, and only drop leases that were
-		// actually released so we never forget a still-held lock.
+		// One-shot kernel-flock release for every held lease; the kernel
+		// auto-releases on process exit even if this is interrupted.
 		for (const [toolCallId, lease] of [...submitLeases.entries()]) {
-			const released = await releaseSolSubmitLease(lease, { maxAttempts: 100, retryMs: 100 });
-			if (released) submitLeases.delete(toolCallId);
+			await releaseSolSubmitLease(lease);
+			submitLeases.delete(toolCallId);
 		}
 	});
 

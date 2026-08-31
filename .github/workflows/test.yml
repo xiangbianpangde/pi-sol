@@ -13,5 +13,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: install dependencies
+        # fs-ext is a native addon (kernel flock for /sol admission).
+        # npm ci from package-lock.json is required for CI to load it
+        # (audit round P1-1).
+        run: npm ci
       - name: unit tests
         run: npm test

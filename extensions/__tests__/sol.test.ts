@@ -3,10 +3,12 @@
  * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol.test.ts
  */
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 import { acquireSolSubmitLease, oracleMaxConcurrentJobs, releaseSolSubmitLease } from "../lib/sol/admission.ts";
@@ -255,6 +257,76 @@ describe("jobs + prompt", () => {
 				assert.equal(a2.acquired, true);
 				if (a2.acquired) await releaseSolSubmitLease(a2.lease);
 			}
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("serializes admission ACROSS processes via kernel flock (real two-process mutex)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-flock-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-flock-jobs-"));
+		const helper = join(dirname(fileURLToPath(import.meta.url)), "flock-child.mjs");
+		try {
+			// Child A acquires and HOLDs the flock.  Node 22 native
+			// --experimental-strip-types runs the helper directly (no npx).
+			const a = spawn(process.execPath, ["--experimental-strip-types", helper, stateDir, jobsDir, "hold"], {
+				env: { ...process.env, PI_ORACLE_JOBS_DIR: jobsDir, PI_SOL_STATE_DIR: stateDir, HOLD_MS: "20000" },
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let aErr = "";
+			a.stderr?.on("data", (d) => { aErr += d; });
+			a.on("error", (e) => { aErr += `SPAWN_ERROR: ${e.message}`; });
+			const aOut = await new Promise<string>((resolve) => {
+				let out = "";
+				a.stdout?.on("data", (d) => { out += d; if (out.includes("ACQUIRED:")) resolve(out); });
+				a.on("exit", (code) => { if (!out) resolve(out + ` [exit ${code}]`); });
+			});
+			assert.match(aOut, /ACQUIRED:/, `child A should acquire, got: ${aOut} | stderr: ${aErr}`);
+			assert.match(aOut, /ACQUIRED:/, `child A should acquire, got: ${aOut}`);
+			// Child B (separate process) must NOT be able to acquire while A holds.
+			const b = spawnSync(process.execPath, ["--experimental-strip-types", helper, stateDir, jobsDir, "probe"], {
+				env: { ...process.env, PI_ORACLE_JOBS_DIR: jobsDir, PI_SOL_STATE_DIR: stateDir },
+				encoding: "utf8",
+				timeout: 15000,
+			});
+			assert.match(String(b.stdout), /BUSY/, `child B should be blocked, got: ${b.stdout} ${b.stderr}`);
+			// Kill -9 A: the kernel must release the flock, so B can now acquire.
+			a.kill("SIGKILL");
+			await new Promise((r) => setTimeout(r, 500));
+			const b2 = spawnSync(process.execPath, ["--experimental-strip-types", helper, stateDir, jobsDir, "probe"], {
+				env: { ...process.env, PI_ORACLE_JOBS_DIR: jobsDir, PI_SOL_STATE_DIR: stateDir },
+				encoding: "utf8",
+				timeout: 15000,
+			});
+			assert.match(String(b2.stdout), /ACQUIRED:|RELEASED/, `child B should acquire after A's SIGKILL, got: ${b2.stdout} ${b2.stderr}`);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("kernel flock auto-releases on holder crash (SIGKILL), no stale lock (audit P2-4)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-flock-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-flock-jobs-"));
+		const helper = join(dirname(fileURLToPath(import.meta.url)), "flock-child.mjs");
+		try {
+			const a = spawn(process.execPath, ["--experimental-strip-types", helper, stateDir, jobsDir, "hold"], {
+				env: { ...process.env, PI_ORACLE_JOBS_DIR: jobsDir, PI_SOL_STATE_DIR: stateDir, HOLD_MS: "20000" },
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			await new Promise<string>((resolve) => {
+				let out = "";
+				a.stdout?.on("data", (d) => { out += d; if (out.includes("ACQUIRED:")) resolve(out); });
+				a.on("exit", (code) => { if (!out) resolve(out); });
+			});
+			// SIGKILL: no cleanup can run, but the kernel releases the flock.
+			a.kill("SIGKILL");
+			await new Promise((r) => setTimeout(r, 500));
+			// A fresh acquire must succeed immediately.
+			const ok = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(ok.acquired, true, "flock must auto-release after holder SIGKILL");
+			if (ok.acquired) await releaseSolSubmitLease(ok.lease);
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });

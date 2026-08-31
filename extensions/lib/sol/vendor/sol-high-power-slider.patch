@@ -343,19 +343,20 @@
  const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
    (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
  ) || "agent-browser";
-@@ -706,7 +714,11 @@
+@@ -706,8 +714,12 @@
  
  async function ensureBrowserConnected(job) {
    if (!browserStarted || cleaningUpBrowser) return;
 -  const status = await streamStatus(job);
 +  let status = await streamStatus(job);
-+  if (status.connected === false) {
+   if (status.connected === false) {
 +    await sleep(1000);
 +    status = await streamStatus(job);
 +  }
-   if (status.connected === false) {
++  if (status.connected === false) {
      throw new Error("The isolated oracle browser disconnected during the job.");
    }
+ }
 @@ -1065,7 +1077,9 @@
      return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
    }
@@ -500,10 +501,12 @@
        }
      }
  
-@@ -1526,14 +1618,49 @@
-   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
- }
+@@ -1524,14 +1616,49 @@
+   }
  
+   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
++}
++
 +async function waitForChatGptModelPicker(job, timeoutMs = 20_000) {
 +  const deadline = Date.now() + timeoutMs;
 +  let lastSnapshot = "";
@@ -518,8 +521,8 @@
 +    await agentBrowser(job, "wait", "500");
 +  }
 +  return lastSnapshot;
-+}
-+
+ }
+ 
  async function configureModel(job) {
    if (isGrokJob(job)) return configureGrokModel(job);
 -  const initialSnapshot = await snapshotText(job);
@@ -537,8 +540,8 @@
    if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
      return;
-   }
- 
++  }
++
 +  if (snapshotHasPowerSliderCompactMenu(initialSnapshot) || /menuitem "Show advanced options"/i.test(initialSnapshot) || /menuitem "Power"/i.test(initialSnapshot)) {
 +    await log(`Power-slider compact UI visible; selecting High instead of the legacy Instant/Thinking/Pro sheet`);
 +    initialSnapshot = await trySelectPowerSliderHigh(job);
@@ -546,11 +549,9 @@
 +      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
 +      return;
 +    }
-+  }
-+
+   }
+ 
    await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
-   let familySnapshot = await openModelConfiguration(job);
-   let verificationSnapshot = familySnapshot;
 @@ -1553,7 +1680,21 @@
    } else if (familyAlreadySelectedInUi) {
      await log("Model family already appears selected; verifying effort-specific settings");
@@ -648,7 +649,23 @@
  
      if (!hasStopStreaming && hasRetryButton && responseFailureText) {
        if (!retriedAfterFailure) {
-@@ -2370,7 +2536,10 @@
+@@ -1851,6 +2017,15 @@
+     }
+ 
+     let completionSignature;
++    // Hard guard: while the model is still streaming (Stop control visible),
++    // never emit a completion signature — the copy-count heuristic alone can
++    // fire mid-generation and truncate a long response.
++    if (hasStopStreaming) {
++      lastCompletionSignature = "";
++      stableCount = 0;
++      await sleep(job.config.worker.pollMs);
++      continue;
++    }
+     if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
+       completionSignature = deriveAssistantCompletionSignature({
+         hasStopStreaming,
+@@ -2370,7 +2545,10 @@
      }));
      await uploadArchive(currentJob);
      await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
@@ -660,7 +677,7 @@
      await log(`Assistant response count before send: ${baselineAssistantCount}`);
      await clickSend(currentJob, baselineAssistantCount);
      await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
-@@ -2391,7 +2560,7 @@
+@@ -2391,7 +2569,7 @@
        patch: awaitingResponsePatch,
      }));
  

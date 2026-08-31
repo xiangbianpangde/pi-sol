@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.ts";
@@ -225,12 +225,26 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 	return { acquired: false, reason: busyReason([], path), activeJobs: listActiveSolJobs(jobsDir) };
 }
 
-/** Release the lease: remove the fixed lock path only if it is still ours. */
+/** Release the lease: remove the fixed lock path only if it is still ours.
+ * Must hold the reclaim token so that a concurrent stale reclaim cannot
+ * replace the path between our read and rm. */
 export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<void> {
+	const stateDir = dirname(lease.path);
 	try {
-		const owner = await readOwner(lease.path);
-		if (owner?.token !== lease.token) return; // not our generation; never touch it
-		await rm(lease.path, { recursive: true, force: true });
+		const releaseToken = await acquireReclaimToken(stateDir);
+		if (!releaseToken) {
+			// Another process is reclaiming; retry once after a brief wait.
+			await new Promise((r) => setTimeout(r, 50));
+			const owner = await readOwner(lease.path);
+			if (owner?.token === lease.token) await rm(lease.path, { recursive: true, force: true });
+			return;
+		}
+		try {
+			const owner = await readOwner(lease.path);
+			if (owner?.token === lease.token) await rm(lease.path, { recursive: true, force: true });
+		} finally {
+			await releaseToken();
+		}
 	} catch {
 		// Path already gone or unreadable — nothing safe to do.
 	}

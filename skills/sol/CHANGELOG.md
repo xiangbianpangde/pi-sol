@@ -1,6 +1,19 @@
 # sol CHANGELOG
 
-## 1.6.0 - 2026-08-31
+## 1.6.1 - 2026-08-31
+
+- **Sol audit round 4 partial (37b6e670, response truncated by premature completion → fixes)**:
+  - `releaseSolSubmitLease` now serializes with stale reclaim via the reclaim
+    token: release reads the owner and removes the fixed path only while
+    holding the token, closing the read→rm window against a concurrent
+    reclaimer replacing the generation (no double-holder / no deleted-new-lock).
+  - Completion guard: while the Stop control is visible the worker never emits
+    a completion signature, so the copy-count heuristic can no longer truncate
+    a long response mid-stream.
+  - Tests: release-vs-stale-reclaim interleaving (newer generation survives),
+    concurrent same-lease release generation safety. 99/99 pass.
+
+ - 2026-08-31
 
 - **Sol audit round 3 (e89f638, FAIL → fixes applied)**:
   - P1 stale-proof/generation binding: stale reclaim now runs under an exclusive

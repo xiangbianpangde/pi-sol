@@ -2017,6 +2017,15 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
     }
 
     let completionSignature;
+    // Hard guard: while the model is still streaming (Stop control visible),
+    // never emit a completion signature — the copy-count heuristic alone can
+    // fire mid-generation and truncate a long response.
+    if (hasStopStreaming) {
+      lastCompletionSignature = "";
+      stableCount = 0;
+      await sleep(job.config.worker.pollMs);
+      continue;
+    }
     if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
       completionSignature = deriveAssistantCompletionSignature({
         hasStopStreaming,

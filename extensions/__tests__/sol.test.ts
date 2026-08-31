@@ -256,6 +256,34 @@ describe("jobs + prompt", () => {
 		}
 	});
 
+	it("release is serialized with stale reclaim (no double-holder window)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "gen-b", pid: process.pid, createdAt: new Date().toISOString() }));
+			// Simulate the audit race: a stale reclaimer has already moved B and
+			// created live C while a late release(B) runs. Release must NOT
+			// remove C (token mismatch check), and C must survive.
+			const lease = { path: lock, token: "gen-b" };
+			await Promise.all([
+				releaseSolSubmitLease(lease),
+				(async () => {
+					// Reclaimer wins the token, moves the path, then recreates C.
+					await rm(lock, { recursive: true, force: true });
+					await mkdir(lock, { recursive: true });
+					await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "gen-c", pid: process.pid, createdAt: new Date().toISOString() }));
+				})(),
+			]);
+			const owner = JSON.parse(await (await import("node:fs/promises")).readFile(join(lock, "owner.json"), "utf8"));
+			assert.equal(owner.token, "gen-c");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("blocks admission while another ChatGPT job is active and recovers after it ends", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));

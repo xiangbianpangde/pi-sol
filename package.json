@@ -15,5 +15,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "fs-ext": "^2.1.1"
   }
 }

@@ -168,7 +168,9 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
       // everything is user-authored until a REAL element line (ref marker at
       // indent >= composer depth) shows up — that is the next page element.
       composerContinuationDepth = indent;
+      return true; // this line just (re)opened the region
     }
+    return false;
   };
   while (i < lines.length) {
     const line = lines[i];
@@ -199,10 +201,13 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
       i += 1;
       continue;
     }
-    markComposer(line, indent);
-    // If markComposer just recorded the main composer, activate the region
-    // for subsequent lines (only the main composer textbox creates a region).
-    if (composerContinuationDepth >= 0) {
+    const composerJustSeen = markComposer(line, indent);
+    // Activate the region ONLY when this line is (or contains) the main
+    // composer textbox.  Previously the check was `depth >= 0` which
+    // re-activated the region on EVERY line after the composer, so the region
+    // never actually ended — every shallower line after it (including real
+    // page elements) was swallowed forever (region-state bug, audit round 7).
+    if (composerJustSeen) {
       composerRegionActive = true;
     }
     // provider error surface role: a REAL element must carry its element

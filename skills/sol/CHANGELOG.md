@@ -1,6 +1,26 @@
 # sol CHANGELOG
 
-## 1.9.0 - 2026-08-31
+## 1.9.1 - 2026-08-31
+
+- **Audit round 7 (after 0647f4cb incomplete → self-verified model's thinking notes)**:
+  - Restore-failure keep-trash: moveReclaimCandidate now KEEPS a displaced live
+    token on restore failure instead of deleting it (the previous code destroyed
+    a live holder's token, creating a double-holder window). The stale trash
+    dir is swept by sweepStaleStaging.
+  - sweepStaleStaging now matches `.trash.` ANYWHERE in the name (previously
+    only matched `endsWith(".trash.")` which never matched the actual
+    `path.trash.pid.uuid` format).
+  - Region re-activation bug: composerContinuationDepth >= 0 re-activated the
+    region on EVERY line after the composer, so the region never ended —
+    all subsequent shallower lines were swallowed forever. Fixed to activate
+    region only when markComposer returns true (just set the depth).
+  - Submit-lock reclaim also uses generation-bound moveReclaimCandidate
+    instead of bare atomicRenameAway + unconditional delete, so even if the
+    reclaim token were double-held, the submit lock cannot be split-brained.
+  - Tests: 118/118 (restore-failure trash kept, sweep .trash., region
+    re-activation, submit-lock generation binding, all prior regressions).
+
+ - 2026-08-31
 
 - **Sol audit round 6 (8438259 fixes 3 P1 + 1 P2 + 1 P3; re-audited at d415ef11)**:
   - P1 exact-role-shaped markdown: the role regex now REQUIRES the element

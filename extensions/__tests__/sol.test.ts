@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { acquireSolSubmitLease, moveReclaimCandidate, releaseSolSubmitLease, releaseTokenGeneration } from "../lib/sol/admission.ts";
+import { acquireSolSubmitLease, moveReclaimCandidate, releaseSolSubmitLease, releaseTokenGeneration, restoreMovedGeneration } from "../lib/sol/admission.ts";
 import { stageSolFiles, validateSolFileMeta } from "../lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard.ts";
 import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
@@ -374,6 +374,55 @@ describe("jobs + prompt", () => {
 			assert.equal(after.token, "B", "newer live token must survive an old holder's release");
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a live token in trash when the restore is pre-empted, never deletes it (audit round 7)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		try {
+			const tokenPath = join(stateDir, "pi-sol-submit.reclaim-token");
+			// Simulate: R1 (stale proof for A) moved live B into trash; before
+			// R1 can restore, third party C re-occupies the fixed path.
+			const trashPath = join(stateDir, "pi-sol-submit.reclaim-token.trash.pid.1");
+			await mkdir(trashPath, { recursive: true });
+			await writeFile(join(trashPath, "owner.json"), JSON.stringify({ token: "B", pid: process.pid, createdAt: new Date().toISOString() }));
+			await mkdir(tokenPath, { recursive: true });
+			await writeFile(join(tokenPath, "owner.json"), JSON.stringify({ token: "C", pid: process.pid, createdAt: new Date().toISOString() }));
+			// restore fails (path occupied) → the moved live dir (B) must NOT
+			// be deleted; it stays as trash so a later sweep can reap it.
+			const restored = await restoreMovedGeneration(tokenPath, trashPath);
+			assert.equal(restored, false);
+			const movedOwner = JSON.parse(await (await import("node:fs/promises")).readFile(join(trashPath, "owner.json"), "utf8"));
+			assert.equal(movedOwner.token, "B", "live token B must survive in trash, not be destroyed");
+			// And the path still belongs to C (not clobbered by the restore).
+			const pathOwner = JSON.parse(await (await import("node:fs/promises")).readFile(join(tokenPath, "owner.json"), "utf8"));
+			assert.equal(pathOwner.token, "C");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("sweeps stale trash dirs including displaced live-holder dirs (audit round 7)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// A trash dir left by a failed restore must be reaped by
+			// sweepStaleStaging when it goes stale (invoked via acquire).
+			const trashPath = join(stateDir, "pi-sol-submit.reclaim-token.trash.pid.1");
+			await mkdir(trashPath, { recursive: true });
+			await writeFile(join(trashPath, "owner.json"), JSON.stringify({ token: "B", pid: process.pid, createdAt: new Date().toISOString() }));
+			const old = new Date(Date.now() - 120 * 1000);
+			await utimes(trashPath, old, old);
+			// acquire triggers sweepStaleStaging.
+			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(acquired.acquired, true);
+			const { readdir } = await import("node:fs/promises");
+			const after = await readdir(stateDir);
+			assert.ok(!after.some((n) => n.includes(".trash.")), `stale trash not swept: ${after.join(", ")}`);
+			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
 		}
 	});
 

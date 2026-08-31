@@ -137,7 +137,11 @@ async function createStagingDir(stateDir: string): Promise<string> {
 async function sweepStaleStaging(stateDir: string): Promise<void> {
 	try {
 		for (const name of await readdir(stateDir)) {
-			if (!name.startsWith(".staging-") && !name.endsWith(".trash.")) continue;
+			// staging dirs are `.staging-<pid>-<uuid>`; trash dirs are
+			// `<fixed>.<path>.trash.<pid>.<uuid>` — both must be swept (the
+			// latter now also keeps a live-holder token after a failed restore,
+			// so it must be reaped once it goes stale, never left forever).
+			if (!name.includes(".trash.") && !name.startsWith(".staging-")) continue;
 			const p = join(stateDir, name);
 			try {
 				const info = await stat(p);
@@ -152,14 +156,16 @@ async function sweepStaleStaging(stateDir: string): Promise<void> {
  * observed (dead) generation.  Returns keep=true only when the caller may
  * discard the moved dir and continue reclaiming.  When a newer LIVE
  * generation replaced the fixed path between readOwner and this call, the
- * moved dir is RESTORED (or cleaned up if the path was re-occupied), and
- * keep=false — the caller does NOT own the token (audit round 6 P1-2).
+ * moved dir is RESTORED; if the path was re-occupied before the restore could
+ * run, the moved dir is KEPT (never deleted) so a live holder's token is
+ * never destroyed — sweepStaleStaging reclaims it later. keep=false — the
+ * caller does NOT own the token (audit round 6/7 P1-2).
  * @internal exported for deterministic interleaving tests
  */
 export async function moveReclaimCandidate(
 	tokenPath: string,
 	observed: Partial<LeaseOwner> | undefined,
-): Promise<{ moved: boolean; keep: boolean }> {
+): Promise<{ moved: boolean; keep: boolean; trash?: string }> {
 	const { moved, trash } = await atomicRenameAway(tokenPath);
 	if (!moved) return { moved: false, keep: false };
 	const movedOwner = await readOwner(trash!);
@@ -168,15 +174,28 @@ export async function moveReclaimCandidate(
 		return { moved: true, keep: true };
 	}
 	// Mismatch: a newer live generation was moved. Restore it so the current
-	// holder keeps authority; if the path was already re-occupied, drop the
-	// orphaned trash rather than leak a stale dir.
-	const restored = await rename(trash!, tokenPath)
-		.then(() => true)
-		.catch(() => false);
+	// holder keeps authority.  If the path was already re-occupied, KEEP the
+	// moved dir (do NOT delete it) — deleting a live holder's token would let
+	// that holder and the new path owner both believe they hold the token
+	// (double-holder window).  The stale trash dir is swept later.
+	const restored = await restoreMovedGeneration(tokenPath, trash!);
 	if (!restored) {
-		await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+		return { moved: true, keep: false, trash };
 	}
 	return { moved: true, keep: false };
+}
+
+/**
+ * Try to put a displaced generation directory back onto the fixed path.
+ * Fails (returns false) when another process re-occupied the path in the
+ * meantime.  The moved dir must then be KEPT (not deleted) by the caller so
+ * a live holder's token is never destroyed.
+ * @internal exported for deterministic restore-failure tests
+ */
+export async function restoreMovedGeneration(tokenPath: string, trash: string): Promise<boolean> {
+	return rename(trash, tokenPath)
+		.then(() => true)
+		.catch(() => false);
 }
 
 /**
@@ -282,13 +301,18 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 			const releaseToken = await acquireReclaimToken(stateDir);
 			if (!releaseToken) continue; // another reclaimer in progress; retry
 			try {
-				// Re-verify under the token: the path can only be the generation
-				// we just verified (no other process can replace it while we
-				// hold the token).
-				if (!(await isStaleLock(path))) continue;
-				const { moved, trash } = await atomicRenameAway(path);
-				if (!moved) continue;
-				await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
+				// Re-verify under the token: read the CURRENT owner and confirm
+				// the lock is still stale before touching it.
+				const observed = await readOwner(path);
+				if (!observed || !(await isStaleLock(path))) continue;
+				// Generation-bound move (audit round 7): even if the reclaim
+				// token were double-held (a paused holder whose live token was
+				// displaced), the SUBMIT LOCK itself is only removed when the
+				// moved dir is exactly the stale generation we observed.  A
+				// newer live lock is restored/kept, never deleted — the
+				// submit-lock split-brain cannot re-open.
+				const { moved, keep } = await moveReclaimCandidate(path, observed);
+				if (!moved || !keep) continue;
 			} finally {
 				await releaseToken();
 			}

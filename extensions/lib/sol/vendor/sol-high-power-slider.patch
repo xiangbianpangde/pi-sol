@@ -9,12 +9,10 @@
  // Bare Instant is the legacy top-level family radio; compact Instant rows are versioned (Instant 5s / Instant 5.5).
  const COMPACT_INTELLIGENCE_CONTROL_PATTERN = /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i;
  const COMPACT_INTELLIGENCE_OPENER_PATTERN = /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i;
-@@ -97,8 +99,174 @@
- 
- /**
+@@ -99,6 +101,177 @@
   * @param {string | undefined} value
-+ * @returns {string}
-+ */
+  * @returns {string}
+  */
 +export const PROVIDER_ERROR_SURFACE_KINDS = Object.freeze(["alert", "status", "dialog", "banner", "log"]);
 +
 +const CONVERSATION_CHROME_PATTERNS = Object.freeze([
@@ -82,7 +80,9 @@
 +      // everything is user-authored until a REAL element line (ref marker at
 +      // indent >= composer depth) shows up — that is the next page element.
 +      composerContinuationDepth = indent;
++      return true; // this line just (re)opened the region
 +    }
++    return false;
 +  };
 +  while (i < lines.length) {
 +    const line = lines[i];
@@ -113,10 +113,13 @@
 +      i += 1;
 +      continue;
 +    }
-+    markComposer(line, indent);
-+    // If markComposer just recorded the main composer, activate the region
-+    // for subsequent lines (only the main composer textbox creates a region).
-+    if (composerContinuationDepth >= 0) {
++    const composerJustSeen = markComposer(line, indent);
++    // Activate the region ONLY when this line is (or contains) the main
++    // composer textbox.  Previously the check was `depth >= 0` which
++    // re-activated the region on EVERY line after the composer, so the region
++    // never actually ended — every shallower line after it (including real
++    // page elements) was swallowed forever (region-state bug, audit round 7).
++    if (composerJustSeen) {
 +      composerRegionActive = true;
 +    }
 +    // provider error surface role: a REAL element must carry its element
@@ -176,15 +179,15 @@
 + *
 + * @param {string} snapshot agent-browser `snapshot -i` accessibility text
 + * @param {{ composerLabel: string; isGrok?: boolean }} labels
-  * @returns {string}
-  */
++ * @returns {string}
++ */
 +export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGrok = false }) {
 +  return classifyProviderBlockerEvidence(snapshot, { composerLabel, isGrok }).surfaces;
 +}
  export function stripChatGptResponseChrome(value) {
    return String(value || "")
      .split("\n")
-@@ -254,10 +422,53 @@
+@@ -254,10 +427,53 @@
    return entries.some(
      (entry) => entry.kind === "button" && /click to remove/i.test(String(entry.label || "")) && parseComposerChipSelection(entry.label),
    );
@@ -239,7 +242,7 @@
      || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && checkedState(entry) === true && compactSelectionFromEntry(entry, entries));
  }
  
-@@ -351,6 +562,9 @@
+@@ -351,6 +567,9 @@
    if (hasRemovableComposerModelChip(entries)) return undefined;
    if (hasLegacyEffortCombobox(entries)) return undefined;
  
@@ -249,7 +252,7 @@
    for (const entry of entries) {
      if (entry.kind !== "menuitemradio" || checkedState(entry) !== true) continue;
      const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: false });
-@@ -361,7 +575,7 @@
+@@ -361,7 +580,7 @@
  
    for (const entry of entries) {
      if (entry.kind !== "button") continue;
@@ -258,7 +261,7 @@
      if (!compactSelection) continue;
      return compactSelection;
    }
-@@ -444,6 +658,17 @@
+@@ -444,6 +663,17 @@
    /** @type {SnapshotEntry[]} */
    const entries = parseSnapshotEntries(snapshot);
    const normalizedEffort = effortLabel.toLowerCase();
@@ -276,7 +279,7 @@
    const compactClosedButtonsAllowed = !hasRemovableComposerModelChip(entries) && !hasLegacyEffortCombobox(entries) && !hasCompactIntelligenceMenuContext(entries);
    return entries.some((entry) => {
      if (entry.disabled) return false;
-@@ -496,20 +721,79 @@
+@@ -496,20 +726,79 @@
    const visibleCompactControls = entries.filter(
      (entry) => !entry.disabled && entry.kind === "menuitemradio" && compactSelectionFromEntry(entry, entries),
    );

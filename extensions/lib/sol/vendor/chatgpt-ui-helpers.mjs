@@ -148,10 +148,14 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
   const surfaces = [];
   const kept = [];
   let hasComposer = false;
+  let composerIndent = -1;
   let sidebarDepth = -1;
   let i = 0;
-  const markComposer = (line) => {
-    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) hasComposer = true;
+  const markComposer = (line, indent) => {
+    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
+      hasComposer = true;
+      composerIndent = indent;
+    }
   };
   while (i < lines.length) {
     const line = lines[i];
@@ -165,10 +169,19 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
       i += 1;
       continue;
     }
-    markComposer(line);
+    markComposer(line, indent);
+    // Composer-depth tracking: once we've seen the composer textbox, its
+    // value continuation subtree (deeper-indented lines) is user-authored
+    // text.  Skip roleMatch for those lines even if they happen to look like
+    // `- dialog "title"` inside the prompt (P1-4).
+    if (composerIndent >= 0 && indent > composerIndent) {
+      kept.push(line);
+      i += 1;
+      continue;
+    }
     // provider error surface role: match the role word followed by whitespace,
     // end of line, or a bracket (handles both named and unnamed roles)
-    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
+    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s+"|\s+\[ref=|\s*$)/i);
     if (roleMatch) {
       // Positive-scope collection over the WHOLE error-role subtree: we only
       // keep descendant lines whose accessibility kind is paragraph or a
@@ -184,7 +197,8 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
         if (childIndent > indent) {
           const childLine = lines[i];
           if (childLine.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(childLine))) {
-            hasComposer = true; // still detect composer; value never collected
+            hasComposer = true;
+            composerIndent = childIndent; // track composer in subtree
           } else {
             const childKind = childLine.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
             const kindName = childKind ? childKind[1] : "";

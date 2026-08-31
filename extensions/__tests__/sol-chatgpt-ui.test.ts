@@ -439,4 +439,40 @@ describe("provider blocker evidence — audit round 3 boundaries", () => {
 		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
 		assert.ok(!/rate limit/i.test(evidence.surfaces), `generic dialog child leaked into surfaces: ${evidence.surfaces}`);
 	});
+
+	it("does NOT treat markdown list text inside the composer as a dialog element (P1-4 audit round 6 regression)", () => {
+		// Real failure: our own audit prompt contained the markdown list line
+		// `- dialog → paragraph "Too many requests" ...` which the loose
+		// role regex matched as a dialog element, leaking the whole prompt
+		// text into STRONG surfaces → false rate-limit page verdict.
+		const snapshot = `
+  - textbox "Chat with ChatGPT" [ref=e122]: 请作为审核员，对仓库进行复核。
+### P1-C: sanitizer 只收 paragraph / 嵌套 error-role
+
+**本轮修复**：descendant 循环整棵子树内只保留 kind 为 paragraph 的行。
+
+请验证反例是否消除：
+
+- dialog → textbox → 多行 composer 续行（generic）→ 不进 surfaces；
+
+- dialog → paragraph "Too many requests" → 仍进 surfaces（真 error 不丢）；
+
+- sidebar 子树在 error-role 内 → 不进 surfaces；
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		// The prompt's own markdown bullets must never enter surfaces.
+		assert.ok(!/Too many requests/i.test(evidence.surfaces), `prompt markdown leaked: ${evidence.surfaces}`);
+		assert.ok(!/dialog →/i.test(evidence.surfaces), `prompt markdown bullet leaked: ${evidence.surfaces}`);
+		assert.ok(evidence.hasComposer, "composer should be detected");
+	});
+
+	it("still detects a real provider alert at the same indent as the composer (sibling, not composer value)", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e122]
+- button "Send prompt" [ref=e119]
+- alert "Too many requests in one hour" [ref=e210]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.match(evidence.surfaces, /Too many requests/);
+	});
 });

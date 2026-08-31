@@ -1,6 +1,17 @@
 # sol CHANGELOG
 
-## 1.4.3 - 2026-08-31
+## 1.5.0 - 2026-08-31
+
+- **Audit-driven refactor (Sol round on a3594c2+59d09e9, FAIL → fixes applied)**:
+  - P1-1 deployment: `sanitizeProviderBlockerSnapshot` added to `SOL_PATCH_MARKERS.runJob` so already-patched workers redeploy the new sanitizer on next `ensureSolOraclePatches()`.
+  - P1-2 unified detection: `classifyChatPage`, `sendAcceptanceState`, and all `throwIfProviderTransientError` sites now use one positive-scope sanitizer (no more raw full-snapshot scans).
+  - P1-3 positive scoping: only provider-owned `alert/status/dialog/banner/log` roles are consulted for rate-limit text; user conversation, composer value, and sidebar titles are never scanned. Real limit pages (banner with composer present, Send-missing, full-page outage) still detected.
+  - P1-4/P1-5 lock protocol: coordination root moved to per-user private `~/.pi/agent/state/` (`PI_SOL_STATE_DIR`); stale reclaim + release use atomic `rename` to a unique trash path (no verify-then-rm generation race); freshness = PID liveness primary + TTL secondary (live PIDs are never reclaimed).
+  - P2-3 fail-closed jobs: unparseable `oracle-*/job.json` counts as unknown ACTIVE (no silent pass-through); job dirs owned by other OS users are ignored (no cross-user fake-job DoS).
+  - P2-5 tests: 7 new sanitizer regression tests (composer value, multi-line composer, sidebar title, post-send conversation message, main banner, Send-missing banner, full-page outage). 83/83 pass.
+  - P2-4 docs: SKILL rate-limit semantics and design auto-revendor notes updated to match implementation.
+
+ - 2026-08-31
 
 - Added cross-Pi ChatGPT admission control for `oracle_submit`: an atomic short-lived lease closes the multi-session race, and active `job.json` records prevent a second `/sol` job while one is queued or running.
 - Added explicit `oracle_submit` blocking diagnostics and release hooks for `tool_result`, `tool_execution_end`, and session shutdown; stale leases recover after a bounded TTL.

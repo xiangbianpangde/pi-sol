@@ -141,33 +141,37 @@ describe("jobs + prompt", () => {
 	});
 
 	it("allows only one simultaneous admission across Pi processes", async () => {
-		const jobsDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
 		try {
-			const results = await Promise.all([acquireSolSubmitLease(jobsDir), acquireSolSubmitLease(jobsDir)]);
+			const results = await Promise.all([acquireSolSubmitLease(stateDir, jobsDir), acquireSolSubmitLease(stateDir, jobsDir)]);
 			assert.equal(results.filter((result) => result.acquired).length, 1);
 			for (const result of results) {
 				if (result.acquired) await releaseSolSubmitLease(result.lease);
 			}
 		} finally {
+			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });
 		}
 	});
 
 	it("blocks admission while another ChatGPT job is active and recovers after it ends", async () => {
-		const jobsDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
 		try {
 			const activeDir = join(jobsDir, "oracle-active");
 			await mkdir(activeDir, { recursive: true });
 			await writeFile(join(activeDir, "job.json"), JSON.stringify({ id: "active", status: "waiting", selection: { provider: "chatgpt" } }));
-			const blocked = await acquireSolSubmitLease(jobsDir);
+			const blocked = await acquireSolSubmitLease(stateDir, jobsDir);
 			assert.equal(blocked.acquired, false);
 			if (!blocked.acquired) assert.match(blocked.reason, /active/);
 
 			await rm(activeDir, { recursive: true, force: true });
-			const acquired = await acquireSolSubmitLease(jobsDir);
+			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
 			assert.equal(acquired.acquired, true);
 			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
 		} finally {
+			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });
 		}
 	});

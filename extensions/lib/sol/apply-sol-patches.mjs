@@ -53,6 +53,7 @@ export const SOL_PATCH_MARKERS = {
 		"Composer is ready but the model picker has not hydrated yet",
 		"!assumedDefaultThinkingFallback",
 		"visible compact selection is",
+		"function sanitizeProviderBlockerSnapshot",
 	],
 };
 

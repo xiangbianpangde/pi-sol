@@ -36,7 +36,7 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 `ensureSolOraclePatches()` runs on Pi `session_start` and every `/sol` turn.
 
 - Installed version == vendored `0.7.20` and markers missing → copy vendor worker files back.
-- Installed version != `0.7.20` → refuse. A newer worker must be re-vendored, not clobbered.
+- Installed version != `0.7.20` → auto re-apply `vendor/sol-high-power-slider.patch` (revendor) to the newer pristine worker; refuse loudly if the patch rejects.
 
 ## Cross-session submission admission
 

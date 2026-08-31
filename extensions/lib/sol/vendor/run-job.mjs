@@ -45,6 +45,7 @@ import {
   snapshotWeaklyMatchesRequestedModel,
   autoSwitchToThinkingSelectionVisible,
   stripChatGptResponseChrome,
+  sanitizeProviderBlockerSnapshot as sanitizeProviderBlockerSnapshotHelper,
 } from "./chatgpt-ui-helpers.mjs";
 import { assistantSnapshotSlice, conversationIdFromUrl, nextStableValueState, providerSendAccepted, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
 import { normalizeLoginProbeResult } from "./auth-flow-helpers.mjs";
@@ -1075,7 +1076,9 @@ function classifyChatPage({ job, url, snapshot, body, probe }) {
     return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
   }
 
-  const outageText = detectProviderTransientErrorText(text);
+  // Provider-owned error surface only; user content (sidebar/composer/history)
+  // never participates in outage classification.
+  const outageText = detectProviderTransientErrorText(sanitizeProviderBlockerSnapshot(snapshot, job));
   if (outageText) {
     return { state: "transient_outage_error", message: `ChatGPT is showing a transient outage/rate-limit page: ${outageText}` };
   }
@@ -1254,39 +1257,18 @@ function formatProviderTransientErrorMessage(job, errorText, context) {
   return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
 }
 
-function stripSnapshotUserContent(snapshot, job = currentJob) {
+function sanitizeProviderBlockerSnapshot(snapshot, job = currentJob) {
   const labels = labelsForJob(job);
-  const lines = snapshot.split("\n");
-  const out = [];
-  let sidebarDepth = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
-    if (sidebarDepth >= 0) {
-      if (indent <= sidebarDepth) sidebarDepth = -1;
-      else continue;
-    }
-    if (line.includes('navigation "Chat history"')) {
-      sidebarDepth = indent;
-      continue;
-    }
-    if (line.includes(`textbox "${labels.composer}"`) || (isGrokJob(job) && /contenteditable/.test(line))) {
-      let j = i + 1;
-      while (j < lines.length && !lines[j].includes(`button "${labels.send}"`)) j += 1;
-      i = j - 1;
-      continue;
-    }
-    out.push(line);
-  }
-  return out.join("\n");
+  return sanitizeProviderBlockerSnapshotHelper(snapshot, {
+    composerLabel: labels.composer,
+    isGrok: isGrokJob(job),
+  });
 }
 
-function providerTransientErrorMessage(job, text, context) {
-  // The full accessibility snapshot includes user-authored content: the
-  // composer input value and sidebar chat titles. Those can legitimately
-  // contain "rate limit"/"Too many requests" and were being misread as a
-  // provider outage page (false failure of otherwise-ready /sol jobs).
-  const errorText = detectProviderVisibleBlockerText(stripSnapshotUserContent(text, job));
+function providerTransientErrorMessage(job, snapshot, context) {
+  // Rate-limit/outage detection only ever consults provider-owned error
+  // surfaces, never user-authored conversation/composer/sidebar text.
+  const errorText = detectProviderVisibleBlockerText(sanitizeProviderBlockerSnapshot(snapshot, job));
   if (!errorText) return "";
   return formatProviderTransientErrorMessage(job, errorText, context);
 }
@@ -1414,7 +1396,7 @@ async function sendAcceptanceState(job, baselineAssistantCount) {
     urlKnown: urlResult.ok,
     assistantCount: Math.max(baselineAssistantCount, messages.length),
     stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
-    transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
+    transientErrorText: detectProviderVisibleBlockerText(sanitizeProviderBlockerSnapshot(snapshot, job)) || "",
   };
 }
 

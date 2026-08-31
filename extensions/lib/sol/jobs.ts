@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 export const DEFAULT_ORACLE_JOBS_DIR = "/tmp";
@@ -78,16 +78,39 @@ export function listRecentSolJobIds(limit = 5, jobsDir = getOracleJobsDir()): st
 
 const ACTIVE_SOL_JOB_STATUSES = new Set(["queued", "preparing", "submitted", "waiting"]);
 
-/** Jobs that can still consume ChatGPT account/browser capacity. */
+/**
+ * Jobs that can still consume ChatGPT account/browser capacity.
+ *
+ * Fail-closed rules (audit P2-3/P1-5):
+ * - A job dir owned by another OS user is never trusted (prevents cross-user
+ *   fake job.json DoS in the shared /tmp namespace).
+ * - An unparseable job.json under oracle-* counts as ACTIVE (unknown status)
+ *   instead of being silently ignored, so a corrupt/half-written record can
+ *   never admit a second concurrent submission.
+ */
 export function listActiveSolJobs(jobsDir = getOracleJobsDir()): SolJobSummary[] {
 	if (!existsSync(jobsDir)) return [];
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
 	return readdirSync(jobsDir)
 		.filter((name) => name.startsWith("oracle-"))
 		.map((name) => join(jobsDir, name))
-		.filter((dir) => existsSync(join(dir, "job.json")))
-		.map((dir) => readSolJob(dir, jobsDir))
-		.filter((job): job is SolJobSummary => Boolean(job))
-		.filter((job) => ACTIVE_SOL_JOB_STATUSES.has(job.status) && job.provider !== "grok")
+		.filter((dir) => {
+			if (!existsSync(join(dir, "job.json"))) return false;
+			if (uid === undefined) return true;
+			try {
+				return statSync(dir).uid === uid;
+			} catch {
+				return false;
+			}
+		})
+		.map((dir) => {
+			const job = readSolJob(dir, jobsDir);
+			if (job) return job;
+			// Fail closed: malformed record is treated as an unknown active job.
+			return { id: dir.replace(/^.*oracle-/, ""), status: "unknown", dir };
+		})
+		.filter((job) => ACTIVE_SOL_JOB_STATUSES.has(job.status) || job.status === "unknown")
+		.filter((job) => job.provider !== "grok")
 		.sort((a, b) => a.id.localeCompare(b.id));
 }
 

@@ -13,6 +13,7 @@ import { describe, it } from "node:test";
 import {
 	countChatGptCopyControls,
 	effortSelectionVisible,
+	sanitizeProviderBlockerSnapshot,
 	snapshotCanSafelySkipModelConfiguration,
 	snapshotHasChatGptComposerIdle,
 	snapshotHasChatGptSendReady,
@@ -181,5 +182,91 @@ describe("composer before the High picker hydrates", () => {
 		assert.equal(snapshotHasModelOpener(INCOMPLETE_COMPOSER), false);
 		assert.equal(snapshotHasModelConfigurationUi(INCOMPLETE_COMPOSER), false);
 		assert.equal(snapshotCanSafelySkipModelConfiguration(INCOMPLETE_COMPOSER, THINKING_EXTENDED), false);
+	});
+});
+
+describe("provider blocker snapshot sanitizer (P1-2/P1-3 regression)", () => {
+	const labels = { composerLabel: "Chat with ChatGPT" };
+
+	it("does not flag a composer value containing 'rate limit'", () => {
+		const snapshot = `
+- navigation "Chat history" [ref=e3]
+  - link "旧对话" [ref=e26]
+- heading "What's on your mind today?" [level=1, ref=e114]
+- textbox "Chat with ChatGPT" [ref=e122]: 分析为什么这个 rate limit 是误报
+- button "Send prompt" [ref=e119]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.ok(!/rate limit/i.test(out), `composer text leaked: ${out}`);
+		assert.ok(!/旧对话/.test(out), `sidebar leaked: ${out}`);
+	});
+
+	it("does not flag a multi-line composer value containing 'Too many requests'", () => {
+		const snapshot = `
+- navigation "Chat history" [ref=e3]
+  - link "历史" [ref=e26]
+- heading "What's on your mind today?" [level=1, ref=e114]
+- textbox "Chat with ChatGPT" [ref=e122]: 第一行
+  第二行包含 Too many requests
+- button "Send prompt" [ref=e119]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.ok(!/too many requests/i.test(out), `composer leaked: ${out}`);
+	});
+
+	it("does not flag a sidebar title containing 'rate limit'", () => {
+		const snapshot = `
+- navigation "Chat history" [ref=e3]
+  - link "解释 rate limit 含义" [ref=e26]
+  - link "Too many requests 分析" [ref=e27]
+- textbox "Chat with ChatGPT" [ref=e122]
+- button "Send prompt" [ref=e119]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.ok(!/rate limit/i.test(out), `sidebar leaked: ${out}`);
+		assert.ok(!/too many requests/i.test(out), `sidebar leaked: ${out}`);
+	});
+
+	it("does not flag a user message that re-entered main conversation after send", () => {
+		const snapshot = `
+- navigation "Chat history" [ref=e3]
+  - link "历史" [ref=e26]
+- generic "请审核 rate limit 的处理" [ref=e112]
+- heading "Sol 回复正文" [level=2, ref=e133]
+- textbox "Chat with ChatGPT" [ref=e122]
+- button "Send prompt" [ref=e119]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.ok(!/rate limit/i.test(out), `conversation leaked: ${out}`);
+	});
+
+	it("still detects a main provider banner 'Too many requests' when composer is present", () => {
+		const snapshot = `
+- navigation "Chat history" [ref=e3]
+  - link "历史" [ref=e26]
+- textbox "Chat with ChatGPT" [ref=e122]
+- button "Send prompt" [ref=e119]
+- alert "Too many requests in one hour" [ref=e210]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /Too many requests/);
+	});
+
+	it("still detects a provider banner when Send button is missing (limit page)", () => {
+		const snapshot = `
+- textbox "Chat with ChatGPT" [ref=e122]
+- alert "You've hit your rate limit" [ref=e210]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /rate limit/);
+	});
+
+	it("falls back to the page when the composer is gone (full-page outage)", () => {
+		const snapshot = `
+- heading "Too many requests" [level=1, ref=e1]
+- paragraph "Please try again later" [ref=e2]
+`;
+		const out = sanitizeProviderBlockerSnapshot(snapshot, labels);
+		assert.match(out, /Too many requests/);
 	});
 });

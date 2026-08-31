@@ -101,6 +101,54 @@ export function buildAllowedChatGptOrigins(chatUrl, authUrl) {
  * @param {string | undefined} value
  * @returns {string}
  */
+export const PROVIDER_ERROR_SURFACE_KINDS = Object.freeze(["alert", "status", "dialog", "banner", "log"]);
+
+/**
+ * Positive-scope provider blocker sanitization (pure, testable).
+ *
+ * Returns candidate text for rate-limit/outage detection:
+ * - Prefer explicit semantic error surfaces (alert/status/dialog/banner/log),
+ *   which are provider-owned and never contain user conversation text.
+ * - If the page has NO composer (full-page outage replacing the app), fall back
+ *   to the sidebar-stripped snapshot so real error pages are still detected.
+ * - When a composer is present, user conversation/composer/sidebar text is never
+ *   consulted, so a prompt or reply that merely mentions "rate limit"/"Too many
+ *   requests" cannot trigger a false failure.
+ *
+ * @param {string} snapshot agent-browser `snapshot -i` accessibility text
+ * @param {{ composerLabel: string; isGrok?: boolean }} labels
+ * @returns {string}
+ */
+export function sanitizeProviderBlockerSnapshot(snapshot, { composerLabel, isGrok = false }) {
+  const lines = String(snapshot || "").split("\n");
+  const surfaces = [];
+  const kept = [];
+  let hasComposer = false;
+  let sidebarDepth = -1;
+  for (const line of lines) {
+    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
+    if (sidebarDepth >= 0) {
+      if (indent <= sidebarDepth) sidebarDepth = -1;
+      else continue; // skip sidebar subtree (user-controlled chat titles)
+    }
+    if (line.includes('navigation "Chat history"')) {
+      sidebarDepth = indent;
+      continue;
+    }
+    if (line.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(line))) {
+      hasComposer = true;
+    }
+    const kindMatch = line.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
+    const kind = kindMatch ? kindMatch[1] : "";
+    if (PROVIDER_ERROR_SURFACE_KINDS.includes(kind)) surfaces.push(line);
+    else kept.push(line);
+  }
+  if (/too many requests|rate limit/i.test(surfaces.join("\n"))) return surfaces.join("\n");
+  // Full-page outage: no composer, conversation replaced, only sidebar remains.
+  if (!hasComposer) return kept.join("\n");
+  return "";
+}
+
 export function stripChatGptResponseChrome(value) {
   return String(value || "")
     .split("\n")

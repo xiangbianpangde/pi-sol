@@ -94,8 +94,11 @@ describe("sol extension registration", () => {
 
 	it("blocks a second ChatGPT submission when another Pi session is active", async () => {
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-active-jobs-"));
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-active-state-"));
 		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
+		const previousStateDir = process.env.PI_SOL_STATE_DIR;
 		process.env.PI_ORACLE_JOBS_DIR = jobsDir;
+		process.env.PI_SOL_STATE_DIR = stateDir;
 		try {
 			const activeDir = join(jobsDir, "oracle-active");
 			await mkdir(activeDir, { recursive: true });
@@ -115,7 +118,10 @@ describe("sol extension registration", () => {
 		} finally {
 			if (previousJobsDir === undefined) delete process.env.PI_ORACLE_JOBS_DIR;
 			else process.env.PI_ORACLE_JOBS_DIR = previousJobsDir;
+			if (previousStateDir === undefined) delete process.env.PI_SOL_STATE_DIR;
+			else process.env.PI_SOL_STATE_DIR = previousStateDir;
 			await rm(jobsDir, { recursive: true, force: true });
+			await rm(stateDir, { recursive: true, force: true });
 		}
 	});
 

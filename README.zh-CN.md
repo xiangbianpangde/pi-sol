@@ -35,7 +35,7 @@
 - 🎯 **锁定 High 推理档位**：固定使用 `thinking_extended`（Plus High）预设，**绝不静默降级**至 Instant 或 Standard。
 - 📁 **严格文件显式暂存**：仅发送通过 `--files a,b` 明确指定的文件，绝不自动打包或上传全项目代码。
 - 🛡️ **浏览器会话防冲突**：自动拦截 `agent_browser` 访问 ChatGPT 域名，防止双重自动化抢占登录态。
-- 🔒 **跨 Pi 提交仲裁**：跨本机多个 Pi 会话串行化 ChatGPT 提交，遇到占用时明确报告任务，不再静默冲突退出。
+- 🔒 **跨 Pi 提交仲裁**：跨本机多个 Pi 会话以 kernel-flock 协调 ChatGPT 提交（默认并发上限 2），达到上限时明确报告任务，不再静默冲突退出。
 - 🔄 **自动补丁维护**：内置适配 2026-08 ChatGPT Plus 紧凑型 UI 与 Power-slider 滑块的 worker 补丁与自动恢复机制。
 - ⏳ **同步与后台双模式**：支持阻塞等待实时解答，也支持 `--bg` 后台提交并在稍后通过 `/sol-read` 查阅。
 
@@ -67,6 +67,12 @@
 - 本地 Chrome 已登录 ChatGPT **Plus** 账号
 - Node.js **22 或更高版本**
 - 运行 `/sol-auth` 之前，请将 Chrome 界面语言调整为 **English**
+- C/C++ 编译工具链（macOS 上为 Xcode Command Line Tools）——`/sol` 提交仲裁使用原生 `fs-ext` 扩展提供内核级 `flock`，安装时会编译
+
+> [!IMPORTANT]
+> **`PI_SOL_STATE_DIR` 必须位于支持可靠 OS 咨询锁（advisory locking）语义的本地文件系统上。**
+>
+> `/sol` 提交仲裁会在该目录下的锁文件上获取排他 `flock(2)`。网络/分布式/FUSE 类文件系统（NFS/SMB 等）不受支持，除非其锁语义已被明确验证——此类挂载点上的 flock 可能静默降级或失败，从而破坏跨 Pi 提交仲裁保证。
 
 > [!IMPORTANT]
 > **Chrome 必须使用英文界面才能完成 ChatGPT 认证。**
@@ -90,7 +96,7 @@ cd pi-sol
 ./scripts/install.sh
 ```
 
-安装脚本会把扩展、skill 和补丁文件复制到 Pi 配置目录（`~/.pi/agent/`）。
+安装脚本会把扩展、skill 和补丁文件复制到 Pi 配置目录（`~/.pi/agent/`），并在该目录安装原生 `fs-ext` 扩展。如果检测到正在运行的 Pi 进程（进程名为 `pi` 或 argv 含 `pi-coding-agent`），安装脚本会拒绝继续——从 `ac52249` 之前的 pathname 协议升级到 kernel-flock 协议是 **stop-the-world** 操作，因为两代协调协议之间没有共同的互斥锁，若同时运行可能导致重复提交。请先关闭所有 Pi 会话；如需强制覆盖（不推荐），设置 `PI_SOL_FORCE_UPGRADE=1`。
 
 ### 2. 重新加载 Pi
 
@@ -160,7 +166,7 @@ cd pi-sol
 - **`--files a,b`**：仅附加明确列出的文件。绝不自动全量扫描或打包仓库。
 - **`--follow <job-id>`**：跟随上一次 `/sol` 调用的对话线索。
 
-ChatGPT 提交会在本机多个 Pi 会话之间串行化。如果已有 `/sol` 任务排队或运行，新提交会被阻止并显示任务 ID；等待完成后使用 `/sol-read <job-id>`。这是针对账号级限流的保护，不是 pi-oracle 隔离浏览器 profile 的并发限制。
+ChatGPT 提交允许本机多个 Pi 会话并发运行最多 `maxConcurrentJobs`（默认 2）个 `/sol` 任务；每个任务运行在各自隔离的浏览器 runtime profile 中。当达到并发上限时，新提交会被阻止并显示活跃任务 ID；等待其中一个完成后使用 `/sol-read <job-id>`。这是针对账号级限流的保护，不是 pi-oracle 隔离浏览器 profile 的并发限制。
 
 ---
 
@@ -255,7 +261,7 @@ ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻
 ### 跨会话提交仲裁
 - 使用短时原子租约保护 `oracle_submit` 的跨 Pi 进程交接。
 - `queued`、`preparing`、`submitted`、`waiting` 状态的 `job.json` 会被视为正在占用。
-- 终态任务不阻塞新任务；Pi 崩溃遗留的提交锁会在有限 TTL 后回收。
+- 终态任务不阻塞新任务。提交仲裁锁是内核级 flock：持有进程退出或崩溃时由内核自动释放（无 TTL、无 stale 锁回收）。
 - 如果最终错误是 `rate limit`，仍表示账号配额窗口耗尽，不能通过切换模型档位绕过。
 
 ---

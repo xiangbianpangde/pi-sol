@@ -228,7 +228,50 @@
    if (status.connected === false) {
      throw new Error("The isolated oracle browser disconnected during the job.");
    }
-@@ -1372,7 +1382,7 @@
+@@ -1242,10 +1252,41 @@
+ function formatProviderTransientErrorMessage(job, errorText, context) {
+   const providerLabel = isGrokJob(job) ? "Grok" : "ChatGPT";
+   return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
++}
++
++function stripSnapshotUserContent(snapshot, job = currentJob) {
++  const labels = labelsForJob(job);
++  const lines = snapshot.split("\n");
++  const out = [];
++  let sidebarDepth = -1;
++  for (let i = 0; i < lines.length; i++) {
++    const line = lines[i];
++    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
++    if (sidebarDepth >= 0) {
++      if (indent <= sidebarDepth) sidebarDepth = -1;
++      else continue;
++    }
++    if (line.includes('navigation "Chat history"')) {
++      sidebarDepth = indent;
++      continue;
++    }
++    if (line.includes(`textbox "${labels.composer}"`) || (isGrokJob(job) && /contenteditable/.test(line))) {
++      let j = i + 1;
++      while (j < lines.length && !lines[j].includes(`button "${labels.send}"`)) j += 1;
++      i = j - 1;
++      continue;
++    }
++    out.push(line);
++  }
++  return out.join("\n");
+ }
+ 
+ function providerTransientErrorMessage(job, text, context) {
+-  const errorText = detectProviderVisibleBlockerText(text);
++  // The full accessibility snapshot includes user-authored content: the
++  // composer input value and sidebar chat titles. Those can legitimately
++  // contain "rate limit"/"Too many requests" and were being misread as a
++  // provider outage page (false failure of otherwise-ready /sol jobs).
++  const errorText = detectProviderVisibleBlockerText(stripSnapshotUserContent(text, job));
+   if (!errorText) return "";
+   return formatProviderTransientErrorMessage(job, errorText, context);
+ }
+@@ -1372,7 +1413,7 @@
      url: urlResult.url,
      urlKnown: urlResult.ok,
      assistantCount: Math.max(baselineAssistantCount, messages.length),
@@ -237,15 +280,16 @@
      transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
    };
  }
-@@ -1427,7 +1437,38 @@
+@@ -1426,6 +1467,37 @@
+   `));
    if (dismissed) await agentBrowser(job, "wait", "500");
    return Boolean(dismissed);
- }
++}
 +
 +async function trySelectPowerSliderHigh(job) {
 +  let snapshot = await snapshotText(job);
 +  if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
- 
++
 +  const advanced = findEntry(
 +    snapshot,
 +    (candidate) => candidate.kind === "menuitem" && /show advanced options/i.test(String(candidate.label || "")) && !candidate.disabled,
@@ -271,12 +315,10 @@
 +
 +  const visible = describeCompactComposerSelection(snapshot) || "unknown";
 +  throw new Error(`ChatGPT Power slider is ${visible}, not GPT-5.6 Sol High. /sol requires thinking_extended. Open Advanced → High and retry.`);
-+}
-+
+ }
+ 
  async function openModelConfiguration(job) {
-   const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
-   let lastSnapshot = "";
-@@ -1451,6 +1492,9 @@
+@@ -1451,6 +1523,9 @@
        throwIfProviderTransientError(job, after, "opening model configuration");
        if (snapshotHasModelConfigurationUi(after)) return after;
        if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
@@ -286,7 +328,7 @@
  
        const configureEntry = findEntry(
          after,
-@@ -1465,6 +1509,9 @@
+@@ -1465,6 +1540,9 @@
          throwIfProviderTransientError(job, postConfigure, "opening model configuration");
          if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
          if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
@@ -296,7 +338,7 @@
        }
      }
  
-@@ -1526,14 +1573,49 @@
+@@ -1526,14 +1604,49 @@
    throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
  }
  
@@ -347,7 +389,7 @@
    await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
    let familySnapshot = await openModelConfiguration(job);
    let verificationSnapshot = familySnapshot;
-@@ -1553,7 +1635,21 @@
+@@ -1553,7 +1666,21 @@
    } else if (familyAlreadySelectedInUi) {
      await log("Model family already appears selected; verifying effort-specific settings");
    } else if (!familyEntry) {
@@ -370,7 +412,7 @@
    }
  
    let compactSelectionVerifiedAfterClick = false;
-@@ -1577,7 +1673,7 @@
+@@ -1577,7 +1704,7 @@
      }
    }
  
@@ -379,7 +421,7 @@
      const effortLabel = requestedEffortLabel(job.selection);
      if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
        const opened = await openEffortDropdown(job);
-@@ -1626,7 +1722,7 @@
+@@ -1626,7 +1753,7 @@
      }
    }
  
@@ -388,7 +430,7 @@
    if (!stronglyVerified) {
      throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
    }
-@@ -1812,24 +1908,37 @@
+@@ -1812,24 +1939,37 @@
    return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
  }
  
@@ -431,7 +473,7 @@
  
      if (!hasStopStreaming && hasRetryButton && responseFailureText) {
        if (!retriedAfterFailure) {
-@@ -2370,7 +2479,10 @@
+@@ -2370,7 +2510,10 @@
      }));
      await uploadArchive(currentJob);
      await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
@@ -443,7 +485,7 @@
      await log(`Assistant response count before send: ${baselineAssistantCount}`);
      await clickSend(currentJob, baselineAssistantCount);
      await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
-@@ -2391,7 +2503,7 @@
+@@ -2391,7 +2534,7 @@
        patch: awaitingResponsePatch,
      }));
  

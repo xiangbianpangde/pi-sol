@@ -1254,8 +1254,39 @@ function formatProviderTransientErrorMessage(job, errorText, context) {
   return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
 }
 
+function stripSnapshotUserContent(snapshot, job = currentJob) {
+  const labels = labelsForJob(job);
+  const lines = snapshot.split("\n");
+  const out = [];
+  let sidebarDepth = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const indent = (line.match(/^\s*/)?.[0].length ?? 0);
+    if (sidebarDepth >= 0) {
+      if (indent <= sidebarDepth) sidebarDepth = -1;
+      else continue;
+    }
+    if (line.includes('navigation "Chat history"')) {
+      sidebarDepth = indent;
+      continue;
+    }
+    if (line.includes(`textbox "${labels.composer}"`) || (isGrokJob(job) && /contenteditable/.test(line))) {
+      let j = i + 1;
+      while (j < lines.length && !lines[j].includes(`button "${labels.send}"`)) j += 1;
+      i = j - 1;
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
 function providerTransientErrorMessage(job, text, context) {
-  const errorText = detectProviderVisibleBlockerText(text);
+  // The full accessibility snapshot includes user-authored content: the
+  // composer input value and sidebar chat titles. Those can legitimately
+  // contain "rate limit"/"Too many requests" and were being misread as a
+  // provider outage page (false failure of otherwise-ready /sol jobs).
+  const errorText = detectProviderVisibleBlockerText(stripSnapshotUserContent(text, job));
   if (!errorText) return "";
   return formatProviderTransientErrorMessage(job, errorText, context);
 }

@@ -349,10 +349,13 @@ describe("jobs + prompt", () => {
 			await mkdir(tokenPath, { recursive: true });
 			await writeFile(join(tokenPath, "owner.json"), JSON.stringify({ token: "B", pid: process.pid, createdAt: new Date().toISOString() }));
 			// R1 resumes with its stale proof for A; the fixed path now holds B.
+			// Pre-rename verification (audit round P1) re-reads the current owner
+			// and sees B (live) — it aborts WITHOUT moving anything, so B is
+			// never displaced at all.
 			const r1 = await moveReclaimCandidate(tokenPath, { token: "A" });
-			assert.equal(r1.moved, true);
-			assert.equal(r1.keep, false); // generation mismatch — must not claim
-			// The live generation B must still be in place (restored), and its
+			assert.equal(r1.moved, false, "stale proof must not even move a newer live generation");
+			assert.equal(r1.keep, false); // must not claim
+			// The live generation B must still be in place, and its
 			// owner file intact.
 			const after = JSON.parse(await (await import("node:fs/promises")).readFile(join(tokenPath, "owner.json"), "utf8"));
 			assert.equal(after.token, "B");
@@ -597,6 +600,42 @@ describe("jobs + prompt", () => {
 			const released = await releaseSolSubmitLease({ path: lock, token: "ours" });
 			assert.equal(released, true);
 			assert.equal(existsSync(lock), false, "matching lock must be gone after release");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does NOT sweep other modules' .trash. dirs in the shared state dir (audit round P2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// A non-pi-sol component placed a .trash. dir in the shared state
+			// dir. sweepStaleStaging must NOT remove it (only pi-sol's own
+			// prefixes are swept).
+			const foreign = join(stateDir, "another-component.trash.backup");
+			await mkdir(foreign, { recursive: true });
+			await writeFile(join(foreign, "important.txt"), "keep me");
+			const old = new Date(Date.now() - 120 * 1000);
+			await utimes(foreign, old, old);
+			await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(existsSync(join(foreign, "important.txt")), true, "foreign .trash. dir must not be swept");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("still sweeps pi-sol's own trash dirs in the shared state dir (audit round P2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const own = join(stateDir, "pi-sol-submit.lock.trash.1234.uuid");
+			await mkdir(own, { recursive: true });
+			const old = new Date(Date.now() - 120 * 1000);
+			await utimes(own, old, old);
+			await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(existsSync(own), false, "pi-sol's own stale trash must be swept");
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });

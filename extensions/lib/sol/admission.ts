@@ -198,11 +198,14 @@ async function createStagingDir(stateDir: string): Promise<string> {
 async function sweepStaleStaging(stateDir: string): Promise<void> {
 	try {
 		for (const name of await readdir(stateDir)) {
-			// staging dirs are `.staging-<pid>-<uuid>`; trash dirs are
-			// `<fixed>.<path>.trash.<pid>.<uuid>` — both must be swept (the
-			// latter now also keeps a live-holder token after a failed restore,
-			// so it must be reaped once it goes stale, never left forever).
-			if (!name.includes(".trash.") && !name.startsWith(".staging-")) continue;
+			// Only sweep pi-sol's own staging/trash dirs (not generic .trash.
+			// from other modules in the shared stateDir — audit round P2).
+			// Staging: .staging-<pid>-<uuid>
+			// Trash:   pi-sol-submit.lock.trash.<pid>.<uuid> or
+			//          pi-sol-submit.reclaim-token.trash.<pid>.<uuid>
+			if (!name.startsWith(".staging-") &&
+			    !name.startsWith(SUBMIT_LOCK_NAME + ".trash.") &&
+			    !name.startsWith(RECLAIM_TOKEN_NAME + ".trash.")) continue;
 			const p = join(stateDir, name);
 			try {
 				const info = await stat(p);
@@ -227,6 +230,18 @@ export async function moveReclaimCandidate(
 	tokenPath: string,
 	observed: Partial<LeaseOwner> | undefined,
 ): Promise<{ moved: boolean; keep: boolean; trash?: string }> {
+	// PRE-RENAME VERIFICATION (audit round P1): read the current owner
+	// immediately before the rename.  Only proceed if it still matches the
+	// observed (dead) generation.  This eliminates the deterministic
+	// counterexample where a stale proof for A renames away a live B that
+	// was published between the original readOwner and this call — the
+	// pre-rename re-read sees B (live) and aborts, never moving a live
+	// holder's token.  The remaining TOCTOU (re-read → rename) is
+	// microseconds against a dead generation, not a live one.
+	const current = await readOwner(tokenPath);
+	if (observed && (!current || current.token !== observed.token)) {
+		return { moved: false, keep: false };
+	}
 	const { moved, trash } = await atomicRenameAway(tokenPath);
 	if (!moved) return { moved: false, keep: false };
 	const movedOwner = await readOwner(trash!);
@@ -263,14 +278,23 @@ export async function restoreMovedGeneration(tokenPath: string, trash: string): 
  * Generation-safe release: only remove the fixed path while it is STILL our
  * generation.  A concurrent reclaim may have replaced us with a newer live
  * token; removing that would delete another holder's serialization token
- * (audit round 6 P1-2).
+ * (audit round 6 P1-2).  Uses atomic rename-to-trash so the fixed path is
+ * removed in one namespace mutation (no read→rm TOCTOU, no partial-rm
+ * ownerless residue) — audit round P1.
  * @internal exported for deterministic tests
  */
 export async function releaseTokenGeneration(tokenPath: string, owner: LeaseOwner): Promise<void> {
 	const current = await readOwner(tokenPath);
-	if (current?.token === owner.token) {
-		await rm(tokenPath, { recursive: true, force: true }).catch(() => undefined);
+	if (current?.token !== owner.token) return; // not ours anymore
+	const trash = `${tokenPath}.trash.${process.pid}.${randomUUID()}`;
+	try {
+		await rename(tokenPath, trash);
+	} catch {
+		// Path may already be gone (a concurrent reclaim removed it); either
+		// way it is no longer ours to manage.
+		return;
 	}
+	await rm(trash, { recursive: true, force: true }).catch(() => undefined);
 }
 
 /**
@@ -460,13 +484,14 @@ export async function releaseSolSubmitLease(lease: SolSubmitLease, options: { ma
 		try {
 			const owner = await readOwner(lease.path);
 			if (owner?.token !== lease.token) return true; // released, or not ours
+			// Atomic removal (rename-to-trash first); if cleanup fails we
+			// CONTINUE so the retry loop covers BOTH reclaim-token contention
+			// AND fixed-path rename failure — never give up after one attempt
+			// (audit round P2 shutdown retry budget).
 			try {
-				// Atomic removal (rename-to-trash first); if cleanup fails we
-				// return false so the caller KEEPS the lease and retries —
-				// never forget ownership of a still-held lock.
 				await removeOwnFreshLockOrThrow(lease.path);
-			} catch (error) {
-				return false; // keep the lease for a later release attempt
+			} catch {
+				continue; // retry: loop will try to acquire the reclaim token again
 			}
 			return true;
 		} finally {

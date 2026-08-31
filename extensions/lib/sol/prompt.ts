@@ -60,7 +60,7 @@ Hard requirements:
 - Do not use agent_browser on ChatGPT. The isolated oracle worker owns that browser session. Regular agent_browser is only for non-ChatGPT pages.
 - Do not archive the whole repository. Only the exact file list below.
 - If a required tool is unavailable, stop and report that blocker. Do not fabricate a Sol answer.
-- ChatGPT /sol submissions are serialized across local Pi sessions to avoid account-level rate-limit collisions. If oracle_submit is blocked because another ChatGPT /sol job is active, report the active job id and stop; do not retry, open a second thread, or change presets.
+- ChatGPT /sol submissions allow concurrent jobs (browser.maxConcurrentJobs, default 2); each job runs in its own isolated browser profile. If oracle_submit is blocked because the concurrency limit is reached, report the active job id and stop; do not retry, open a second thread, or change presets.
 - Worker High/Power-slider patches are restored automatically before this turn. Never tell the user to run apply scripts. If a job still fails with "effort dropdown" or "model family control", restore once via \`node ~/.pi/agent/extensions/lib/sol/apply-sol-patches.mjs --restore\` yourself, then retry the same thinking_extended submit once. Do not ask the user to do that.
 
 ChatGPT web upload / 封控 (already prechecked when files were staged; still honor them):

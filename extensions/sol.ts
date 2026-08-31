@@ -196,6 +196,14 @@ export default function (pi: ExtensionAPI) {
 						const admission = await acquireSolSubmitLease();
 						if (admission.acquired) {
 							submitLeases.set(event.toolCallId, admission.lease);
+						} else if (admission.pendingLease) {
+							// Cleanup of our own fresh lock failed inside admission; the
+							// lease is still OURS (live PID).  Register it so the
+							// release machinery (tool_execution_end / session_shutdown)
+							// retries until the lock is gone — never forget ownership
+							// of a still-held lock (audit round P2).
+							submitLeases.set(event.toolCallId, admission.pendingLease);
+							admissionBlockReason = admission.reason;
 						} else {
 							admissionBlockReason = admission.reason;
 						}

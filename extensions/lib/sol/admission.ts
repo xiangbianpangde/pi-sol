@@ -68,7 +68,7 @@ export type SolSubmitLease = {
 
 export type SolSubmitAdmission =
 	| { acquired: true; lease: SolSubmitLease }
-	| { acquired: false; reason: string; activeJobs: SolJobSummary[] };
+	| { acquired: false; reason: string; activeJobs: SolJobSummary[]; pendingLease?: SolSubmitLease };
 
 type LeaseOwner = {
 	token: string;
@@ -160,6 +160,11 @@ async function atomicPublishLock(stagingDir: string, fixedPath: string, owner: L
  * lock (owner alive → never stale) would wedge all future /sol admissions
  * until this Pi exits (audit round P2-C2).
  */
+/** Async wrapper around existsSync for use in return expressions. */
+async function existsSyncAuto(path: string): Promise<boolean> {
+	return existsSync(path);
+}
+
 async function removeOwnFreshLockOrThrow(path: string): Promise<void> {
 	try {
 		await rm(path, { recursive: true, force: true });
@@ -383,23 +388,40 @@ export async function acquireSolSubmitLease(
 		} catch (error) {
 			// A scan failure right after we published our OWN fresh lock must
 			// not leave a live-PID wedge (nobody owns the lease, yet the PID
-			// is alive so it can never be reclaimed as stale).  Clean our
-			// generation and fail closed; escalate loudly if cleanup fails
-			// (audit round P2-C2-1).
-			await removeOwnFreshLockOrThrow(path);
+			// is alive so it can never be reclaimed as stale).  We try to
+			// clean our generation; if even cleanup fails, we return the lease
+			// as pendingLease so the caller registers it in submitLeases and
+			// the release machinery retries until success (audit round P2).
+			try {
+				await removeOwnFreshLockOrThrow(path);
+			} catch { /* cleanup failure — preserve ownership for retry */ }
+			// If cleanup succeeded, pendingLease is undefined; the tool_call
+			// handler skips registration.  If cleanup failed, the lease is
+			// passed back so it stays owned (not lost) — the existing
+			// release-keeps-lease / session_shutdown retry machinery handles
+			// eventual cleanup.  In either case we fail-closed (no submit).
 			return {
 				acquired: false,
 				reason: `Cannot scan active /sol jobs after acquiring the coordination lock: ${error instanceof Error ? error.message : String(error)}`,
 				activeJobs: [],
+				...(await existsSyncAuto(path) ? { pendingLease: { path, token } } : {}),
 			};
 		}
 		if (active.length >= maxConcurrentJobs) {
 			// Confirm our own generation is removed before reporting busy;
 			// never swallow a cleanup failure (a leaked live-PID lock would
 			// wedge all future /sol admissions until this Pi exits).
-			// audit round P2-C2-2.
-			await removeOwnFreshLockOrThrow(path);
-			return { acquired: false, reason: busyReason(active), activeJobs: active };
+			// If cleanup fails, preserve ownership via pendingLease for
+			// retry by the release machinery (audit round P2).
+			try {
+				await removeOwnFreshLockOrThrow(path);
+			} catch { /* cleanup failure — preserve ownership */ }
+			return {
+				acquired: false,
+				reason: busyReason(active),
+				activeJobs: active,
+				...(await existsSyncAuto(path) ? { pendingLease: { path, token } } : {}),
+			};
 		}
 		return { acquired: true, lease: { path, token } };
 	}

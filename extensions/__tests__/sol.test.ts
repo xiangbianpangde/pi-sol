@@ -547,6 +547,42 @@ describe("jobs + prompt", () => {
 		}
 	});
 
+	it("preserves lease ownership via pendingLease when post-publish cleanup fails (audit round P2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// scanActive throws AFTER the fresh lock is published; before
+			// throwing it removes write permission on the state dir so the
+			// cleanup rm() fails → the lease must come back as pendingLease
+			// (ownership preserved for retry), never silently dropped.
+			const { chmodSync } = await import("node:fs");
+			let calls = 0;
+			const scanActive = () => {
+				calls += 1;
+				if (calls === 1) return []; // pre-lock fast scan passes
+				// In-lock authoritative scan: throw AFTER removing write
+				// permission so the cleanup rm() fails.
+				chmodSync(stateDir, 0o500); // lock dir now unwritable
+				throw new Error("jobs dir vanished");
+			};
+			const result = await acquireSolSubmitLease(stateDir, jobsDir, 2, scanActive as never);
+			assert.equal(result.acquired, false);
+			if (!result.acquired) {
+				assert.match(result.reason, /Cannot scan active/);
+				assert.ok(result.pendingLease, "cleanup failure must return pendingLease, not drop ownership");
+				assert.equal(result.pendingLease?.path, join(stateDir, "pi-sol-submit.lock"));
+			}
+			// Restore permissions so the finally cleanup can remove the dir.
+			const { chmod } = await import("node:fs/promises");
+			await chmod(stateDir, 0o700);
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			assert.equal(existsSync(lock), true, "lock should still exist (rm failed) so pendingLease has something to clean");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("reads oracle.json maxConcurrentJobs with strict typing and fails back to the default (audit P2-4)", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "sol-cfg-"));
 		const home = join(dir, "fake-home");
@@ -581,7 +617,7 @@ describe("jobs + prompt", () => {
 		assert.match(text, /oracle_auth/);
 		assert.match(text, /Do not archive the whole repository/);
 		assert.match(text, /Never retry Instant\/Standard/);
-		assert.match(text, /submissions are serialized across local Pi sessions/);
+		assert.match(text, /concurrent jobs/);
 		assert.match(text, /Never tell the user to run apply scripts/);
 		assert.match(text, /\.pi\/sol-staging\/x\/a\.ts/);
 	});

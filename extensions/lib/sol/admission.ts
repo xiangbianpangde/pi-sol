@@ -166,11 +166,22 @@ async function existsSyncAuto(path: string): Promise<boolean> {
 }
 
 async function removeOwnFreshLockOrThrow(path: string): Promise<void> {
+	// ATOMIC REMOVAL: fs.rm(recursive) is not atomic — it can delete
+	// owner.json first and then fail on the parent-dir permission, leaving an
+	// ownerless lock dir at the FIXED path (which readOwner would misjudge as
+	// "not ours", wedging admission until the owner Pi exits).  Instead we
+	// rename the fixed path to a unique trash dir FIRST (atomic: the fixed
+	// path is gone in one step) and only then best-effort delete the trash;
+	// any leftover trash is reaped by sweepStaleStaging.  The fixed path
+	// never carries a partial-rm remnant (audit round P2).
+	const trash = `${path}.trash.${process.pid}.${randomUUID()}`;
 	try {
-		await rm(path, { recursive: true, force: true });
+		await rename(path, trash);
 	} catch (error) {
+		if (!existsSync(path)) return; // already gone
 		throw new Error(`Cannot remove own coordination lock ${path}: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	await rm(trash, { recursive: true, force: true }).catch(() => undefined);
 	if (existsSync(path)) {
 		throw new Error(`Coordination lock ${path} still exists after removal; refusing to forget ownership`);
 	}
@@ -448,8 +459,16 @@ export async function releaseSolSubmitLease(lease: SolSubmitLease, options: { ma
 		}
 		try {
 			const owner = await readOwner(lease.path);
-			if (owner?.token === lease.token) await rm(lease.path, { recursive: true, force: true });
-			return true; // released, or the path is already not ours
+			if (owner?.token !== lease.token) return true; // released, or not ours
+			try {
+				// Atomic removal (rename-to-trash first); if cleanup fails we
+				// return false so the caller KEEPS the lease and retries —
+				// never forget ownership of a still-held lock.
+				await removeOwnFreshLockOrThrow(lease.path);
+			} catch (error) {
+				return false; // keep the lease for a later release attempt
+			}
+			return true;
 		} finally {
 			await releaseToken();
 		}

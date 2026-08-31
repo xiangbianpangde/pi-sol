@@ -583,6 +583,26 @@ describe("jobs + prompt", () => {
 		}
 	});
 
+	it("removes a matching lock via atomic rename-to-trash and leaves no fixed-path remnant (audit round P2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// Release removes a matching-token lock through atomic
+			// rename-to-trash (not non-atomic rm), so the fixed path never
+			// carries a partial-rm ownerless remnant that readOwner would
+			// misjudge as "not ours".
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "ours", pid: process.pid, createdAt: new Date().toISOString() }));
+			const released = await releaseSolSubmitLease({ path: lock, token: "ours" });
+			assert.equal(released, true);
+			assert.equal(existsSync(lock), false, "matching lock must be gone after release");
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("reads oracle.json maxConcurrentJobs with strict typing and fails back to the default (audit P2-4)", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "sol-cfg-"));
 		const home = join(dir, "fake-home");

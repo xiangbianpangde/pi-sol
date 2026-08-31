@@ -414,4 +414,29 @@ describe("provider blocker evidence — audit round 3 boundaries", () => {
 		assert.ok(!/rate limit/i.test(evidence.surfaces), `composer value leaked into surfaces: ${evidence.surfaces}`);
 		assert.equal(evidence.hasComposer, true); // composer was still detected
 	});
+
+	it("does NOT include multi-line composer continuation inside error-role subtree (P1-4)", () => {
+		const snapshot = `
+- dialog "shell" [ref=e1]
+  - textbox "Chat with ChatGPT" [ref=e2]
+    - generic "请审核 rate limit 的处理" [ref=e3]
+- generic "请检查" [ref=e4]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		// A deeper-indented generic under a composer textbox is user input
+		// content (agent-browser renders the composer value as a plain/generic
+		// continuation), never provider error text.
+		assert.ok(!/rate limit/i.test(evidence.surfaces), `composer continuation leaked: ${evidence.surfaces}`);
+	});
+
+	it("does NOT include generic user message inside a dialog in strong surfaces (P1-4)", () => {
+		const snapshot = `
+- dialog "shell" [ref=e1]
+  - generic "请审核 rate limit 的处理" [ref=e2]
+- textbox "Chat with ChatGPT" [ref=e3]
+- button "Send prompt" [ref=e4]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		assert.ok(!/rate limit/i.test(evidence.surfaces), `generic dialog child leaked into surfaces: ${evidence.surfaces}`);
+	});
 });

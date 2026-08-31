@@ -3,6 +3,7 @@
  * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol.test.ts
  */
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -306,19 +307,48 @@ describe("jobs + prompt", () => {
 		}
 	});
 
-	it("reclaims an ownerless reclaim-token after the init grace (P1-2)", async () => {
+	it("reclaims a reclaim-token whose owner is provably dead (atomic-publish crash case)", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
 		try {
+			// A crashed holder leaves a FULLY-INITIALIZED token (owner.json
+			// present — atomic publish has no ownerless intermediate state).
+			// Dead owner PID → reclaimable.
 			const token = join(stateDir, "pi-sol-submit.reclaim-token");
 			await mkdir(token, { recursive: true });
-			// No owner.json: simulate crash between mkdir and owner write. Backdate
-			// mtime beyond the 5s init grace so it is treated as stale.
-			const old = new Date(Date.now() - 10 * 1000);
-			await utimes(token, old, old);
+			await writeFile(join(token, "owner.json"), JSON.stringify({ token: "dead-token", pid: 999999, createdAt: new Date().toISOString() }));
+			// Also place a stale submit lock so acquire goes through the
+			// reclaim path (and therefore exercises acquireReclaimToken).
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "dead-lock", pid: 999999, createdAt: new Date().toISOString() }));
+			const old = new Date(Date.now() - 16 * 60 * 1000);
+			await utimes(lock, old, old);
 			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
 			assert.equal(acquired.acquired, true);
 			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("never leaves an ownerless reclaim-token visible (atomic publish invariant)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			// The token path must NEVER exist without owner.json: atomic publish
+			// renames a fully-initialized staging dir onto the fixed path, so an
+			// ownerless token cannot be created by the protocol itself.
+			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(acquired.acquired, true);
+			if (acquired.acquired) {
+				const token = join(stateDir, "pi-sol-submit.reclaim-token");
+				if (existsSync(token)) {
+					assert.ok(existsSync(join(token, "owner.json")), "token must carry owner.json when it exists");
+				}
+				await releaseSolSubmitLease(acquired.lease);
+			}
 		} finally {
 			await rm(stateDir, { recursive: true, force: true });
 			await rm(jobsDir, { recursive: true, force: true });

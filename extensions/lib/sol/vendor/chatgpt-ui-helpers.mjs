@@ -170,17 +170,28 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
     // end of line, or a bracket (handles both named and unnamed roles)
     const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
     if (roleMatch) {
-      // Collect this line plus all descendant lines (greater indentation).
-      // A composer textbox nested inside the subtree is still user input:
-      // mark hasComposer but NEVER include its value in strong surfaces.
+      // Positive-scope collection over the WHOLE error-role subtree: we only
+      // keep descendant lines whose accessibility kind is paragraph or a
+      // nested provider error role (alert/status/dialog/banner/log). Every
+      // other kind (generic, heading, textbox, button, link, navigation,
+      // contenteditable, ...) is skipped — those shapes can carry user-authored
+      // conversation or composer content and must never become STRONG provider
+      // evidence (P1-4). Deep paragraphs (3+ levels) are still captured.
       surfaces.push(line);
       i += 1;
       while (i < lines.length) {
         const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
         if (childIndent > indent) {
-          const isComposer = lines[i].includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(lines[i]));
-          if (isComposer) hasComposer = true;
-          else surfaces.push(lines[i]);
+          const childLine = lines[i];
+          if (childLine.includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(childLine))) {
+            hasComposer = true; // still detect composer; value never collected
+          } else {
+            const childKind = childLine.match(/^\s*[-+]?\s*([A-Za-z][A-Za-z0-9]*)\s+"/);
+            const kindName = childKind ? childKind[1] : "";
+            if (kindName === "paragraph" || PROVIDER_ERROR_SURFACE_KINDS.includes(kindName)) {
+              surfaces.push(childLine);
+            }
+          }
           i += 1;
         } else break;
       }

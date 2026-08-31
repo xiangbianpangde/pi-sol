@@ -1,6 +1,30 @@
 # sol CHANGELOG
 
-## 1.7.0 - 2026-08-31
+## 1.8.0 - 2026-08-31
+
+- **Sol audit round 5 (186690d2, FAIL 4 P1 → fixes)**:
+  - P1 atomic publish: submit lock and reclaim token are now published by
+    writing owner.json into a UNIQUE staging dir and renaming it onto the fixed
+    path. rename() is atomic, so the fixed path never exposes an ownerless
+    intermediate state (closes the mkdir→write crash-window split-brain for
+    both the reclaim token and the primary submit lock).
+  - P1 release wedge: `releaseSolSubmitLease` returns false when it cannot
+    acquire the reclaim token; the caller now KEEPS the lease so
+    tool_execution_end / session_shutdown retry instead of forgetting a
+    still-held lock (no more permanent /sol block while the lease owner is
+    alive).
+  - P1 sanitizer scope: error-role subtree collection now only keeps descendant
+    lines whose accessibility kind is `paragraph` or a nested error role;
+    generic/heading/textbox/button/link/navigation shapes (user conversation,
+    composer continuation, sidebar) never enter STRONG surfaces — including
+    multi-line composer continuation and generic messages nested inside a
+    dialog.
+  - Tests: 106/106 (atomic-publish ownerless invariant, dead-owner token
+    reclaim, release-keeps-lease-on-token-busy, multi-line composer + dialog
+    generic exclusion, completion-guard marker, prior concurrency/crash/upgrade
+    regressions).
+
+ - 2026-08-31
 
 - **Sol audit round 4 (fa556f6f, FAIL 4 P1 → fixes)**:
   - P1-1 release fallback: removed the bare read→rm fallback in

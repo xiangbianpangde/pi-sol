@@ -249,8 +249,11 @@ export default function (pi: ExtensionAPI) {
 	const releaseSubmitLeaseFor = async (toolCallId: string): Promise<void> => {
 		const lease = submitLeases.get(toolCallId);
 		if (!lease) return;
-		submitLeases.delete(toolCallId);
-		await releaseSolSubmitLease(lease);
+		// If release cannot acquire the reclaim token (another process is
+		// mid-mutation), it returns false — KEEP the lease so a later event
+		// (tool_execution_end / session_shutdown) retries instead of wedging.
+		const released = await releaseSolSubmitLease(lease);
+		if (released) submitLeases.delete(toolCallId);
 	};
 
 	// Release the cross-session admission lease as soon as oracle_submit
@@ -263,8 +266,12 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "oracle_submit") await releaseSubmitLeaseFor(event.toolCallId);
 	});
 	pi.on("session_shutdown", async () => {
-		await Promise.all([...submitLeases.values()].map((lease) => releaseSolSubmitLease(lease)));
-		submitLeases.clear();
+		// Longer retry budget on shutdown, and only drop leases that were
+		// actually released so we never forget a still-held lock.
+		for (const lease of [...submitLeases.values()]) {
+			const released = await releaseSolSubmitLease(lease, { maxAttempts: 100, retryMs: 100 });
+			if (released) submitLeases.delete(lease);
+		}
 	});
 
 	pi.registerCommand("sol", {

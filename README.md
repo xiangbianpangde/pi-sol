@@ -35,7 +35,7 @@
 - 🎯 **Guaranteed High Reasoning**: Uses the fixed `thinking_extended` (Plus High) preset; **never silently falls back** to Instant or Standard.
 - 📁 **Strict Opt-in File Staging**: Only user-specified files (`--files a,b`) are sent. Repositories are never auto-archived.
 - 🛡️ **Session Guard**: Automatically blocks `agent_browser` on ChatGPT domains to avoid browser session collisions.
-- 🔒 **Cross-Pi Admission**: Serializes ChatGPT submissions across local Pi sessions and reports the active job instead of silently colliding.
+- 🔒 **Cross-Pi Admission**: Coordinates ChatGPT submissions across local Pi sessions with kernel-level flock (default concurrency limit 2) and reports active jobs when the limit is reached instead of silently colliding.
 - 🔄 **Self-Healing Patches**: Automatically manages compatibility patches for ChatGPT Plus High UI (2026-08 compact & Power-slider).
 - ⏳ **Sync & Background Modes**: Block for immediate reasoning answers or run `--bg` jobs with persistent `/sol-read` retrieval.
 

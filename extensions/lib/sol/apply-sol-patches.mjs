@@ -54,6 +54,7 @@ export const SOL_PATCH_MARKERS = {
 		"!assumedDefaultThinkingFallback",
 		"visible compact selection is",
 		"function sanitizeProviderBlockerSnapshot",
+		"while the model is still streaming (Stop control visible)",
 	],
 };
 

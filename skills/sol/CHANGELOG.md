@@ -1,6 +1,31 @@
 # sol CHANGELOG
 
-## 1.6.1 - 2026-08-31
+## 1.7.0 - 2026-08-31
+
+- **Sol audit round 4 (fa556f6f, FAIL 4 P1 → fixes)**:
+  - P1-1 release fallback: removed the bare read→rm fallback in
+    `releaseSolSubmitLease`. Release now acquires the reclaim token (retrying up
+    to 20x) and only mutates the fixed path while holding it; never falls back
+    to a tokenless rm that could delete a newer generation.
+  - P1-2 ownerless reclaim-token: a token directory created but whose
+    `owner.json` was never written (crash between mkdir and write) is now
+    reclaimed after a 5s init grace via atomic rename, so it can never wedge
+    reclaims forever.
+  - P1-3 completion guard deployment: the streaming hard guard marker
+    ("while the model is still streaming (Stop control visible)") is added to
+    `SOL_PATCH_MARKERS.runJob`, so an eddf08b worker with older markers only
+    will be detected as missing and redeployed with the new guard.
+  - P1-4 composer-in-dialog: `classifyProviderBlockerEvidence` now marks a
+    composer textbox nested inside an error-role subtree as `hasComposer` but
+    never includes its value in strong surfaces (user text cannot become a
+    strong provider blocker).
+  - P2 pidAlive: only ESRCH proves death; all other errno are treated as
+    possibly-alive (fail closed toward "do not reclaim").
+  - Tests: 103/103 (release-token-unavailable, ownerless-token reclaim,
+    composer-in-dialog strong-surface exclusion, completion-guard marker,
+    plus all prior concurrency/crash/upgrade regressions).
+
+ - 2026-08-31
 
 - **Sol audit round 4 partial (37b6e670, response truncated by premature completion → fixes)**:
   - `releaseSolSubmitLease` now serializes with stale reclaim via the reclaim

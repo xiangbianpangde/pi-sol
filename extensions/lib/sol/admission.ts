@@ -27,6 +27,8 @@ import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.
 const SUBMIT_LOCK_NAME = "pi-sol-submit.lock";
 const RECLAIM_TOKEN_NAME = "pi-sol-submit.reclaim-token";
 const SUBMIT_LOCK_TTL_MS = 15 * 60 * 1000;
+/** Ownerless reclaim-token grace before it is considered stale (crash window). */
+const TOKEN_INIT_GRACE_MS = 5 * 1000;
 
 export type SolSubmitLease = {
 	path: string;
@@ -51,7 +53,8 @@ function lockPath(stateDir: string): string {
 	return join(stateDir, SUBMIT_LOCK_NAME);
 }
 
-/** PID liveness: true when the owner PID is still alive (or unverifiable). */
+/** PID liveness: only ESRCH proves dead; every other outcome is treated as
+ * possibly-alive (fail closed toward "do not reclaim"). */
 function pidAlive(pid: number): boolean {
 	if (!Number.isInteger(pid) || pid <= 0) return false;
 	try {
@@ -59,8 +62,9 @@ function pidAlive(pid: number): boolean {
 		return true;
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException)?.code;
-		// ESRCH = no such process (dead). EPERM = exists but owned by another user.
-		return code === "EPERM";
+		// ESRCH = no such process (provably dead). EPERM and any other errno
+		// (platform quirks, containers, permissions) are treated as alive.
+		return code !== "ESRCH";
 	}
 }
 
@@ -111,18 +115,33 @@ async function atomicRenameAway(path: string): Promise<{ moved: boolean; trash?:
  * The token records its owner (PID). If the owner died, the token itself is
  * stale and is reclaimed atomically (rename to a unique trash path), so a
  * crash while holding the token cannot wedge future reclaims forever.
+ * An ownerless token (created but owner.json never written before a crash) is
+ * reclaimed after a short grace period via the same atomic rename.
  * Returns a release function, or undefined when another live process holds it.
  */
 async function acquireReclaimToken(stateDir: string): Promise<(() => Promise<void>) | undefined> {
 	const tokenPath = join(stateDir, RECLAIM_TOKEN_NAME);
-	for (let attempt = 0; attempt < 3; attempt += 1) {
+	for (let attempt = 0; attempt < 4; attempt += 1) {
 		try {
 			await mkdir(tokenPath, { mode: 0o700 });
 		} catch {
-			// EEXIST: another process (maybe crashed) holds the token. Reclaim
-			// it only when the recorded owner is provably dead.
+			// EEXIST: another process (maybe crashed) holds the token.
 			const owner = await readOwner(tokenPath);
+			let reclaimable = false;
 			if (owner && !pidAlive(Number(owner.pid))) {
+				reclaimable = true; // recorded owner provably dead
+			} else if (!owner) {
+				// Ownerless token: created but owner.json never written (crash
+				// between mkdir and write). Reclaim after a short grace so we
+				// never race the writer that is still initializing it.
+				try {
+					const info = await stat(tokenPath);
+					reclaimable = Date.now() - info.mtimeMs > TOKEN_INIT_GRACE_MS;
+				} catch {
+					reclaimable = true;
+				}
+			}
+			if (reclaimable) {
 				const { moved, trash } = await atomicRenameAway(tokenPath);
 				if (moved) {
 					await rm(trash!, { recursive: true, force: true }).catch(() => undefined);
@@ -228,16 +247,20 @@ export async function acquireSolSubmitLease(stateDir = getSolStateDir(), jobsDir
 /** Release the lease: remove the fixed lock path only if it is still ours.
  * Must hold the reclaim token so that a concurrent stale reclaim cannot
  * replace the path between our read and rm. */
+/** Release the lease: remove the fixed lock path only if it is still ours.
+ * Must hold the reclaim token so that a concurrent stale reclaim cannot
+ * replace the path between our read and rm. If the token cannot be acquired
+ * (another process is mid-mutation), retry briefly; never fall back to a bare
+ * read→rm, because that would re-open the generation race. If the token is
+ * still unavailable after the retries, leave the lock in place (fail-safe:
+ * the stale-reclaim path or the operator hint handles it). */
 export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<void> {
 	const stateDir = dirname(lease.path);
-	try {
+	for (let attempt = 0; attempt < 20; attempt += 1) {
 		const releaseToken = await acquireReclaimToken(stateDir);
 		if (!releaseToken) {
-			// Another process is reclaiming; retry once after a brief wait.
 			await new Promise((r) => setTimeout(r, 50));
-			const owner = await readOwner(lease.path);
-			if (owner?.token === lease.token) await rm(lease.path, { recursive: true, force: true });
-			return;
+			continue;
 		}
 		try {
 			const owner = await readOwner(lease.path);
@@ -245,9 +268,9 @@ export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<void
 		} finally {
 			await releaseToken();
 		}
-	} catch {
-		// Path already gone or unreadable — nothing safe to do.
+		return;
 	}
+	// Fail-safe: no bare mutation of the fixed path ever.
 }
 
 /** Tighten an existing (not just newly created) state dir to 0700. */

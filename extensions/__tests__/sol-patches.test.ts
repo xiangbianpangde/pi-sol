@@ -123,6 +123,15 @@ describe("ensureSolOraclePatches", () => {
 		assert.equal(existsSync(join(VENDOR, SOL_PATCH_FILE)), true);
 	});
 
+	it("carries a marker for the completion streaming guard so old workers redeploy (P1-3)", () => {
+		// The hard guard ("while the model is still streaming (Stop control
+		// visible)") must be part of the marker set: an eddf08b worker that has
+		// every older marker but lacks this one must fail missingMarkers() and
+		// get the new vendor worker copied back by ensureSolOraclePatches().
+		assert.ok(SOL_PATCH_MARKERS.runJob.some((m) => m.includes("still streaming")), "completion guard marker missing from SOL_PATCH_MARKERS.runJob");
+		assert.match(readFileSync(join(VENDOR, "run-job.mjs"), "utf8"), /while the model is still streaming \(Stop control visible\)/);
+	});
+
 	it("re-applies the patch to a newer pristine pi-oracle instead of overwriting it", () => {
 		const { root, worker } = fakeOracleRoot("0.8.0");
 		const vendor = fakeVendorDir();

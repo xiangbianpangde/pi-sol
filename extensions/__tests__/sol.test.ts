@@ -284,6 +284,47 @@ describe("jobs + prompt", () => {
 		}
 	});
 
+	it("release does NOT remove the lock when it cannot acquire the reclaim token (P1-1)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const lock = join(stateDir, "pi-sol-submit.lock");
+			await mkdir(lock, { recursive: true });
+			await writeFile(join(lock, "owner.json"), JSON.stringify({ token: "gen-a", pid: process.pid, createdAt: new Date().toISOString() }));
+			// Hold the reclaim token with a LIVE owner so release can never get it.
+			const token = join(stateDir, "pi-sol-submit.reclaim-token");
+			await mkdir(token, { recursive: true });
+			await writeFile(join(token, "owner.json"), JSON.stringify({ token: "tok", pid: process.pid, createdAt: new Date().toISOString() }));
+			// release must NOT bare-rm the fixed path while another process holds
+			// the token (that was the P1-1 generation race). It retries then gives up.
+			await releaseSolSubmitLease({ path: lock, token: "gen-a" });
+			const owner = JSON.parse(await (await import("node:fs/promises")).readFile(join(lock, "owner.json"), "utf8"));
+			assert.equal(owner.token, "gen-a"); // lock still intact
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reclaims an ownerless reclaim-token after the init grace (P1-2)", async () => {
+		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));
+		try {
+			const token = join(stateDir, "pi-sol-submit.reclaim-token");
+			await mkdir(token, { recursive: true });
+			// No owner.json: simulate crash between mkdir and owner write. Backdate
+			// mtime beyond the 5s init grace so it is treated as stale.
+			const old = new Date(Date.now() - 10 * 1000);
+			await utimes(token, old, old);
+			const acquired = await acquireSolSubmitLease(stateDir, jobsDir);
+			assert.equal(acquired.acquired, true);
+			if (acquired.acquired) await releaseSolSubmitLease(acquired.lease);
+		} finally {
+			await rm(stateDir, { recursive: true, force: true });
+			await rm(jobsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("blocks admission while another ChatGPT job is active and recovers after it ends", async () => {
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-jobs-"));

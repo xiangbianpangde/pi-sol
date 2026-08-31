@@ -400,4 +400,18 @@ describe("provider blocker evidence — audit round 3 boundaries", () => {
 		assert.equal(evidence.surfaces, "");
 		assert.equal(evidence.fallback, ""); // composer present → fallback disabled
 	});
+
+	it("does NOT include composer value inside error-role subtree in strong surfaces (P1-4)", () => {
+		const snapshot = `
+- dialog "shell" [ref=e1]
+  - textbox "Chat with ChatGPT" [ref=e2]: 请审核 rate limit 的处理
+- generic "请检查" [ref=e3]
+`;
+		const evidence = classifyProviderBlockerEvidence(snapshot, labels);
+		// The composer textbox inside the dialog must NOT leak its value into
+		// strong surfaces. The user's "rate limit" text must never become a
+		// strong provider blocker.
+		assert.ok(!/rate limit/i.test(evidence.surfaces), `composer value leaked into surfaces: ${evidence.surfaces}`);
+		assert.equal(evidence.hasComposer, true); // composer was still detected
+	});
 });

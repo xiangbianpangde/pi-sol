@@ -171,15 +171,16 @@ export function classifyProviderBlockerEvidence(snapshot, { composerLabel, isGro
     const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
     if (roleMatch) {
       // Collect this line plus all descendant lines (greater indentation).
-      // Composer detection still runs inside the subtree (a textbox nested in
-      // a dialog must count as the composer).
+      // A composer textbox nested inside the subtree is still user input:
+      // mark hasComposer but NEVER include its value in strong surfaces.
       surfaces.push(line);
       i += 1;
       while (i < lines.length) {
         const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
         if (childIndent > indent) {
-          markComposer(lines[i]);
-          surfaces.push(lines[i]);
+          const isComposer = lines[i].includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(lines[i]));
+          if (isComposer) hasComposer = true;
+          else surfaces.push(lines[i]);
           i += 1;
         } else break;
       }

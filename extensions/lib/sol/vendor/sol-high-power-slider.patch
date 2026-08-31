@@ -9,7 +9,7 @@
  // Bare Instant is the legacy top-level family radio; compact Instant rows are versioned (Instant 5s / Instant 5.5).
  const COMPACT_INTELLIGENCE_CONTROL_PATTERN = /^(?:Instant\s+[\d.]+s?|Medium(?:\s+5\s*[–-]\s*30s)?|High(?:\s+15\s*[–-]\s*60s)?|Extra High|Pro(?:\s+5\+\s*min|\s+Standard|\s+Extended)?)$/i;
  const COMPACT_INTELLIGENCE_OPENER_PATTERN = /^(?:Instant(?:\s+[\d.]+s?)?|Medium|High|Extra High|Pro(?: Standard| Extended)?)$/i;
-@@ -97,8 +99,118 @@
+@@ -97,8 +99,119 @@
  
  /**
   * @param {string | undefined} value
@@ -85,15 +85,16 @@
 +    const roleMatch = line.match(/^\s*[-+]?\s*(alert|status|dialog|banner|log)(?:\s|$|\[)/i);
 +    if (roleMatch) {
 +      // Collect this line plus all descendant lines (greater indentation).
-+      // Composer detection still runs inside the subtree (a textbox nested in
-+      // a dialog must count as the composer).
++      // A composer textbox nested inside the subtree is still user input:
++      // mark hasComposer but NEVER include its value in strong surfaces.
 +      surfaces.push(line);
 +      i += 1;
 +      while (i < lines.length) {
 +        const childIndent = (lines[i].match(/^\s*/)?.[0].length ?? 0);
 +        if (childIndent > indent) {
-+          markComposer(lines[i]);
-+          surfaces.push(lines[i]);
++          const isComposer = lines[i].includes(`textbox "${composerLabel}"`) || (isGrok && /contenteditable/.test(lines[i]));
++          if (isComposer) hasComposer = true;
++          else surfaces.push(lines[i]);
 +          i += 1;
 +        } else break;
 +      }
@@ -128,12 +129,10 @@
  export function stripChatGptResponseChrome(value) {
    return String(value || "")
      .split("\n")
-@@ -254,10 +366,53 @@
-   return entries.some(
-     (entry) => entry.kind === "button" && /click to remove/i.test(String(entry.label || "")) && parseComposerChipSelection(entry.label),
+@@ -256,8 +369,51 @@
    );
-+}
-+
+ }
+ 
 +function hasLegacyCompactIntelligenceMenu(entries) {
 +  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && LEGACY_COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +    || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && Boolean(parseCompactIntelligenceSelection(entry.label)));
@@ -174,8 +173,8 @@
 +    if (parsed) return parsed;
 +  }
 +  return undefined;
- }
- 
++}
++
  function hasCompactIntelligenceMenuContext(entries) {
 -  return entries.some((entry) => !entry.disabled && entry.kind === "menu" && COMPACT_INTELLIGENCE_MENU_PATTERN.test(normalizeText(entry.label)))
 +  if (isPowerSliderCompactMenu(entries)) return false;
@@ -183,7 +182,7 @@
      || entries.some((entry) => !entry.disabled && entry.kind === "menuitemradio" && checkedState(entry) === true && compactSelectionFromEntry(entry, entries));
  }
  
-@@ -351,6 +506,9 @@
+@@ -351,6 +507,9 @@
    if (hasRemovableComposerModelChip(entries)) return undefined;
    if (hasLegacyEffortCombobox(entries)) return undefined;
  
@@ -193,7 +192,7 @@
    for (const entry of entries) {
      if (entry.kind !== "menuitemradio" || checkedState(entry) !== true) continue;
      const compactSelection = compactSelectionFromEntry(entry, entries, { allowClosedButtons: false });
-@@ -361,7 +519,7 @@
+@@ -361,7 +520,7 @@
  
    for (const entry of entries) {
      if (entry.kind !== "button") continue;
@@ -202,7 +201,7 @@
      if (!compactSelection) continue;
      return compactSelection;
    }
-@@ -444,6 +602,17 @@
+@@ -444,6 +603,17 @@
    /** @type {SnapshotEntry[]} */
    const entries = parseSnapshotEntries(snapshot);
    const normalizedEffort = effortLabel.toLowerCase();
@@ -220,7 +219,7 @@
    const compactClosedButtonsAllowed = !hasRemovableComposerModelChip(entries) && !hasLegacyEffortCombobox(entries) && !hasCompactIntelligenceMenuContext(entries);
    return entries.some((entry) => {
      if (entry.disabled) return false;
-@@ -496,8 +665,8 @@
+@@ -496,8 +666,8 @@
    const visibleCompactControls = entries.filter(
      (entry) => !entry.disabled && entry.kind === "menuitemradio" && compactSelectionFromEntry(entry, entries),
    );
@@ -231,7 +230,7 @@
    );
    const hasIntelligenceHeading = entries.some((entry) => entry.kind === "heading" && normalizeText(entry.label) === "Intelligence" && !entry.disabled);
    const hasEffortCombobox = entries.some(
-@@ -510,6 +679,65 @@
+@@ -510,6 +680,65 @@
   * @param {string} snapshot
   * @returns {boolean}
   */

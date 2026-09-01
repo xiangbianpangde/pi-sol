@@ -1,5 +1,780 @@
---- a/extensions/oracle/worker/chatgpt-ui-helpers.mjs
-+++ b/extensions/oracle/worker/chatgpt-ui-helpers.mjs
+--- a/extensions/oracle/lib/tools.ts	2026-09-01 10:14:12
++++ b/extensions/oracle/lib/tools.ts	2026-09-01 08:52:39
+@@ -4,9 +4,10 @@
+ // Usage: Imported by the oracle extension entrypoint and sanity tests to register tools against the pi API.
+ // Invariants/Assumptions: The pi runtime validates TypeBox schemas before execute, while execute owns semantic normalization.
+ import { randomUUID } from "node:crypto";
++import { realpathSync, statSync, existsSync } from "node:fs";
+ import { rename, rm, stat } from "node:fs/promises";
+ import { tmpdir } from "node:os";
+-import { join } from "node:path";
++import { basename, dirname, join } from "node:path";
+ import { createArchive, type ArchiveCreationResult, type ArchiveSizeBreakdownRow } from "./archive.js";
+ import { runOracleAuthBootstrap } from "./auth.js";
+ import { StringEnum } from "@earendil-works/pi-ai";
+@@ -49,6 +50,7 @@
+   spawnWorker,
+   terminateWorkerPid,
+   updateJob,
++  writeJob,
+   type OracleJob,
+ } from "./jobs.js";
+ import { isOracleProjectTrusted } from "./trust.js";
+@@ -123,6 +125,14 @@
+ 
+ const ORACLE_CANCEL_PARAMS = Type.Object({
+   jobId: Type.String({ description: "Oracle job id." }),
++}, { additionalProperties: false });
++
++const ORACLE_RECOVER_PARAMS = Type.Object({
++  sourceJobId: Type.Optional(Type.String({
++    description: "UUID of a failed oracle job to recover. Omit for auto-selection (latest resumable job in current project).",
++    minLength: 1,
++    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
++  })),
+ }, { additionalProperties: false });
+ 
+ const MAX_QUEUED_JOBS_PER_ACTIVE_RUNTIME = 1;
+@@ -305,7 +315,7 @@
+   return resolveFollowUp(args.followUpJobId, args.cwd);
+ }
+ 
+-type OracleToolName = "oracle_auth" | "oracle_submit" | "oracle_read" | "oracle_cancel";
++type OracleToolName = "oracle_auth" | "oracle_submit" | "oracle_read" | "oracle_cancel" | "oracle_recover";
+ type OracleToolErrorSource = OracleToolName | "oracle_preflight";
+ type OracleQueueSnapshot = { queued: boolean; position?: number; depth?: number };
+ type OracleToolErrorDetails = {
+@@ -324,7 +334,7 @@
+   responseAvailable?: boolean;
+ };
+ 
+-const ORACLE_TOOL_NAMES = new Set<OracleToolName>(["oracle_auth", "oracle_submit", "oracle_read", "oracle_cancel"]);
++const ORACLE_TOOL_NAMES = new Set<OracleToolName>(["oracle_auth", "oracle_submit", "oracle_read", "oracle_cancel", "oracle_recover"]);
+ 
+ function asRecord(value: unknown): Record<string, unknown> | undefined {
+   return typeof value === "object" && value !== null && !Array.isArray(value)
+@@ -683,6 +693,14 @@
+   if (provider === "grok") return "Grok";
+   if (provider === "chatgpt") return "ChatGPT";
+   return "configured provider";
++}
++
++function formatOracleRecoverResponse(result: { id: string; status: string; sourceJobId: string; sourceJobStatus: string; conversationId?: string; chatUrl?: string }): string {
++  return `Oracle recovery job dispatched: ${result.id}
++Recovering from source job: ${result.sourceJobId} (${result.sourceJobStatus})
++Conversation: ${result.conversationId ?? "(unknown)"}
++Chat URL: ${result.chatUrl ?? "(unknown)"}
++Use /oracle-read ${result.id} to retrieve the recovered response.`;
+ }
+ 
+ function formatOraclePreflightResponse(details: OraclePreflightDetails): string {
+@@ -1135,6 +1153,159 @@
+   });
+ 
+   pi.registerTool({
++    name: "oracle_recover",
++    label: "Oracle Recover",
++    description: "Read-only recovery of an interrupted ChatGPT conversation. Opens the existing conversation without sending a new user turn and returns the complete last assistant message. Only works for failed jobs whose send was accepted by the provider.",
++    promptSnippet: "Recover the full answer of an interrupted ChatGPT job.",
++    promptGuidelines: [
++      "Use oracle_recover when a previous oracle_submit job failed after the send was accepted (browser crash, CDP disconnect, stale worker). The ChatGPT web conversation completed the answer server-side; oracle_recover opens the conversation and reads the existing assistant message without sending anything new.",
++      "Pass sourceJobId (UUID) to recover a specific job. Omit sourceJobId to auto-select the latest resumable failed job in the current project.",
++      "After oracle_recover returns a job id, call oracle_read to retrieve the recovered response.",
++    ],
++    parameters: ORACLE_RECOVER_PARAMS,
++    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
++      try {
++        const projectCwd = getProjectId(ctx.cwd);
++        const baseConfig = loadOracleConfig(projectCwd, { projectConfigTrustCwd: ctx.cwd, projectConfigTrusted: isOracleProjectTrusted(ctx) });
++        const originSessionFile = requirePersistedSessionFile(getSessionFile(ctx), "recover oracle jobs");
++        const projectId = getProjectId(projectCwd);
++        const sessionId = getSessionId(originSessionFile, projectId);
++        const config = resolveOracleConfigForProvider(baseConfig, "chatgpt");
++
++        // Step 1: Determine source job
++        let sourceJob: OracleJob | undefined;
++        if (params.sourceJobId) {
++          const rawId = params.sourceJobId.trim();
++          // Strict UUIDv4 grammar
++          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(rawId)) {
++            throw new Error(`Invalid sourceJobId: "${rawId}" is not a valid UUIDv4.`);
++          }
++          sourceJob = readJob(rawId);
++          if (!sourceJob) throw new Error(`Source job ${rawId} not found.`);
++        } else {
++          // Auto-select: latest resumable failed job in current project
++          const candidates = listOracleJobDirs()
++            .map((dir) => readJob(dir))
++            .filter((job): job is OracleJob => Boolean(job && job.projectId === projectId && job.status === "failed" && job.selection?.provider === "chatgpt" && job.conversationId && job.recoverySource?.anchor?.sendAcceptedAt))
++            .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
++          sourceJob = candidates[0];
++          if (!sourceJob) throw new Error("No resumable failed job found in the current project. Ensure a failed oracle job with a valid conversationId and sendAcceptedAt exists.");
++        }
++
++        // Step 2: Validate source job identity chain
++        // Canonical containment: only accept oracle-<uuid> under the jobs dir
++        const jobsRoot = realpathSync(ORACLE_JOBS_DIR);
++        const sourceDir = getJobDir(sourceJob.id);
++        const sourceReal = realpathSync(sourceDir);
++        if (dirname(sourceReal) !== jobsRoot || basename(sourceReal) !== "oracle-" + sourceJob.id) {
++          throw new Error(`Source job ${sourceJob.id} has unexpected path containment.`);
++        }
++        // UID check
++        const sourceStat = statSync(sourceReal);
++        if (sourceStat.uid !== process.getuid()) {
++          throw new Error(`Source job ${sourceJob.id} is owned by another user (UID ${sourceStat.uid}).`);
++        }
++        // Project binding
++        if (sourceJob.projectId !== projectId) {
++          throw new Error(`Source job ${sourceJob.id} belongs to project ${sourceJob.projectId}, not current project ${projectId}.`);
++        }
++        // Provider
++        if (sourceJob.selection?.provider !== "chatgpt") {
++          throw new Error(`Source job ${sourceJob.id} provider is "${sourceJob.selection?.provider}", expected "chatgpt".`);
++        }
++        // Conversation identity
++        if (!sourceJob.conversationId) {
++          throw new Error(`Source job ${sourceJob.id} has no conversationId — cannot recover.`);
++        }
++        // Must have recovery anchor
++        if (!sourceJob.recoverySource?.anchor) {
++          throw new Error(`Source job ${sourceJob.id} has no recovery anchor. This job was created before recovery support was added or did not complete the send phase.`);
++        }
++
++        // Step 3: Create recovery child job with immutable snapshot
++        const childJobId = randomUUID();
++        const runtime = allocateRuntime(config);
++        const childAnchor = { ...sourceJob.recoverySource.anchor };
++        const childJob = await createJob(
++          childJobId,
++          {
++            prompt: "(recovery)",
++            files: ["./recovery-placeholder"],
++            selection: { provider: "chatgpt", preset: "thinking_extended" },
++            chatUrl: sourceJob.chatUrl,
++            requestSource: "tool",
++          },
++          projectCwd,
++          originSessionFile,
++          config,
++          runtime,
++          { initialState: "submitted" },
++        );
++        // Override the created job with recovery-specific fields
++        const recoveryJob = {
++          ...childJob,
++          jobKind: "recovery" as const,
++          recoveryOfJobId: sourceJob.id,
++          recoverySource: {
++            jobId: sourceJob.id,
++            sourceCreatedAt: sourceJob.createdAt,
++            conversationId: sourceJob.conversationId,
++            chatUrl: sourceJob.chatUrl || "",
++            anchor: childAnchor,
++          },
++        };
++        await writeJob(recoveryJob);
++
++        // Step 4: Admission (runtime lease + conversation lease)
++        await withLock("admission", "global", { jobId: childJobId, processPid: process.pid }, async () => {
++          await promoteQueuedJobsWithinAdmissionLock({ workerPath, source: "oracle_recover" });
++          const admittedAt = new Date().toISOString();
++          const runtimeAttempt = await tryAcquireRuntimeLease(config, {
++            jobId: childJobId,
++            runtimeId: runtime.runtimeId,
++            runtimeSessionName: runtime.runtimeSessionName,
++            runtimeProfileDir: runtime.runtimeProfileDir,
++            projectId,
++            sessionId,
++            createdAt: admittedAt,
++          });
++          if (!runtimeAttempt.acquired) {
++            throw new Error("Oracle runtime capacity reached. Cannot spawn a recovery worker. Try again later.");
++          }
++          const conversationAttempt = await tryAcquireConversationLease({
++            jobId: childJobId,
++            conversationId: sourceJob.conversationId,
++            projectId,
++            sessionId,
++            createdAt: admittedAt,
++          });
++          if (!conversationAttempt.acquired) {
++            throw new Error(
++              `Conversation ${sourceJob.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
++                "Concurrent recovery and submission targeting the same ChatGPT thread are not allowed.",
++            );
++          }
++        });
++
++        // Step 5: Spawn worker
++        const spawnedWorker = await spawnWorker(workerPath, childJobId);
++        const result = {
++          id: childJobId,
++          status: "submitted" as const,
++          sourceJobId: sourceJob.id,
++          sourceJobStatus: sourceJob.status,
++          conversationId: sourceJob.conversationId,
++          chatUrl: sourceJob.chatUrl,
++          orphanWorker: spawnedWorker,
++        };
++        return { content: [{ type: "text" as const, text: formatOracleRecoverResponse(result) }], details: result };
++      } catch (error) {
++        return buildOracleToolErrorResult("oracle_recover", error, {});
++      }
++    },
++  });
++
++  pi.registerTool({
+     name: "oracle_read",
+     label: "Oracle Read",
+     description: "Read the status and outputs of a previously dispatched oracle job.",
+--- a/extensions/oracle/lib/jobs.ts	2026-09-01 10:14:12
++++ b/extensions/oracle/lib/jobs.ts	2026-09-01 08:49:22
+@@ -148,6 +148,23 @@
+   selection: OracleResolvedSelection;
+   extensionProvenance?: OracleExtensionProvenance;
+   followUpToJobId?: string;
++  jobKind?: "submission" | "recovery";
++  recoveryOfJobId?: string;
++  recoverySource?: {
++    jobId: string;
++    sourceCreatedAt: string;
++    conversationId: string;
++    chatUrl: string;
++    anchor: {
++      baselineAssistantCount: number;
++      baselineLastAssistantHash?: string;
++      submittedPromptHash?: string;
++      armedAt?: string;
++      sendAcceptedAt?: string;
++      conversationId?: string;
++      chatUrl?: string;
++    };
++  };
+   chatUrl?: string;
+   conversationId?: string;
+   responsePath?: string;
+@@ -983,6 +1000,7 @@
+     selection: input.selection,
+     extensionProvenance: readExtensionProvenance(cwd),
+     followUpToJobId: input.followUpToJobId,
++  jobKind: undefined,
+     chatUrl: input.chatUrl,
+     conversationId,
+     responseFormat: "text/plain",
+--- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 10:59:56
+@@ -34,11 +34,19 @@
+   snapshotHasClosedCompactSelection,
+   snapshotHasModelConfigurationUi,
+   snapshotHasModelOpener,
++  snapshotHasPowerSliderCompactMenu,
++  describeCompactComposerSelection,
++  snapshotHasChatGptStopControl,
++  snapshotHasChatGptSendReady,
++  snapshotHasChatGptComposerIdle,
++  countChatGptCopyControls,
+   snapshotHasUsableComposerControls,
+   snapshotStronglyMatchesRequestedModel,
+   snapshotWeaklyMatchesRequestedModel,
+   autoSwitchToThinkingSelectionVisible,
+   stripChatGptResponseChrome,
++  sanitizeProviderBlockerSnapshot as sanitizeProviderBlockerSnapshotHelper,
++  classifyProviderBlockerEvidence,
+ } from "./chatgpt-ui-helpers.mjs";
+ import { assistantSnapshotSlice, conversationIdFromUrl, nextStableValueState, providerSendAccepted, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
+ import { normalizeLoginProbeResult } from "./auth-flow-helpers.mjs";
+@@ -84,7 +92,7 @@
+ const MODEL_CONFIGURATION_SETTLE_TIMEOUT_MS = 20_000;
+ const MODEL_CONFIGURATION_SETTLE_POLL_MS = 250;
+ const MODEL_CONFIGURATION_CLOSE_RETRY_MS = 1_000;
+-const POST_SEND_SETTLE_MS = 15_000;
++const POST_SEND_SETTLE_MS = 2_000;
+ const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
+   (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
+ ) || "agent-browser";
+@@ -102,6 +110,10 @@
+ let shuttingDown = false;
+ let lastHeartbeatMs = 0;
+ 
++function hashText(text) {
++  return createHash("sha256").update(text, "utf8").digest("hex");
++}
++
+ function providerForJob(job) {
+   return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
+ }
+@@ -706,7 +718,11 @@
+ 
+ async function ensureBrowserConnected(job) {
+   if (!browserStarted || cleaningUpBrowser) return;
+-  const status = await streamStatus(job);
++  let status = await streamStatus(job);
++  if (status.connected === false) {
++    await sleep(1000);
++    status = await streamStatus(job);
++  }
+   if (status.connected === false) {
+     throw new Error("The isolated oracle browser disconnected during the job.");
+   }
+@@ -1065,7 +1081,9 @@
+     return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
+   }
+ 
+-  const outageText = detectProviderTransientErrorText(text);
++  // Provider-owned error surface only; user content (sidebar/composer/history)
++  // never participates in outage classification.
++  const outageText = detectProviderTransientErrorText(sanitizeProviderBlockerSnapshot(snapshot, job));
+   if (outageText) {
+     return { state: "transient_outage_error", message: `ChatGPT is showing a transient outage/rate-limit page: ${outageText}` };
+   }
+@@ -1244,8 +1262,32 @@
+   return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
+ }
+ 
+-function providerTransientErrorMessage(job, text, context) {
+-  const errorText = detectProviderVisibleBlockerText(text);
++function sanitizeProviderBlockerSnapshot(snapshot, job = currentJob) {
++  const labels = labelsForJob(job);
++  return sanitizeProviderBlockerSnapshotHelper(snapshot, {
++    composerLabel: labels.composer,
++    isGrok: isGrokJob(job),
++  });
++}
++
++function providerBlockerEvidence(job, snapshot) {
++  const labels = labelsForJob(job);
++  const { surfaces, fallback } = classifyProviderBlockerEvidence(snapshot, {
++    composerLabel: labels.composer,
++    isGrok: isGrokJob(job),
++  });
++  return {
++    // STRONG: provider error-role subtree explicitly reports a blocker.
++    strong: detectProviderVisibleBlockerText(surfaces),
++    // WEAK: no composer + no conversation chrome; needs consecutive frames.
++    weak: detectProviderVisibleBlockerText(fallback),
++  };
++}
++
++function providerTransientErrorMessage(job, snapshot, context) {
++  // Rate-limit/outage detection only ever consults provider-owned error
++  // surfaces, never user-authored conversation/composer/sidebar text.
++  const errorText = detectProviderVisibleBlockerText(sanitizeProviderBlockerSnapshot(snapshot, job));
+   if (!errorText) return "";
+   return formatProviderTransientErrorMessage(job, errorText, context);
+ }
+@@ -1372,8 +1414,18 @@
+     url: urlResult.url,
+     urlKnown: urlResult.ok,
+     assistantCount: Math.max(baselineAssistantCount, messages.length),
+-    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming"),
+-    transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
++    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
++    transientErrorText: (() => {
++      const ev = providerBlockerEvidence(job, snapshot);
++      // Strong evidence (error-role subtree) is immediate; weak evidence
++      // (composer-absent fallback) is returned separately for multi-frame confirmation.
++      if (ev.strong) return ev.strong;
++      return "";
++    })(),
++    weakBlockerText: (() => {
++      const ev = providerBlockerEvidence(job, snapshot);
++      return ev.strong ? "" : ev.weak;
++    })(),
+   };
+ }
+ 
+@@ -1390,11 +1442,18 @@
+ }
+ 
+ async function waitForSendAccepted(job, beforeSend, options = {}) {
++  let weakBlockerFrames = 0;
+   const timeoutAt = Date.now() + (options.timeoutMs || 15_000);
+   while (Date.now() < timeoutAt) {
+     await heartbeat();
+     const afterSend = await sendAcceptanceState(job, beforeSend.assistantCount || 0);
+     if (afterSend.transientErrorText) throw new Error(formatProviderTransientErrorMessage(job, afterSend.transientErrorText, "waiting for send acceptance"));
++    if (afterSend.weakBlockerText) {
++      weakBlockerFrames += 1;
++      if (weakBlockerFrames >= 3) {
++        throw new Error(formatProviderTransientErrorMessage(job, afterSend.weakBlockerText, "waiting for send acceptance (weak, 3 consecutive frames)"));
++      }
++    } else weakBlockerFrames = 0;
+     if (providerSendAccepted(beforeSend, afterSend)) return true;
+     await sleep(500);
+   }
+@@ -1428,6 +1487,37 @@
+   return Boolean(dismissed);
+ }
+ 
++async function trySelectPowerSliderHigh(job) {
++  let snapshot = await snapshotText(job);
++  if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
++
++  const advanced = findEntry(
++    snapshot,
++    (candidate) => candidate.kind === "menuitem" && /show advanced options/i.test(String(candidate.label || "")) && !candidate.disabled,
++  );
++  if (advanced) {
++    await clickRef(job, advanced.ref);
++    await agentBrowser(job, "wait", "800");
++    snapshot = await snapshotText(job);
++    if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
++    const high = findEntry(
++      snapshot,
++      (candidate) => ["menuitem", "menuitemradio", "button", "radio"].includes(candidate.kind || "")
++        && /^(?:High(?:\s+15\s*[–-]\s*60s)?)$/i.test(String(candidate.label || "").replace(/\s+/g, " ").trim())
++        && !candidate.disabled,
++    );
++    if (high) {
++      await clickRef(job, high.ref);
++      await agentBrowser(job, "wait", "800");
++      snapshot = await snapshotText(job);
++      if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
++    }
++  }
++
++  const visible = describeCompactComposerSelection(snapshot) || "unknown";
++  throw new Error(`ChatGPT Power slider is ${visible}, not GPT-5.6 Sol High. /sol requires thinking_extended. Open Advanced → High and retry.`);
++}
++
+ async function openModelConfiguration(job) {
+   const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
+   let lastSnapshot = "";
+@@ -1451,6 +1541,9 @@
+       throwIfProviderTransientError(job, after, "opening model configuration");
+       if (snapshotHasModelConfigurationUi(after)) return after;
+       if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
++      if (snapshotHasPowerSliderCompactMenu(after) || /menuitem "Show advanced options"/i.test(after)) {
++        return trySelectPowerSliderHigh(job);
++      }
+ 
+       const configureEntry = findEntry(
+         after,
+@@ -1465,6 +1558,9 @@
+         throwIfProviderTransientError(job, postConfigure, "opening model configuration");
+         if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
+         if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
++        if (snapshotHasPowerSliderCompactMenu(postConfigure) || /menuitem "Show advanced options"/i.test(postConfigure)) {
++          return trySelectPowerSliderHigh(job);
++        }
+       }
+     }
+ 
+@@ -1526,14 +1622,49 @@
+   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
+ }
+ 
++async function waitForChatGptModelPicker(job, timeoutMs = 20_000) {
++  const deadline = Date.now() + timeoutMs;
++  let lastSnapshot = "";
++  while (Date.now() < deadline) {
++    lastSnapshot = await snapshotText(job);
++    if (snapshotCanSafelySkipModelConfiguration(lastSnapshot, job.selection)) return lastSnapshot;
++    if (snapshotHasModelOpener(lastSnapshot) || snapshotHasModelConfigurationUi(lastSnapshot)) return lastSnapshot;
++    if (snapshotHasUsableComposerControls(lastSnapshot)) {
++      await agentBrowser(job, "wait", "1000");
++      continue;
++    }
++    await agentBrowser(job, "wait", "500");
++  }
++  return lastSnapshot;
++}
++
+ async function configureModel(job) {
+   if (isGrokJob(job)) return configureGrokModel(job);
+-  const initialSnapshot = await snapshotText(job);
++  let assumedDefaultThinkingFallback = false;
++  let initialSnapshot = await snapshotText(job);
++  if (
++    snapshotHasUsableComposerControls(initialSnapshot)
++    && !snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)
++    && !snapshotHasModelOpener(initialSnapshot)
++    && !snapshotHasModelConfigurationUi(initialSnapshot)
++  ) {
++    await log("Composer is ready but the model picker has not hydrated yet; waiting before configuration");
++    initialSnapshot = await waitForChatGptModelPicker(job);
++  }
+   if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
+     await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
+     return;
+   }
+ 
++  if (snapshotHasPowerSliderCompactMenu(initialSnapshot) || /menuitem "Show advanced options"/i.test(initialSnapshot) || /menuitem "Power"/i.test(initialSnapshot)) {
++    await log(`Power-slider compact UI visible; selecting High instead of the legacy Instant/Thinking/Pro sheet`);
++    initialSnapshot = await trySelectPowerSliderHigh(job);
++    if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
++      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
++      return;
++    }
++  }
++
+   await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
+   let familySnapshot = await openModelConfiguration(job);
+   let verificationSnapshot = familySnapshot;
+@@ -1553,7 +1684,21 @@
+   } else if (familyAlreadySelectedInUi) {
+     await log("Model family already appears selected; verifying effort-specific settings");
+   } else if (!familyEntry) {
+-    throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
++    // ChatGPT 新 UI：首页 headless 初始快照往往没有渲染出模型选择控件（如 High 按钮），
++    // 而默认档位就是 GPT-5.6 Sol High (= thinking family, extended)。找不到控件时按默认档位继续，
++    // 不再报错；只在非默认 family (pro/instant) 下才严格报错。
++    if (job.selection.modelFamily === "thinking") {
++      const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
++      if (visible && visible !== "high") {
++        throw new Error(`Could not find model family control for thinking; visible compact selection is ${visible}, not High`);
++      }
++      await log(`Model family control not found for thinking; assuming default ChatGPT High selection (family=thinking effort=extended) and continuing`);
++      familySnapshot = initialSnapshot;
++      verificationSnapshot = initialSnapshot;
++      assumedDefaultThinkingFallback = true;
++    } else {
++      throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
++    }
+   }
+ 
+   let compactSelectionVerifiedAfterClick = false;
+@@ -1577,7 +1722,7 @@
+     }
+   }
+ 
+-  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick) {
++  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick && !assumedDefaultThinkingFallback) {
+     const effortLabel = requestedEffortLabel(job.selection);
+     if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
+       const opened = await openEffortDropdown(job);
+@@ -1626,7 +1771,7 @@
+     }
+   }
+ 
+-  const stronglyVerified = compactSelectionVerifiedAfterClick || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
++  const stronglyVerified = compactSelectionVerifiedAfterClick || assumedDefaultThinkingFallback || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
+   if (!stronglyVerified) {
+     throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
+   }
+@@ -1812,24 +1957,49 @@
+   return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
+ }
+ 
+-async function waitForChatCompletion(job, baselineAssistantCount) {
++async function waitForChatCompletion(job, baselineAssistantCount, options = {}) {
++  let weakBlockerFrames = 0;
+   const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
++  const baselineCopyCount = Number(options.baselineCopyCount || 0);
++  const baselineLastText = String(options.baselineLastText || "");
+   let lastCompletionSignature = "";
+   let stableCount = 0;
+   let retriedAfterFailure = false;
++  let lastStatusLogAt = 0;
+ 
+   while (Date.now() < timeoutAt) {
+     await heartbeat();
+     const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
+-    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming");
++    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot);
++    const sendReady = isGrokJob(job) ? false : snapshotHasChatGptSendReady(snapshot);
++    const composerIdle = isGrokJob(job) ? false : snapshotHasChatGptComposerIdle(snapshot);
+     const hasRetryButton = snapshot.includes('button "Retry"');
+-    const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
+-    throwIfProviderTransientError(job, snapshot, "waiting for response completion");
++    const copyResponseCount = isGrokJob(job)
++      ? (snapshot.match(/button "Copy"/g) || []).length
++      : countChatGptCopyControls(snapshot);
++    {
++      const ev = providerBlockerEvidence(job, snapshot);
++      if (ev.strong) {
++        throw new Error(formatProviderTransientErrorMessage(job, ev.strong, "waiting for response completion"));
++      }
++      if (ev.weak) {
++        weakBlockerFrames += 1;
++        if (weakBlockerFrames >= 3) {
++          throw new Error(formatProviderTransientErrorMessage(job, ev.weak, "waiting for response completion (weak, 3 consecutive frames)"));
++        }
++      } else weakBlockerFrames = 0;
++    }
+     const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
+     const messages = await assistantMessages(job);
+-    const targetMessage = messages[baselineAssistantCount];
++    const lastText = messages.at(-1)?.text || "";
++    const progressed = messages.length > baselineAssistantCount || (Boolean(lastText) && lastText !== baselineLastText);
++    const targetMessage = messages[baselineAssistantCount] || (progressed ? messages.at(-1) : undefined);
+     const targetText = targetMessage?.text || "";
+-    const hasTargetCopyResponse = copyResponseCount > baselineAssistantCount;
++    const hasTargetCopyResponse = copyResponseCount > baselineCopyCount || (!hasStopStreaming && composerIdle && progressed && Boolean(targetText));
++    if (Date.now() - lastStatusLogAt >= 15_000) {
++      lastStatusLogAt = Date.now();
++      await log(`Completion poll: stop=${hasStopStreaming} idle=${composerIdle} sendReady=${sendReady} copy=${copyResponseCount}/${baselineCopyCount} msgs=${messages.length}/${baselineAssistantCount} text=${targetText.length} progressed=${progressed}`);
++    }
+ 
+     if (!hasStopStreaming && hasRetryButton && responseFailureText) {
+       if (!retriedAfterFailure) {
+@@ -1851,6 +2021,15 @@
+     }
+ 
+     let completionSignature;
++    // Hard guard: while the model is still streaming (Stop control visible),
++    // never emit a completion signature — the copy-count heuristic alone can
++    // fire mid-generation and truncate a long response.
++    if (hasStopStreaming) {
++      lastCompletionSignature = "";
++      stableCount = 0;
++      await sleep(job.config.worker.pollMs);
++      continue;
++    }
+     if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
+       completionSignature = deriveAssistantCompletionSignature({
+         hasStopStreaming,
+@@ -1886,6 +2065,63 @@
+   throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
+ }
+ 
++async function waitForRecoveredAssistant(job, baselineAssistantCount) {
++  // Pure observation loop: open the existing conversation URL and read the
++  // assistant reply that completed server-side. No Retry, no model config,
++  // no send. Simplified from waitForChatCompletion.
++  const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
++  let lastSignature = "";
++  let stableCount = 0;
++  let lastStatusLogAt = 0;
++
++  while (Date.now() < timeoutAt) {
++    await heartbeat();
++    const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
++    const hasStopStreaming = snapshotHasChatGptStopControl(snapshot);
++    const sendReady = snapshotHasChatGptSendReady(snapshot);
++    const composerIdle = snapshotHasChatGptComposerIdle(snapshot);
++    const copyResponseCount = countChatGptCopyControls(snapshot);
++    const messages = await assistantMessages(job);
++    const targetMessage = messages[baselineAssistantCount] || undefined;
++    const targetText = targetMessage?.text || "";
++    const progressed = messages.length > baselineAssistantCount;
++    if (Date.now() - lastStatusLogAt >= 15_000) {
++      lastStatusLogAt = Date.now();
++      await log(`Recovery poll: stop=${hasStopStreaming} idle=${composerIdle} sendReady=${sendReady} copy=${copyResponseCount} msgs=${messages.length}/${baselineAssistantCount} text=${targetText.length}`);
++    }
++
++    // Never emit completion while the model is still streaming.
++    if (hasStopStreaming) {
++      lastSignature = "";
++      stableCount = 0;
++      await sleep(job.config.worker.pollMs);
++      continue;
++    }
++    const hasTargetCopyResponse = copyResponseCount > 0 && (composerIdle || progressed);
++    let completionSignature;
++    if (targetText && (hasTargetCopyResponse || isGrokJob(job))) {
++      completionSignature = deriveAssistantCompletionSignature({
++        hasStopStreaming,
++        hasTargetCopyResponse: hasTargetCopyResponse || isGrokJob(job),
++        responseText: targetText,
++      });
++    }
++    if (completionSignature) {
++      if (completionSignature === lastSignature) stableCount += 1;
++      else stableCount = 1;
++      lastSignature = completionSignature;
++      if (stableCount >= 2) {
++        return { responseIndex: baselineAssistantCount, responseText: targetText };
++      }
++    } else {
++      lastSignature = "";
++      stableCount = 0;
++    }
++    await sleep(job.config.worker.pollMs);
++  }
++  throw new Error(`Timed out waiting for the recovered assistant response (baseline assistant count: ${baselineAssistantCount})`);
++}
++
+ async function sha256(path) {
+   const buffer = await readFile(path);
+   return createHash("sha256").update(buffer).digest("hex");
+@@ -2355,6 +2591,39 @@
+       patch: { heartbeatAt: new Date().toISOString() },
+     }));
+     await waitForOracleReady(currentJob);
++
++    // Read-only recovery branch: open the existing conversation, read the
++    // completed assistant reply, and finish. No configureModel, no upload,
++    // no send, no Retry.
++    if (currentJob.jobKind === "recovery") {
++      const anchor = currentJob.recoverySource?.anchor;
++      if (!anchor) throw new Error("Recovery job is missing its recoverySource anchor snapshot");
++      await log(`Recovery job ${currentJob.id}: opening conversation ${currentJob.conversationId || "(unknown)"} for read-only observation`);
++      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
++        at: new Date().toISOString(),
++        source: "oracle:worker",
++        message: "Opening the existing conversation to recover the completed assistant response.",
++        patch: { heartbeatAt: new Date().toISOString() },
++      }));
++      const completion = await waitForRecoveredAssistant(currentJob, Number(anchor.baselineAssistantCount || 0));
++      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "extracting_response", {
++        at: new Date().toISOString(),
++        source: "oracle:worker",
++        message: "Extracting the recovered response body.",
++        patch: { heartbeatAt: new Date().toISOString() },
++      }));
++      const responseText = stripChatGptResponseChrome(completion.responseText);
++      await secureWriteText(currentJob.responsePath, `${responseText}
++`);
++      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "complete", {
++        at: new Date().toISOString(),
++        source: "oracle:worker",
++        message: "Recovered the completed ChatGPT response.",
++        patch: { responsePath: currentJob.responsePath, responseFormat: "text/plain", cleanupPending: true },
++      }));
++      await log(`Recovery job ${currentJob.id} complete`);
++      return;
++    }
+     currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
+       at: new Date().toISOString(),
+       source: "oracle:worker",
+@@ -2369,11 +2638,31 @@
+       patch: { heartbeatAt: new Date().toISOString() },
+     }));
+     await uploadArchive(currentJob);
+-    await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
+-    const baselineAssistantCount = (await assistantMessages(currentJob)).length;
++    const promptText = await readFile(currentJob.promptPath, "utf8");
++    await setComposerText(currentJob, promptText);
++    const baselineMessages = await assistantMessages(currentJob);
++    const baselineAssistantCount = baselineMessages.length;
++    const baselineLastText = baselineMessages.at(-1)?.text || "";
++    const baselineCopyCount = countChatGptCopyControls(await snapshotText(currentJob));
+     await log(`Assistant response count before send: ${baselineAssistantCount}`);
+     await clickSend(currentJob, baselineAssistantCount);
+-    await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
++    await log(`Send accepted; recording recovery anchor`);
++    await mutateJob((job) => ({
++      ...job,
++      recoverySource: {
++        ...(job.recoverySource || {}),
++        anchor: {
++          baselineAssistantCount,
++          baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
++          submittedPromptHash: hashText(promptText),
++          conversationId: job.conversationId,
++          chatUrl: job.chatUrl,
++          armedAt: new Date().toISOString(),
++          sendAcceptedAt: new Date().toISOString(),
++        },
++      },
++    }));
++    await log(`Recovery anchor recorded (baseline assistant count: ${baselineAssistantCount})`);
+     await sleep(POST_SEND_SETTLE_MS);
+ 
+     const observedChatUrl = isGrokJob(currentJob)
+@@ -2391,7 +2680,7 @@
+       patch: awaitingResponsePatch,
+     }));
+ 
+-    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount);
++    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount, { baselineCopyCount, baselineLastText });
+     if (isGrokJob(currentJob) && !currentJob.conversationId) {
+       const stableGrokChatUrl = await waitForStableChatUrl(currentJob, undefined);
+       const stableGrokConversationId = conversationIdFromUrl(stableGrokChatUrl);
+--- a/extensions/oracle/worker/chatgpt-ui-helpers.mjs	2026-09-01 10:14:12
++++ b/extensions/oracle/worker/chatgpt-ui-helpers.mjs	2026-08-31 14:25:45
 @@ -30,6 +30,8 @@
  const PRO_THINKING_EFFORT_COMBOBOX_LABEL = "Pro thinking effort";
  const EFFORT_LABELS = new Set(["Light", "Standard", "Extended", "Heavy"]);
@@ -361,8 +1136,8 @@
  export function snapshotHasUsableComposerControls(snapshot) {
    /** @type {SnapshotEntry[]} */
    const entries = parseSnapshotEntries(snapshot);
---- a/extensions/oracle/worker/chatgpt-ui-helpers.d.mts
-+++ b/extensions/oracle/worker/chatgpt-ui-helpers.d.mts
+--- a/extensions/oracle/worker/chatgpt-ui-helpers.d.mts	2026-09-01 10:14:12
++++ b/extensions/oracle/worker/chatgpt-ui-helpers.d.mts	2026-08-31 12:51:22
 @@ -21,6 +21,12 @@
  export declare function snapshotHasClosedCompactSelection(snapshot: string, selection: OracleUiSelection): boolean;
  export declare function snapshotHasModelConfigurationUi(snapshot: string): boolean;
@@ -376,377 +1151,3 @@
  export declare function snapshotHasModelOpener(snapshot: string): boolean;
  export declare function autoSwitchToThinkingSelectionVisible(snapshot: string): boolean | undefined;
  export declare function snapshotCanSafelySkipModelConfiguration(snapshot: string, selection: OracleUiSelection): boolean;
---- a/extensions/oracle/worker/run-job.mjs
-+++ b/extensions/oracle/worker/run-job.mjs
-@@ -34,11 +34,19 @@
-   snapshotHasClosedCompactSelection,
-   snapshotHasModelConfigurationUi,
-   snapshotHasModelOpener,
-+  snapshotHasPowerSliderCompactMenu,
-+  describeCompactComposerSelection,
-+  snapshotHasChatGptStopControl,
-+  snapshotHasChatGptSendReady,
-+  snapshotHasChatGptComposerIdle,
-+  countChatGptCopyControls,
-   snapshotHasUsableComposerControls,
-   snapshotStronglyMatchesRequestedModel,
-   snapshotWeaklyMatchesRequestedModel,
-   autoSwitchToThinkingSelectionVisible,
-   stripChatGptResponseChrome,
-+  sanitizeProviderBlockerSnapshot as sanitizeProviderBlockerSnapshotHelper,
-+  classifyProviderBlockerEvidence,
- } from "./chatgpt-ui-helpers.mjs";
- import { assistantSnapshotSlice, conversationIdFromUrl, nextStableValueState, providerSendAccepted, resolveStableConversationUrlCandidate, stripUrlQueryAndHash } from "./chatgpt-flow-helpers.mjs";
- import { normalizeLoginProbeResult } from "./auth-flow-helpers.mjs";
-@@ -84,7 +92,7 @@
- const MODEL_CONFIGURATION_SETTLE_TIMEOUT_MS = 20_000;
- const MODEL_CONFIGURATION_SETTLE_POLL_MS = 250;
- const MODEL_CONFIGURATION_CLOSE_RETRY_MS = 1_000;
--const POST_SEND_SETTLE_MS = 15_000;
-+const POST_SEND_SETTLE_MS = 2_000;
- const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
-   (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
- ) || "agent-browser";
-@@ -706,8 +714,12 @@
- 
- async function ensureBrowserConnected(job) {
-   if (!browserStarted || cleaningUpBrowser) return;
--  const status = await streamStatus(job);
-+  let status = await streamStatus(job);
-   if (status.connected === false) {
-+    await sleep(1000);
-+    status = await streamStatus(job);
-+  }
-+  if (status.connected === false) {
-     throw new Error("The isolated oracle browser disconnected during the job.");
-   }
- }
-@@ -1065,7 +1077,9 @@
-     return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
-   }
- 
--  const outageText = detectProviderTransientErrorText(text);
-+  // Provider-owned error surface only; user content (sidebar/composer/history)
-+  // never participates in outage classification.
-+  const outageText = detectProviderTransientErrorText(sanitizeProviderBlockerSnapshot(snapshot, job));
-   if (outageText) {
-     return { state: "transient_outage_error", message: `ChatGPT is showing a transient outage/rate-limit page: ${outageText}` };
-   }
-@@ -1244,8 +1258,32 @@
-   return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
- }
- 
--function providerTransientErrorMessage(job, text, context) {
--  const errorText = detectProviderVisibleBlockerText(text);
-+function sanitizeProviderBlockerSnapshot(snapshot, job = currentJob) {
-+  const labels = labelsForJob(job);
-+  return sanitizeProviderBlockerSnapshotHelper(snapshot, {
-+    composerLabel: labels.composer,
-+    isGrok: isGrokJob(job),
-+  });
-+}
-+
-+function providerBlockerEvidence(job, snapshot) {
-+  const labels = labelsForJob(job);
-+  const { surfaces, fallback } = classifyProviderBlockerEvidence(snapshot, {
-+    composerLabel: labels.composer,
-+    isGrok: isGrokJob(job),
-+  });
-+  return {
-+    // STRONG: provider error-role subtree explicitly reports a blocker.
-+    strong: detectProviderVisibleBlockerText(surfaces),
-+    // WEAK: no composer + no conversation chrome; needs consecutive frames.
-+    weak: detectProviderVisibleBlockerText(fallback),
-+  };
-+}
-+
-+function providerTransientErrorMessage(job, snapshot, context) {
-+  // Rate-limit/outage detection only ever consults provider-owned error
-+  // surfaces, never user-authored conversation/composer/sidebar text.
-+  const errorText = detectProviderVisibleBlockerText(sanitizeProviderBlockerSnapshot(snapshot, job));
-   if (!errorText) return "";
-   return formatProviderTransientErrorMessage(job, errorText, context);
- }
-@@ -1372,8 +1410,18 @@
-     url: urlResult.url,
-     urlKnown: urlResult.ok,
-     assistantCount: Math.max(baselineAssistantCount, messages.length),
--    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming"),
--    transientErrorText: detectProviderVisibleBlockerText(snapshot) || "",
-+    stopStreaming: isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot),
-+    transientErrorText: (() => {
-+      const ev = providerBlockerEvidence(job, snapshot);
-+      // Strong evidence (error-role subtree) is immediate; weak evidence
-+      // (composer-absent fallback) is returned separately for multi-frame confirmation.
-+      if (ev.strong) return ev.strong;
-+      return "";
-+    })(),
-+    weakBlockerText: (() => {
-+      const ev = providerBlockerEvidence(job, snapshot);
-+      return ev.strong ? "" : ev.weak;
-+    })(),
-   };
- }
- 
-@@ -1390,11 +1438,18 @@
- }
- 
- async function waitForSendAccepted(job, beforeSend, options = {}) {
-+  let weakBlockerFrames = 0;
-   const timeoutAt = Date.now() + (options.timeoutMs || 15_000);
-   while (Date.now() < timeoutAt) {
-     await heartbeat();
-     const afterSend = await sendAcceptanceState(job, beforeSend.assistantCount || 0);
-     if (afterSend.transientErrorText) throw new Error(formatProviderTransientErrorMessage(job, afterSend.transientErrorText, "waiting for send acceptance"));
-+    if (afterSend.weakBlockerText) {
-+      weakBlockerFrames += 1;
-+      if (weakBlockerFrames >= 3) {
-+        throw new Error(formatProviderTransientErrorMessage(job, afterSend.weakBlockerText, "waiting for send acceptance (weak, 3 consecutive frames)"));
-+      }
-+    } else weakBlockerFrames = 0;
-     if (providerSendAccepted(beforeSend, afterSend)) return true;
-     await sleep(500);
-   }
-@@ -1428,6 +1483,37 @@
-   return Boolean(dismissed);
- }
- 
-+async function trySelectPowerSliderHigh(job) {
-+  let snapshot = await snapshotText(job);
-+  if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
-+
-+  const advanced = findEntry(
-+    snapshot,
-+    (candidate) => candidate.kind === "menuitem" && /show advanced options/i.test(String(candidate.label || "")) && !candidate.disabled,
-+  );
-+  if (advanced) {
-+    await clickRef(job, advanced.ref);
-+    await agentBrowser(job, "wait", "800");
-+    snapshot = await snapshotText(job);
-+    if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
-+    const high = findEntry(
-+      snapshot,
-+      (candidate) => ["menuitem", "menuitemradio", "button", "radio"].includes(candidate.kind || "")
-+        && /^(?:High(?:\s+15\s*[–-]\s*60s)?)$/i.test(String(candidate.label || "").replace(/\s+/g, " ").trim())
-+        && !candidate.disabled,
-+    );
-+    if (high) {
-+      await clickRef(job, high.ref);
-+      await agentBrowser(job, "wait", "800");
-+      snapshot = await snapshotText(job);
-+      if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
-+    }
-+  }
-+
-+  const visible = describeCompactComposerSelection(snapshot) || "unknown";
-+  throw new Error(`ChatGPT Power slider is ${visible}, not GPT-5.6 Sol High. /sol requires thinking_extended. Open Advanced → High and retry.`);
-+}
-+
- async function openModelConfiguration(job) {
-   const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
-   let lastSnapshot = "";
-@@ -1451,6 +1537,9 @@
-       throwIfProviderTransientError(job, after, "opening model configuration");
-       if (snapshotHasModelConfigurationUi(after)) return after;
-       if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
-+      if (snapshotHasPowerSliderCompactMenu(after) || /menuitem "Show advanced options"/i.test(after)) {
-+        return trySelectPowerSliderHigh(job);
-+      }
- 
-       const configureEntry = findEntry(
-         after,
-@@ -1465,6 +1554,9 @@
-         throwIfProviderTransientError(job, postConfigure, "opening model configuration");
-         if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
-         if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
-+        if (snapshotHasPowerSliderCompactMenu(postConfigure) || /menuitem "Show advanced options"/i.test(postConfigure)) {
-+          return trySelectPowerSliderHigh(job);
-+        }
-       }
-     }
- 
-@@ -1524,14 +1616,49 @@
-   }
- 
-   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
-+}
-+
-+async function waitForChatGptModelPicker(job, timeoutMs = 20_000) {
-+  const deadline = Date.now() + timeoutMs;
-+  let lastSnapshot = "";
-+  while (Date.now() < deadline) {
-+    lastSnapshot = await snapshotText(job);
-+    if (snapshotCanSafelySkipModelConfiguration(lastSnapshot, job.selection)) return lastSnapshot;
-+    if (snapshotHasModelOpener(lastSnapshot) || snapshotHasModelConfigurationUi(lastSnapshot)) return lastSnapshot;
-+    if (snapshotHasUsableComposerControls(lastSnapshot)) {
-+      await agentBrowser(job, "wait", "1000");
-+      continue;
-+    }
-+    await agentBrowser(job, "wait", "500");
-+  }
-+  return lastSnapshot;
- }
- 
- async function configureModel(job) {
-   if (isGrokJob(job)) return configureGrokModel(job);
--  const initialSnapshot = await snapshotText(job);
-+  let assumedDefaultThinkingFallback = false;
-+  let initialSnapshot = await snapshotText(job);
-+  if (
-+    snapshotHasUsableComposerControls(initialSnapshot)
-+    && !snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)
-+    && !snapshotHasModelOpener(initialSnapshot)
-+    && !snapshotHasModelConfigurationUi(initialSnapshot)
-+  ) {
-+    await log("Composer is ready but the model picker has not hydrated yet; waiting before configuration");
-+    initialSnapshot = await waitForChatGptModelPicker(job);
-+  }
-   if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
-     await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
-     return;
-+  }
-+
-+  if (snapshotHasPowerSliderCompactMenu(initialSnapshot) || /menuitem "Show advanced options"/i.test(initialSnapshot) || /menuitem "Power"/i.test(initialSnapshot)) {
-+    await log(`Power-slider compact UI visible; selecting High instead of the legacy Instant/Thinking/Pro sheet`);
-+    initialSnapshot = await trySelectPowerSliderHigh(job);
-+    if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
-+      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
-+      return;
-+    }
-   }
- 
-   await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
-@@ -1553,7 +1680,21 @@
-   } else if (familyAlreadySelectedInUi) {
-     await log("Model family already appears selected; verifying effort-specific settings");
-   } else if (!familyEntry) {
--    throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
-+    // ChatGPT 新 UI：首页 headless 初始快照往往没有渲染出模型选择控件（如 High 按钮），
-+    // 而默认档位就是 GPT-5.6 Sol High (= thinking family, extended)。找不到控件时按默认档位继续，
-+    // 不再报错；只在非默认 family (pro/instant) 下才严格报错。
-+    if (job.selection.modelFamily === "thinking") {
-+      const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
-+      if (visible && visible !== "high") {
-+        throw new Error(`Could not find model family control for thinking; visible compact selection is ${visible}, not High`);
-+      }
-+      await log(`Model family control not found for thinking; assuming default ChatGPT High selection (family=thinking effort=extended) and continuing`);
-+      familySnapshot = initialSnapshot;
-+      verificationSnapshot = initialSnapshot;
-+      assumedDefaultThinkingFallback = true;
-+    } else {
-+      throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
-+    }
-   }
- 
-   let compactSelectionVerifiedAfterClick = false;
-@@ -1577,7 +1718,7 @@
-     }
-   }
- 
--  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick) {
-+  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick && !assumedDefaultThinkingFallback) {
-     const effortLabel = requestedEffortLabel(job.selection);
-     if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
-       const opened = await openEffortDropdown(job);
-@@ -1626,7 +1767,7 @@
-     }
-   }
- 
--  const stronglyVerified = compactSelectionVerifiedAfterClick || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
-+  const stronglyVerified = compactSelectionVerifiedAfterClick || assumedDefaultThinkingFallback || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
-   if (!stronglyVerified) {
-     throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
-   }
-@@ -1812,24 +1953,49 @@
-   return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
- }
- 
--async function waitForChatCompletion(job, baselineAssistantCount) {
-+async function waitForChatCompletion(job, baselineAssistantCount, options = {}) {
-+  let weakBlockerFrames = 0;
-   const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
-+  const baselineCopyCount = Number(options.baselineCopyCount || 0);
-+  const baselineLastText = String(options.baselineLastText || "");
-   let lastCompletionSignature = "";
-   let stableCount = 0;
-   let retriedAfterFailure = false;
-+  let lastStatusLogAt = 0;
- 
-   while (Date.now() < timeoutAt) {
-     await heartbeat();
-     const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
--    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshot.includes("Stop streaming");
-+    const hasStopStreaming = isGrokJob(job) ? snapshot.includes(GROK_LABELS.stop) : snapshotHasChatGptStopControl(snapshot);
-+    const sendReady = isGrokJob(job) ? false : snapshotHasChatGptSendReady(snapshot);
-+    const composerIdle = isGrokJob(job) ? false : snapshotHasChatGptComposerIdle(snapshot);
-     const hasRetryButton = snapshot.includes('button "Retry"');
--    const copyResponseCount = isGrokJob(job) ? (snapshot.match(/button "Copy"/g) || []).length : (snapshot.match(/Copy response/g) || []).length;
--    throwIfProviderTransientError(job, snapshot, "waiting for response completion");
-+    const copyResponseCount = isGrokJob(job)
-+      ? (snapshot.match(/button "Copy"/g) || []).length
-+      : countChatGptCopyControls(snapshot);
-+    {
-+      const ev = providerBlockerEvidence(job, snapshot);
-+      if (ev.strong) {
-+        throw new Error(formatProviderTransientErrorMessage(job, ev.strong, "waiting for response completion"));
-+      }
-+      if (ev.weak) {
-+        weakBlockerFrames += 1;
-+        if (weakBlockerFrames >= 3) {
-+          throw new Error(formatProviderTransientErrorMessage(job, ev.weak, "waiting for response completion (weak, 3 consecutive frames)"));
-+        }
-+      } else weakBlockerFrames = 0;
-+    }
-     const responseFailureText = detectResponseFailureText(`${snapshot}\n${body}`);
-     const messages = await assistantMessages(job);
--    const targetMessage = messages[baselineAssistantCount];
-+    const lastText = messages.at(-1)?.text || "";
-+    const progressed = messages.length > baselineAssistantCount || (Boolean(lastText) && lastText !== baselineLastText);
-+    const targetMessage = messages[baselineAssistantCount] || (progressed ? messages.at(-1) : undefined);
-     const targetText = targetMessage?.text || "";
--    const hasTargetCopyResponse = copyResponseCount > baselineAssistantCount;
-+    const hasTargetCopyResponse = copyResponseCount > baselineCopyCount || (!hasStopStreaming && composerIdle && progressed && Boolean(targetText));
-+    if (Date.now() - lastStatusLogAt >= 15_000) {
-+      lastStatusLogAt = Date.now();
-+      await log(`Completion poll: stop=${hasStopStreaming} idle=${composerIdle} sendReady=${sendReady} copy=${copyResponseCount}/${baselineCopyCount} msgs=${messages.length}/${baselineAssistantCount} text=${targetText.length} progressed=${progressed}`);
-+    }
- 
-     if (!hasStopStreaming && hasRetryButton && responseFailureText) {
-       if (!retriedAfterFailure) {
-@@ -1851,6 +2017,15 @@
-     }
- 
-     let completionSignature;
-+    // Hard guard: while the model is still streaming (Stop control visible),
-+    // never emit a completion signature — the copy-count heuristic alone can
-+    // fire mid-generation and truncate a long response.
-+    if (hasStopStreaming) {
-+      lastCompletionSignature = "";
-+      stableCount = 0;
-+      await sleep(job.config.worker.pollMs);
-+      continue;
-+    }
-     if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
-       completionSignature = deriveAssistantCompletionSignature({
-         hasStopStreaming,
-@@ -2370,7 +2545,10 @@
-     }));
-     await uploadArchive(currentJob);
-     await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
--    const baselineAssistantCount = (await assistantMessages(currentJob)).length;
-+    const baselineMessages = await assistantMessages(currentJob);
-+    const baselineAssistantCount = baselineMessages.length;
-+    const baselineLastText = baselineMessages.at(-1)?.text || "";
-+    const baselineCopyCount = countChatGptCopyControls(await snapshotText(currentJob));
-     await log(`Assistant response count before send: ${baselineAssistantCount}`);
-     await clickSend(currentJob, baselineAssistantCount);
-     await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
-@@ -2391,7 +2569,7 @@
-       patch: awaitingResponsePatch,
-     }));
- 
--    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount);
-+    const completion = await waitForChatCompletion(currentJob, baselineAssistantCount, { baselineCopyCount, baselineLastText });
-     if (isGrokJob(currentJob) && !currentJob.conversationId) {
-       const stableGrokChatUrl = await waitForStableChatUrl(currentJob, undefined);
-       const stableGrokConversationId = conversationIdFromUrl(stableGrokChatUrl);

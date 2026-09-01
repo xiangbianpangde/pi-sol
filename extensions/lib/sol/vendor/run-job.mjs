@@ -110,6 +110,10 @@ let cleaningUpRuntime = false;
 let shuttingDown = false;
 let lastHeartbeatMs = 0;
 
+function hashText(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
 function providerForJob(job) {
   return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
 }
@@ -2061,6 +2065,63 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
   throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
 }
 
+async function waitForRecoveredAssistant(job, baselineAssistantCount) {
+  // Pure observation loop: open the existing conversation URL and read the
+  // assistant reply that completed server-side. No Retry, no model config,
+  // no send. Simplified from waitForChatCompletion.
+  const timeoutAt = Date.now() + job.config.worker.completionTimeoutMs;
+  let lastSignature = "";
+  let stableCount = 0;
+  let lastStatusLogAt = 0;
+
+  while (Date.now() < timeoutAt) {
+    await heartbeat();
+    const [snapshot, body] = await Promise.all([snapshotText(job), pageText(job).catch(() => "")]);
+    const hasStopStreaming = snapshotHasChatGptStopControl(snapshot);
+    const sendReady = snapshotHasChatGptSendReady(snapshot);
+    const composerIdle = snapshotHasChatGptComposerIdle(snapshot);
+    const copyResponseCount = countChatGptCopyControls(snapshot);
+    const messages = await assistantMessages(job);
+    const targetMessage = messages[baselineAssistantCount] || undefined;
+    const targetText = targetMessage?.text || "";
+    const progressed = messages.length > baselineAssistantCount;
+    if (Date.now() - lastStatusLogAt >= 15_000) {
+      lastStatusLogAt = Date.now();
+      await log(`Recovery poll: stop=${hasStopStreaming} idle=${composerIdle} sendReady=${sendReady} copy=${copyResponseCount} msgs=${messages.length}/${baselineAssistantCount} text=${targetText.length}`);
+    }
+
+    // Never emit completion while the model is still streaming.
+    if (hasStopStreaming) {
+      lastSignature = "";
+      stableCount = 0;
+      await sleep(job.config.worker.pollMs);
+      continue;
+    }
+    const hasTargetCopyResponse = copyResponseCount > 0 && (composerIdle || progressed);
+    let completionSignature;
+    if (targetText && (hasTargetCopyResponse || isGrokJob(job))) {
+      completionSignature = deriveAssistantCompletionSignature({
+        hasStopStreaming,
+        hasTargetCopyResponse: hasTargetCopyResponse || isGrokJob(job),
+        responseText: targetText,
+      });
+    }
+    if (completionSignature) {
+      if (completionSignature === lastSignature) stableCount += 1;
+      else stableCount = 1;
+      lastSignature = completionSignature;
+      if (stableCount >= 2) {
+        return { responseIndex: baselineAssistantCount, responseText: targetText };
+      }
+    } else {
+      lastSignature = "";
+      stableCount = 0;
+    }
+    await sleep(job.config.worker.pollMs);
+  }
+  throw new Error(`Timed out waiting for the recovered assistant response (baseline assistant count: ${baselineAssistantCount})`);
+}
+
 async function sha256(path) {
   const buffer = await readFile(path);
   return createHash("sha256").update(buffer).digest("hex");
@@ -2530,6 +2591,39 @@ async function run() {
       patch: { heartbeatAt: new Date().toISOString() },
     }));
     await waitForOracleReady(currentJob);
+
+    // Read-only recovery branch: open the existing conversation, read the
+    // completed assistant reply, and finish. No configureModel, no upload,
+    // no send, no Retry.
+    if (currentJob.jobKind === "recovery") {
+      const anchor = currentJob.recoverySource?.anchor;
+      if (!anchor) throw new Error("Recovery job is missing its recoverySource anchor snapshot");
+      await log(`Recovery job ${currentJob.id}: opening conversation ${currentJob.conversationId || "(unknown)"} for read-only observation`);
+      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
+        at: new Date().toISOString(),
+        source: "oracle:worker",
+        message: "Opening the existing conversation to recover the completed assistant response.",
+        patch: { heartbeatAt: new Date().toISOString() },
+      }));
+      const completion = await waitForRecoveredAssistant(currentJob, Number(anchor.baselineAssistantCount || 0));
+      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "extracting_response", {
+        at: new Date().toISOString(),
+        source: "oracle:worker",
+        message: "Extracting the recovered response body.",
+        patch: { heartbeatAt: new Date().toISOString() },
+      }));
+      const responseText = stripChatGptResponseChrome(completion.responseText);
+      await secureWriteText(currentJob.responsePath, `${responseText}
+`);
+      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "complete", {
+        at: new Date().toISOString(),
+        source: "oracle:worker",
+        message: "Recovered the completed ChatGPT response.",
+        patch: { responsePath: currentJob.responsePath, responseFormat: "text/plain", cleanupPending: true },
+      }));
+      await log(`Recovery job ${currentJob.id} complete`);
+      return;
+    }
     currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
       at: new Date().toISOString(),
       source: "oracle:worker",
@@ -2544,14 +2638,31 @@ async function run() {
       patch: { heartbeatAt: new Date().toISOString() },
     }));
     await uploadArchive(currentJob);
-    await setComposerText(currentJob, await readFile(currentJob.promptPath, "utf8"));
+    const promptText = await readFile(currentJob.promptPath, "utf8");
+    await setComposerText(currentJob, promptText);
     const baselineMessages = await assistantMessages(currentJob);
     const baselineAssistantCount = baselineMessages.length;
     const baselineLastText = baselineMessages.at(-1)?.text || "";
     const baselineCopyCount = countChatGptCopyControls(await snapshotText(currentJob));
     await log(`Assistant response count before send: ${baselineAssistantCount}`);
     await clickSend(currentJob, baselineAssistantCount);
-    await log(`Send accepted; waiting ${POST_SEND_SETTLE_MS}ms after send to avoid streaming interruption`);
+    await log(`Send accepted; recording recovery anchor`);
+    await mutateJob((job) => ({
+      ...job,
+      recoverySource: {
+        ...(job.recoverySource || {}),
+        anchor: {
+          baselineAssistantCount,
+          baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
+          submittedPromptHash: hashText(promptText),
+          conversationId: job.conversationId,
+          chatUrl: job.chatUrl,
+          armedAt: new Date().toISOString(),
+          sendAcceptedAt: new Date().toISOString(),
+        },
+      },
+    }));
+    await log(`Recovery anchor recorded (baseline assistant count: ${baselineAssistantCount})`);
     await sleep(POST_SEND_SETTLE_MS);
 
     const observedChatUrl = isGrokJob(currentJob)

@@ -126,6 +126,36 @@ function readVendoredOracleVersion(vendor) {
 	return value || VENDORED_ORACLE_VERSION;
 }
 
+function readVendorDigest(vendor) {
+	const path = join(vendor, ".vendor-digest");
+	if (!existsSync(path)) return undefined;
+	try {
+		return JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+function computeVendorDigest(vendor) {
+	// Hash of the authority-sensitive vendor files only (tools.ts + jobs.ts).
+	// This binds the ORACLE_VERSION to the actual file content so a tampered
+	// version string cannot skip the revendor branch (audit P2-N2).
+	const entries = ["tools.ts", "jobs.ts"].map((name) => [name, sha256File(join(vendor, name))]);
+	return Object.fromEntries(entries);
+}
+
+function verifyVendorDigest(vendor) {
+	const expected = computeVendorDigest(vendor);
+	const stored = readVendorDigest(vendor);
+	if (!stored) return { ok: true }; // pre-digest vendor — accept
+	for (const [name, hash] of Object.entries(expected)) {
+		if (stored[name] !== hash) {
+			return { ok: false, error: `vendor ${name} digest mismatch: expected ${stored[name] ?? "(missing)"}, got ${hash.slice(0, 12)}` };
+		}
+	}
+	return { ok: true };
+}
+
 function missingNeedles(path, needles) {
 	if (!existsSync(path)) return [`missing file ${path}`];
 	const text = readFileSync(path, "utf8");
@@ -238,6 +268,15 @@ export function revendorSolOraclePatches(options = {}) {
 	if (!installedVersion) {
 		return { ok: false, revendored: false, error: `cannot read pi-oracle version under ${root}` };
 	}
+
+	// Vendor digest gate (audit P2-N2): a tampered ORACLE_VERSION string must
+	// not skip the revendor branch. The digest binds the version claim to the
+	// actual vendor file content.
+	const digestCheck = verifyVendorDigest(vendor);
+	if (!digestCheck.ok) {
+		return { ok: false, revendored: false, error: digestCheck.error };
+	}
+
 	if (installedVersion === vendoredVersion && !options.force) {
 		return { ok: true, revendored: false, version: installedVersion };
 	}
@@ -335,6 +374,7 @@ export function revendorSolOraclePatches(options = {}) {
 		for (const rel of WORKER_RELATIVE_FILES) {
 			copyFileSync(join(staging, rel), join(vendor, rel.split("/").pop()));
 		}
+		writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(computeVendorDigest(vendor)), "utf8");
 		writeFileSync(join(vendor, "ORACLE_VERSION"), `${installedVersion}\n`, "utf8");
 		return { ok: true, revendored: true, version: installedVersion, previousVersion: vendoredVersion };
 	} finally {
@@ -358,7 +398,14 @@ export function ensureSolOraclePatches(options = {}) {
 
 	const missing = missingMarkers(root);
 
+	// Authority hash gate on the no-op fast path too (audit P1-N1): marker
+	// presence alone is not authority. A marker-preserving third-hash mutation
+	// of lib/tools.ts or lib/jobs.ts must fail closed, not silently pass.
 	if (!options.force && missing.length === 0) {
+		const authority = verifyAuthorityRestoreState(root, vendor);
+		if (!authority.ok) {
+			return { ok: false, restored: false, missing: [authority.error], root, error: authority.error };
+		}
 		return { ok: true, restored: false, missing: [], root };
 	}
 

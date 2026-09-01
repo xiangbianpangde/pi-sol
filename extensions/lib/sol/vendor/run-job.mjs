@@ -2065,6 +2065,24 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
   throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
 }
 
+async function promptFromConversationUserTurn(job, responseIndex) {
+  // Read the user message that precedes the target assistant reply at
+  // responseIndex, so the recovered answer can be bound to the submitted
+  // prompt. Returns the user message text (or "" if not resolvable).
+  const idx = Number(responseIndex);
+  const result = await evalPage(
+    job,
+    toJsonScript(`
+      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-testid="user-message"]'));
+      const texts = nodes.map((node) => (node.innerText || node.textContent || '').trim()).filter(Boolean);
+      const userTurn = texts[${idx}] || (texts.length > 0 ? texts[texts.length - 1] : "");
+      return { text: userTurn };
+    `),
+  );
+  const text = typeof result?.text === "string" ? result.text.trim() : "";
+  return text;
+}
+
 async function waitForRecoveredAssistant(job, baselineAssistantCount) {
   // Pure observation loop: open the existing conversation URL and read the
   // assistant reply that completed server-side. No Retry, no model config,
@@ -2633,7 +2651,21 @@ async function run() {
           );
         }
       }
-      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount}`);
+      // submittedPromptHash binding: the target assistant reply must follow a
+      // user turn whose content matches the prompt the source job submitted.
+      // This guards against edited/regenerated source user turns that keep the
+      // conversation id and preceding assistant hash intact but no longer
+      // correspond to the submitted prompt (audit P2-3).
+      if (anchor.submittedPromptHash) {
+        const observedPromptText = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => "");
+        if (observedPromptText && hashText(observedPromptText) !== anchor.submittedPromptHash) {
+          throw new Error(
+            "Recovery prompt mismatch: the user turn preceding the target assistant reply does not match the source job's submitted prompt hash. " +
+              "The conversation may have been edited or regenerated; refusing recovery.",
+          );
+        }
+      }
+      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
       currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
         at: new Date().toISOString(),
         source: "oracle:worker",
@@ -2689,16 +2721,13 @@ async function run() {
     // stage — the recovery child resolves it from the chat URL).
     await mutateJob((job) => ({
       ...job,
-      recoverySource: {
-        ...(job.recoverySource || {}),
-        anchor: {
-          baselineAssistantCount,
-          baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
-          submittedPromptHash: hashText(promptText),
-          conversationId: job.conversationId,
-          chatUrl: job.chatUrl,
-          armedAt: new Date().toISOString(),
-        },
+      recoveryAnchor: {
+        baselineAssistantCount,
+        baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
+        submittedPromptHash: hashText(promptText),
+        conversationId: job.conversationId,
+        chatUrl: job.chatUrl,
+        armedAt: new Date().toISOString(),
       },
     }));
     await log(`Pre-send anchor armed (baseline assistant count: ${baselineAssistantCount})`);
@@ -2715,14 +2744,11 @@ async function run() {
     const observedConversationId = conversationIdFromUrl(observedChatUrl) || currentJob.conversationId;
     await mutateJob((job) => ({
       ...job,
-      recoverySource: {
-        ...(job.recoverySource || {}),
-        anchor: {
-          ...(job.recoverySource?.anchor || {}),
-          sendAcceptedAt: new Date().toISOString(),
-          conversationId: observedConversationId || job.conversationId,
-          chatUrl: observedChatUrl || job.chatUrl,
-        },
+      recoveryAnchor: {
+        ...(job.recoveryAnchor || {}),
+        sendAcceptedAt: new Date().toISOString(),
+        conversationId: observedConversationId || job.conversationId,
+        chatUrl: observedChatUrl || job.chatUrl,
       },
     }));
     await log(`Recovery anchor committed (sendAccepted, conversation: ${observedConversationId || "(observing)"})`);

@@ -1,5 +1,5 @@
 --- a/extensions/oracle/lib/tools.ts	2026-09-01 10:14:12
-+++ b/extensions/oracle/lib/tools.ts	2026-09-01 11:42:54
++++ b/extensions/oracle/lib/tools.ts	2026-09-01 12:20:30
 @@ -4,9 +4,10 @@
  // Usage: Imported by the oracle extension entrypoint and sanity tests to register tools against the pi API.
  // Invariants/Assumptions: The pi runtime validates TypeBox schemas before execute, while execute owns semantic normalization.
@@ -21,21 +21,21 @@
    type OracleJob,
  } from "./jobs.js";
  import { isOracleProjectTrusted } from "./trust.js";
-@@ -125,6 +128,14 @@
-   jobId: Type.String({ description: "Oracle job id." }),
- }, { additionalProperties: false });
+@@ -123,6 +126,14 @@
  
+ const ORACLE_CANCEL_PARAMS = Type.Object({
+   jobId: Type.String({ description: "Oracle job id." }),
++}, { additionalProperties: false });
++
 +const ORACLE_RECOVER_PARAMS = Type.Object({
 +  sourceJobId: Type.Optional(Type.String({
 +    description: "UUID of a failed oracle job to recover. Omit for auto-selection (latest resumable job in current project).",
 +    minLength: 1,
 +    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 +  })),
-+}, { additionalProperties: false });
-+
+ }, { additionalProperties: false });
+ 
  const MAX_QUEUED_JOBS_PER_ACTIVE_RUNTIME = 1;
- const MAX_QUEUED_ARCHIVE_BYTES_PER_ACTIVE_RUNTIME = resolveOracleProviderArchivePlan("chatgpt").maxArchiveBytes;
- function prepareOracleProviderAliases<T>(args: unknown, toolName: string): T {
 @@ -305,7 +316,7 @@
    return resolveFollowUp(args.followUpJobId, args.cwd);
  }
@@ -54,27 +54,38 @@
  
  function asRecord(value: unknown): Record<string, unknown> | undefined {
    return typeof value === "object" && value !== null && !Array.isArray(value)
-@@ -683,8 +694,31 @@
-   if (provider === "grok") return "Grok";
-   if (provider === "chatgpt") return "ChatGPT";
+@@ -685,6 +696,42 @@
    return "configured provider";
-+}
-+
+ }
+ 
 +function isRecoverableSourceJob(job: OracleJob | undefined, projectId: string): boolean {
 +  if (!job) return false;
 +  if (job.projectId !== projectId) return false;
 +  if (job.status !== "failed") return false;
 +  if (job.selection?.provider !== "chatgpt") return false;
-+  // Explicit jobKind: only "submission" (or undefined/legacy) jobs are recoverable,
-+  // not recovery children (which would form recovery-of-recovery chains).
-+  const kind = job.jobKind ?? "submission";
-+  if (kind !== "submission") return false;
-+  if (!job.conversationId) return false;
-+  if (!job.recoverySource?.anchor) return false;
-+  if (!job.recoverySource.anchor.sendAcceptedAt) return false;
++  // Explicit jobKind: only "submission" — NOT null/undefined/legacy — are
++  // recoverable. Recovery children (jobKind === "recovery") are excluded.
++  if (job.jobKind !== "submission") return false;
++  // A conversation must be addressable: either the top-level conversationId
++  // (follow-up or committed) or an anchor-recorded identity (armed on an
++  // existing conversation). A brand-new conversation that crashed during
++  // Phase 1 has no URL yet and cannot be opened — that stays unrecoverable.
++  const hasAddressableConversation = Boolean(
++    job.conversationId || job.recoveryAnchor?.conversationId || job.recoveryAnchor?.chatUrl,
++  );
++  if (!hasAddressableConversation) return false;
++  if (!job.recoveryAnchor) return false;
++  // Phase-1 anchor (armedAt + baselineAssistantCount + submittedPromptHash)
++  // is sufficient for recovery eligibility. The recovery worker probes the
++  // conversation to verify the send was real (checking prompt hash,
++  // conversation state, etc.). Phase-2 (sendAcceptedAt + conversationId)
++  // improves accuracy but is not required for the read-only observation.
++  if (!job.recoveryAnchor.armedAt) return false;
++  if (typeof job.recoveryAnchor.baselineAssistantCount !== "number") return false;
++  if (!job.recoveryAnchor.submittedPromptHash) return false;
 +  return true;
- }
- 
++}
++
 +function formatOracleRecoverResponse(result: { id: string; status: string; sourceJobId: string; sourceJobStatus: string; conversationId?: string; chatUrl?: string }): string {
 +  return `Oracle recovery job dispatched: ${result.id}
 +Recovering from source job: ${result.sourceJobId} (${result.sourceJobStatus})
@@ -86,10 +97,15 @@
  function formatOraclePreflightResponse(details: OraclePreflightDetails): string {
    const providerLabel = formatOracleProviderLabel(details.provider);
    if (details.ready) {
-@@ -1135,6 +1169,183 @@
-   });
- 
-   pi.registerTool({
+@@ -1130,6 +1177,183 @@
+         }
+       } catch (error) {
+         return buildOracleToolErrorResult("oracle_submit", error, params);
++      }
++    },
++  });
++
++  pi.registerTool({
 +    name: "oracle_recover",
 +    label: "Oracle Recover",
 +    description: "Read-only recovery of an interrupted ChatGPT conversation. Opens the existing conversation without sending a new user turn and returns the complete last assistant message. Only works for failed jobs whose send was accepted by the provider.",
@@ -148,12 +164,12 @@
 +        if (sourceStat.uid !== process.getuid()) {
 +          throw new Error(`Source job ${sourceJob.id} is owned by another user (UID ${sourceStat.uid}).`);
 +        }
-+        // isRecoverableSourceJob already validated projectId, provider, conversationId, anchor, sendAcceptedAt
++        // isRecoverableSourceJob already validated projectId, provider, conversation identity, and a Phase-1 armed anchor
 +
 +        // Step 3: Admission-first — acquire leases BEFORE creating the child job
 +        childJobId = randomUUID();
 +        runtime = allocateRuntime(config);
-+        const childAnchor = { ...sourceJob.recoverySource!.anchor };
++        const childAnchor = { ...sourceJob.recoveryAnchor! };
 +
 +        await withLock("admission", "global", { jobId: childJobId, processPid: process.pid }, async () => {
 +          await promoteQueuedJobsWithinAdmissionLock({ workerPath, source: "oracle_recover" });
@@ -262,22 +278,31 @@
 +          await appendCleanupWarnings(childJobId, cleanupReport.warnings).catch(() => undefined);
 +        }
 +        return buildOracleToolErrorResult("oracle_recover", error, {});
-+      }
-+    },
-+  });
-+
-+  pi.registerTool({
-     name: "oracle_read",
-     label: "Oracle Read",
-     description: "Read the status and outputs of a previously dispatched oracle job.",
+       }
+     },
+   });
 --- a/extensions/oracle/lib/jobs.ts	2026-09-01 10:14:12
-+++ b/extensions/oracle/lib/jobs.ts	2026-09-01 11:22:59
-@@ -148,6 +148,23 @@
++++ b/extensions/oracle/lib/jobs.ts	2026-09-01 12:19:39
+@@ -148,6 +148,37 @@
    selection: OracleResolvedSelection;
    extensionProvenance?: OracleExtensionProvenance;
    followUpToJobId?: string;
 +  jobKind: "submission" | "recovery";
 +  recoveryOfJobId?: string;
++  // The submission's own pre-send anchor, written by the worker in two
++  // phases (armed before clickSend, committed after acceptance). Used by
++  // oracle_recover to locate and validate the source conversation.
++  recoveryAnchor?: {
++    baselineAssistantCount: number;
++    baselineLastAssistantHash?: string;
++    submittedPromptHash?: string;
++    conversationId?: string;
++    chatUrl?: string;
++    armedAt?: string;
++    sendAcceptedAt?: string;
++  };
++  // Immutable provenance snapshot, written ONLY on recovery children by
++  // oracle_recover (not on ordinary submissions).
 +  recoverySource?: {
 +    jobId: string;
 +    sourceCreatedAt: string;
@@ -287,16 +312,16 @@
 +      baselineAssistantCount: number;
 +      baselineLastAssistantHash?: string;
 +      submittedPromptHash?: string;
-+      armedAt?: string;
-+      sendAcceptedAt?: string;
 +      conversationId?: string;
 +      chatUrl?: string;
++      armedAt?: string;
++      sendAcceptedAt?: string;
 +    };
 +  };
    chatUrl?: string;
    conversationId?: string;
    responsePath?: string;
-@@ -941,7 +958,7 @@
+@@ -941,7 +972,7 @@
    originSessionFile: string | undefined,
    config: OracleConfig,
    runtime: OracleRuntimeAllocation,
@@ -305,7 +330,7 @@
  ): Promise<OracleJob> {
    const jobDir = getJobDir(id);
    const logsDir = join(jobDir, "logs");
-@@ -983,6 +1000,7 @@
+@@ -983,6 +1014,7 @@
      selection: input.selection,
      extensionProvenance: readExtensionProvenance(cwd),
      followUpToJobId: input.followUpToJobId,
@@ -314,7 +339,7 @@
      conversationId,
      responseFormat: "text/plain",
 --- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 11:22:17
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 12:20:04
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -344,17 +369,17 @@
  const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
    (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
  ) || "agent-browser";
-@@ -102,6 +110,10 @@
+@@ -101,6 +109,10 @@
+ let cleaningUpRuntime = false;
  let shuttingDown = false;
  let lastHeartbeatMs = 0;
- 
++
 +function hashText(text) {
 +  return createHash("sha256").update(text, "utf8").digest("hex");
 +}
-+
+ 
  function providerForJob(job) {
    return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
- }
 @@ -706,7 +718,11 @@
  
  async function ensureBrowserConnected(job) {
@@ -454,12 +479,10 @@
      if (providerSendAccepted(beforeSend, afterSend)) return true;
      await sleep(500);
    }
-@@ -1426,6 +1485,37 @@
-   `));
-   if (dismissed) await agentBrowser(job, "wait", "500");
+@@ -1428,6 +1487,37 @@
    return Boolean(dismissed);
-+}
-+
+ }
+ 
 +async function trySelectPowerSliderHigh(job) {
 +  let snapshot = await snapshotText(job);
 +  if (snapshotCanSafelySkipModelConfiguration(snapshot, job.selection)) return snapshot;
@@ -489,9 +512,11 @@
 +
 +  const visible = describeCompactComposerSelection(snapshot) || "unknown";
 +  throw new Error(`ChatGPT Power slider is ${visible}, not GPT-5.6 Sol High. /sol requires thinking_extended. Open Advanced → High and retry.`);
- }
- 
++}
++
  async function openModelConfiguration(job) {
+   const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
+   let lastSnapshot = "";
 @@ -1451,6 +1541,9 @@
        throwIfProviderTransientError(job, after, "opening model configuration");
        if (snapshotHasModelConfigurationUi(after)) return after;
@@ -676,10 +701,28 @@
      if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
        completionSignature = deriveAssistantCompletionSignature({
          hasStopStreaming,
-@@ -1884,6 +2063,63 @@
+@@ -1884,6 +2063,81 @@
    }
  
    throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
++}
++
++async function promptFromConversationUserTurn(job, responseIndex) {
++  // Read the user message that precedes the target assistant reply at
++  // responseIndex, so the recovered answer can be bound to the submitted
++  // prompt. Returns the user message text (or "" if not resolvable).
++  const idx = Number(responseIndex);
++  const result = await evalPage(
++    job,
++    toJsonScript(`
++      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-testid="user-message"]'));
++      const texts = nodes.map((node) => (node.innerText || node.textContent || '').trim()).filter(Boolean);
++      const userTurn = texts[${idx}] || (texts.length > 0 ? texts[texts.length - 1] : "");
++      return { text: userTurn };
++    `),
++  );
++  const text = typeof result?.text === "string" ? result.text.trim() : "";
++  return text;
 +}
 +
 +async function waitForRecoveredAssistant(job, baselineAssistantCount) {
@@ -740,7 +783,7 @@
  }
  
  async function sha256(path) {
-@@ -2355,6 +2591,74 @@
+@@ -2355,6 +2609,88 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await waitForOracleReady(currentJob);
@@ -786,7 +829,21 @@
 +          );
 +        }
 +      }
-+      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount}`);
++      // submittedPromptHash binding: the target assistant reply must follow a
++      // user turn whose content matches the prompt the source job submitted.
++      // This guards against edited/regenerated source user turns that keep the
++      // conversation id and preceding assistant hash intact but no longer
++      // correspond to the submitted prompt (audit P2-3).
++      if (anchor.submittedPromptHash) {
++        const observedPromptText = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => "");
++        if (observedPromptText && hashText(observedPromptText) !== anchor.submittedPromptHash) {
++          throw new Error(
++            "Recovery prompt mismatch: the user turn preceding the target assistant reply does not match the source job's submitted prompt hash. " +
++              "The conversation may have been edited or regenerated; refusing recovery.",
++          );
++        }
++      }
++      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
 +      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
 +        at: new Date().toISOString(),
 +        source: "oracle:worker",
@@ -815,7 +872,7 @@
      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
        at: new Date().toISOString(),
        source: "oracle:worker",
-@@ -2369,17 +2673,60 @@
+@@ -2369,17 +2705,54 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await uploadArchive(currentJob);
@@ -837,16 +894,13 @@
 +    // stage — the recovery child resolves it from the chat URL).
 +    await mutateJob((job) => ({
 +      ...job,
-+      recoverySource: {
-+        ...(job.recoverySource || {}),
-+        anchor: {
-+          baselineAssistantCount,
-+          baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
-+          submittedPromptHash: hashText(promptText),
-+          conversationId: job.conversationId,
-+          chatUrl: job.chatUrl,
-+          armedAt: new Date().toISOString(),
-+        },
++      recoveryAnchor: {
++        baselineAssistantCount,
++        baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
++        submittedPromptHash: hashText(promptText),
++        conversationId: job.conversationId,
++        chatUrl: job.chatUrl,
++        armedAt: new Date().toISOString(),
 +      },
 +    }));
 +    await log(`Pre-send anchor armed (baseline assistant count: ${baselineAssistantCount})`);
@@ -865,14 +919,11 @@
      const observedConversationId = conversationIdFromUrl(observedChatUrl) || currentJob.conversationId;
 +    await mutateJob((job) => ({
 +      ...job,
-+      recoverySource: {
-+        ...(job.recoverySource || {}),
-+        anchor: {
-+          ...(job.recoverySource?.anchor || {}),
-+          sendAcceptedAt: new Date().toISOString(),
-+          conversationId: observedConversationId || job.conversationId,
-+          chatUrl: observedChatUrl || job.chatUrl,
-+        },
++      recoveryAnchor: {
++        ...(job.recoveryAnchor || {}),
++        sendAcceptedAt: new Date().toISOString(),
++        conversationId: observedConversationId || job.conversationId,
++        chatUrl: observedChatUrl || job.chatUrl,
 +      },
 +    }));
 +    await log(`Recovery anchor committed (sendAccepted, conversation: ${observedConversationId || "(observing)"})`);
@@ -880,7 +931,7 @@
      const awaitingResponsePatch = {
        heartbeatAt: new Date().toISOString(),
        ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
-@@ -2391,7 +2738,7 @@
+@@ -2391,7 +2764,7 @@
        patch: awaitingResponsePatch,
      }));
  

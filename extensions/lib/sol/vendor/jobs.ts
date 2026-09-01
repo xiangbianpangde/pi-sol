@@ -150,6 +150,20 @@ export interface OracleJob {
   followUpToJobId?: string;
   jobKind: "submission" | "recovery";
   recoveryOfJobId?: string;
+  // The submission's own pre-send anchor, written by the worker in two
+  // phases (armed before clickSend, committed after acceptance). Used by
+  // oracle_recover to locate and validate the source conversation.
+  recoveryAnchor?: {
+    baselineAssistantCount: number;
+    baselineLastAssistantHash?: string;
+    submittedPromptHash?: string;
+    conversationId?: string;
+    chatUrl?: string;
+    armedAt?: string;
+    sendAcceptedAt?: string;
+  };
+  // Immutable provenance snapshot, written ONLY on recovery children by
+  // oracle_recover (not on ordinary submissions).
   recoverySource?: {
     jobId: string;
     sourceCreatedAt: string;
@@ -159,10 +173,10 @@ export interface OracleJob {
       baselineAssistantCount: number;
       baselineLastAssistantHash?: string;
       submittedPromptHash?: string;
-      armedAt?: string;
-      sendAcceptedAt?: string;
       conversationId?: string;
       chatUrl?: string;
+      armedAt?: string;
+      sendAcceptedAt?: string;
     };
   };
   chatUrl?: string;

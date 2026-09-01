@@ -701,13 +701,26 @@ function isRecoverableSourceJob(job: OracleJob | undefined, projectId: string): 
   if (job.projectId !== projectId) return false;
   if (job.status !== "failed") return false;
   if (job.selection?.provider !== "chatgpt") return false;
-  // Explicit jobKind: only "submission" (or undefined/legacy) jobs are recoverable,
-  // not recovery children (which would form recovery-of-recovery chains).
-  const kind = job.jobKind ?? "submission";
-  if (kind !== "submission") return false;
-  if (!job.conversationId) return false;
-  if (!job.recoverySource?.anchor) return false;
-  if (!job.recoverySource.anchor.sendAcceptedAt) return false;
+  // Explicit jobKind: only "submission" — NOT null/undefined/legacy — are
+  // recoverable. Recovery children (jobKind === "recovery") are excluded.
+  if (job.jobKind !== "submission") return false;
+  // A conversation must be addressable: either the top-level conversationId
+  // (follow-up or committed) or an anchor-recorded identity (armed on an
+  // existing conversation). A brand-new conversation that crashed during
+  // Phase 1 has no URL yet and cannot be opened — that stays unrecoverable.
+  const hasAddressableConversation = Boolean(
+    job.conversationId || job.recoveryAnchor?.conversationId || job.recoveryAnchor?.chatUrl,
+  );
+  if (!hasAddressableConversation) return false;
+  if (!job.recoveryAnchor) return false;
+  // Phase-1 anchor (armedAt + baselineAssistantCount + submittedPromptHash)
+  // is sufficient for recovery eligibility. The recovery worker probes the
+  // conversation to verify the send was real (checking prompt hash,
+  // conversation state, etc.). Phase-2 (sendAcceptedAt + conversationId)
+  // improves accuracy but is not required for the read-only observation.
+  if (!job.recoveryAnchor.armedAt) return false;
+  if (typeof job.recoveryAnchor.baselineAssistantCount !== "number") return false;
+  if (!job.recoveryAnchor.submittedPromptHash) return false;
   return true;
 }
 
@@ -1227,12 +1240,12 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
         if (sourceStat.uid !== process.getuid()) {
           throw new Error(`Source job ${sourceJob.id} is owned by another user (UID ${sourceStat.uid}).`);
         }
-        // isRecoverableSourceJob already validated projectId, provider, conversationId, anchor, sendAcceptedAt
+        // isRecoverableSourceJob already validated projectId, provider, conversation identity, and a Phase-1 armed anchor
 
         // Step 3: Admission-first — acquire leases BEFORE creating the child job
         childJobId = randomUUID();
         runtime = allocateRuntime(config);
-        const childAnchor = { ...sourceJob.recoverySource!.anchor };
+        const childAnchor = { ...sourceJob.recoveryAnchor! };
 
         await withLock("admission", "global", { jobId: childJobId, processPid: process.pid }, async () => {
           await promoteQueuedJobsWithinAdmissionLock({ workerPath, source: "oracle_recover" });

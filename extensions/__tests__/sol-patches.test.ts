@@ -270,4 +270,83 @@ describe("ensureSolOraclePatches", () => {
 			rmSync(vendor, { recursive: true, force: true });
 		}
 	});
+
+	it("rejects a same-version restore when installed lib files match neither pristine nor patched hash (P1-5 bypass A)", () => {
+		// Same version as vendored: the restore path copies vendor → installed
+		// directly. It must refuse to overwrite authority lib files whose
+		// installed content is an unknown third hash (not pristine, not
+		// already-patched).
+		const { root, worker, lib } = fakeOracleRoot(); // 0.7.20 == vendored
+		const vendor = fakeVendorDir();
+		try {
+			// Worker files missing markers so restore is attempted
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
+			// Authority lib files carry an unknown third hash
+			writeFileSync(join(lib, "tools.ts"), "export const UNKNOWN = true;\n");
+			writeFileSync(join(lib, "jobs.ts"), "export const UNKNOWN = true;\n");
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.equal(result.restored, false);
+			assert.match(String(result.error), /authority hash fail-closed/);
+			// The unknown lib content must NOT have been overwritten
+			assert.match(readFileSync(join(lib, "tools.ts"), "utf8"), /UNKNOWN/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a version-mismatch revendor when lib files are not the reviewed pristine content (P1-5 bypass B)", () => {
+		// A new pi-oracle version legitimately differs from vendored; revendor
+		// re-applies the patch. Authority lib files must still match the
+		// reviewed pristine baseline — an already-patched (or third) lib hash
+		// must fail closed instead of silently re-patching changed authority
+		// code.
+		const { root, worker, lib } = fakeOracleRoot("0.8.0");
+		const vendor = fakeVendorDir();
+		try {
+			// Worker files missing markers so revendor is attempted
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "UPSTREAM_0_8_0\n");
+			// Authority lib files are the ALREADY-PATCHED copies (patched hash,
+			// not pristine) — must be rejected by the authority hash gate.
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.equal(result.restored, false);
+			assert.match(String(result.error), /authority hash fail-closed/);
+			// The already-patched lib content must NOT have been overwritten
+			assert.equal(readFileSync(join(lib, "tools.ts"), "utf8"), readFileSync(join(vendor, "tools.ts"), "utf8"));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts a same-version restore when installed lib files are already-patched vendor copies (P1-5 restore states)", () => {
+		// Same version, worker markers missing, lib files already hold the
+		// vendored patched copies (patched hash): restore is allowed.
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true);
+			for (const needle of SOL_PATCH_MARKERS.runJob) {
+				assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
 });

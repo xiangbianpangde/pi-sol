@@ -84,15 +84,21 @@ export const SOL_PATCH_MARKERS = {
 		// treat a recovery job as a normal submit and send a new turn).
 		"async function waitForRecoveredAssistant",
 		"Recovery job is missing its recoverySource anchor snapshot",
-		// Audit round 2026-09-01 round 6/7/8: the canonical logical-turn parser
+		// Audit round 2026-09-01 round 6/7/8/9: the canonical logical-turn parser
 		// revisions (closest() role merge + messageId dedup) must force
 		// redeploy of any worker that still carries an earlier parser body.
 		// The two-step merge lines are absent from round-5/6/7 workers, so
 		// their markers reliably distinguish the new parser domain.
 		"const roleContainer = node.closest('[data-message-author-role]')",
-		"const idNode = roleContainer.querySelector('[data-message-id]') || roleContainer;",
+		"const ownId = roleContainer.getAttribute('data-message-id') || '';",
 		"no unambiguous user predecessor: target index",
 		"closest() role merge",
+		// Audit round 2026-09-01 round 9 (P1-R8-NEW-1): canonical prompt
+		// domain — source-side submittedPromptHash and recovery-side hash
+		// must normalize with the same rules; user turns must read the
+		// message body (excluding attachment preview / UI chrome).
+		"function canonicalPromptText",
+		".user-message-bubble-color .whitespace-pre-wrap",
 	],
 	lib: [
 		// Audit round 2026-09-01 oracle_recover: old lib files without the

@@ -462,8 +462,8 @@ describe("canonical parser redeploy markers (audit round 6/7)", () => {
 		const runJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
 		// The canonical logical-turn parser revision must be distinguishable by
 		// marker so an already-installed round-5 worker gets redeployed (P1-R6-NEW-1).
-		assert.match(runJob, /roleContainer = node\.closest\('\[data-message-author-role\]'\)/);
-		assert.match(runJob, /idNode = roleContainer\.querySelector\('\[data-message-id\]'\) \|\| roleContainer;/);
+		assert.match(runJob, /const roleContainer = node\.closest\('\[data-message-author-role\]'\)/);
+		assert.match(runJob, /ownId = roleContainer\.getAttribute\('data-message-id'\).*\|\| '';/);
 		assert.match(runJob, /no unambiguous user predecessor/);
 		assert.match(runJob, /closest\(\) role merge/);
 	});
@@ -474,7 +474,7 @@ describe("canonical parser redeploy markers (audit round 6/7)", () => {
 		try {
 			// Simulate an installed round-5 worker: has waitForRecoveredAssistant
 			// but NOT the canonical closest-merge parser body.
-			const round5runJob = readFileSync(join(vendor, "run-job.mjs"), "utf8").replace(/roleContainer = node\.closest\('\[data-message-author-role\]'\)/, "const roleContainer = node;");
+			const round5runJob = readFileSync(join(vendor, "run-job.mjs"), "utf8").replace(/const roleContainer = node\.closest\('\[data-message-author-role\]'\)/, "const roleContainer = node;");
 			writeFileSync(join(worker, "run-job.mjs"), round5runJob);
 			copyFileSync(join(vendor, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
 			copyFileSync(join(vendor, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
@@ -484,10 +484,34 @@ describe("canonical parser redeploy markers (audit round 6/7)", () => {
 			assert.equal(result.ok, true);
 			assert.equal(result.restored, true);
 			// The restored worker must contain the canonical parser marker again.
-			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /roleContainer = node\.closest\('\[data-message-author-role\]'\)/);
+			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /const roleContainer = node\.closest\('\[data-message-author-role\]'\)/);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(vendor, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("canonical prompt domain (audit round 9, P1-R8-NEW-1)", () => {
+	it("uses canonicalPromptText on both the source-side hash and the recovery-side check", () => {
+		const runJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
+		// Source-side (Phase-1 anchor) and recovery-side (prompt proof) must
+		// both normalize through canonicalPromptText so multi-paragraph
+		// prompts (blank lines, trailing newline) hash consistently.
+		assert.match(runJob, /submittedPromptHash: hashText\(canonicalPromptText\(promptText\)\)/);
+		assert.match(runJob, /hashText\(canonicalPromptText\(promptProbe\.text\)\) !== anchor\.submittedPromptHash/);
+		// The user-turn body extraction excludes attachment preview / UI
+		// chrome so the hash domain is the prompt text, not the whole bubble.
+		assert.match(runJob, /\.user-message-bubble-color \.whitespace-pre-wrap/);
+	});
+
+	it("canonicalizes multi-paragraph prompts the same way on both ends", () => {
+		const runJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
+		// Verify the canonicalization function exists and is referenced at
+		// both ends (source hash + recovery check). The exact split/join
+		// tokens are already covered by the call-site assertions above.
+		assert.ok(runJob.includes("function canonicalPromptText(text)"));
+		assert.ok(runJob.includes("line.trimEnd()"));
+		assert.ok(runJob.includes("line.trim()"));
 	});
 });

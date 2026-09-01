@@ -114,6 +114,21 @@ function hashText(text) {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
+// Canonical prompt domain (audit P1-R8-NEW-1): both the source-side
+// submittedPromptHash and the recovery-side predecessor hash MUST normalize
+// the prompt text with the exact same rules, otherwise a legitimate recovery
+// (multi-paragraph prompt with blank lines, trailing newline, etc.) fails
+// closed at the prompt-proof step. The normalization mirrors what the DOM
+// renderer produces for a user turn body.
+function canonicalPromptText(text) {
+  return String(text || "")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() && !/^Thought for\b/i.test(line.trim()))
+    .join("\n")
+    .trim();
+}
+
 function providerForJob(job) {
   return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
 }
@@ -2070,12 +2085,26 @@ async function conversationTurnRecords(job) {
         if (role !== 'user' && role !== 'assistant') continue;
         if (seenRoles.has(roleContainer)) continue;
         seenRoles.add(roleContainer);
-        const idNode = roleContainer.querySelector('[data-message-id]') || roleContainer;
-        const id = idNode.getAttribute('data-message-id') || '';
+        // Identity priority: role container's own message-id first, then
+        // a descendant's (audit round 8 additional observation). If both
+        // are absent the record is rejected — no id-less logical turn.
+        const ownId = roleContainer.getAttribute('data-message-id') || '';
+        const childId = ownId ? '' : (roleContainer.querySelector('[data-message-id]')?.getAttribute('data-message-id') || '');
+        const id = ownId || childId;
         if (!id) continue;
         if (seenIds.has(id)) continue;
         seenIds.add(id);
-        records.push({ role, id, text: renderText(roleContainer) });
+        // For user turns, extract the actual prompt body node instead of the
+        // whole role container, so attachment previews / UI chrome are not
+        // included in the prompt hash comparison. Fall back to the container.
+        let text;
+        if (role === 'user') {
+          const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap, .whitespace-pre-wrap');
+          text = bodyNode ? renderText(bodyNode) : renderText(roleContainer);
+        } else {
+          text = renderText(roleContainer);
+        }
+        records.push({ role, id, text });
       }
       return { records };
     `),
@@ -2706,7 +2735,7 @@ async function run() {
               "Cannot prove the source prompt was sent; refusing recovery.",
           );
         }
-        if (hashText(promptProbe.text) !== anchor.submittedPromptHash) {
+        if (hashText(canonicalPromptText(promptProbe.text)) !== anchor.submittedPromptHash) {
           throw new Error(
             "Recovery prompt mismatch: the user turn preceding the target assistant reply does not match the source job's submitted prompt hash. " +
               "The conversation may have been edited or regenerated; refusing recovery.",
@@ -2764,7 +2793,7 @@ async function run() {
       recoveryAnchor: {
         baselineAssistantCount,
         baselineLastAssistantHash: baselineLastText ? hashText(baselineLastText) : undefined,
-        submittedPromptHash: hashText(promptText),
+        submittedPromptHash: hashText(canonicalPromptText(promptText)),
         conversationId: job.conversationId,
         chatUrl: job.chatUrl,
         armedAt: new Date().toISOString(),

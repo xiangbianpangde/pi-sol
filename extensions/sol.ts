@@ -25,7 +25,7 @@ import {
 	type ParsedSolInput,
 } from "./lib/sol/parse.ts";
 import { ensureSolOraclePatches, formatSolPatchNote } from "./lib/sol/patches.ts";
-import { buildSolAuthPrompt, buildSolDispatchPrompt, buildSolResumePrompt, buildSolStandingRule, SOL_SKILL_NAME } from "./lib/sol/prompt.ts";
+import { buildSolAuthPrompt, buildSolDispatchPrompt, buildSolRecoverGuidance, buildSolStandingRule, SOL_SKILL_NAME } from "./lib/sol/prompt.ts";
 import { classifySolTrigger, DETECTOR_RULESET, hashSolText, normalizeSolText } from "./lib/sol/trigger-detect.ts";
 import {
 	defaultSolTriggerLogPath,
@@ -184,11 +184,15 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName !== "agent_browser") {
 			// Record-only oracle phase observer. Association is honest: matched by
 			// oracle_submit prompt request-hash when possible, else session-last.
-			const phase = event.toolName.match(/^oracle_(preflight|auth|submit|read)$/)?.[1];
+			const phase = event.toolName.match(/^oracle_(preflight|auth|submit|read|recover)$/)?.[1];
 			if (phase) {
 				const session = sessionOf(ctx);
 				let admissionBlockReason: string | undefined;
-				if (phase === "submit") {
+				// Capacity-consuming oracle tools: oracle_submit and oracle_recover
+				// both launch a browser worker that consumes ChatGPT capacity, so
+				// both go through the kernel-flock admission gate (audit round
+				// 2026-09-01 oracle_recover). oracle_read/preflight/auth do not.
+				if (phase === "submit" || phase === "recover") {
 					const provider = (event.input as { provider?: unknown } | undefined)?.provider;
 					// /sol always uses ChatGPT. Leave Grok's independent admission
 					// policy untouched when an agent explicitly invokes it.
@@ -256,14 +260,18 @@ export default function (pi: ExtensionAPI) {
 		submitLeases.delete(toolCallId);
 	};
 
-	// Release the cross-session admission lease as soon as oracle_submit
-	// finishes. The durable job.json active-state check still protects the
-	// handoff after this point and also recovers leases from crashed Pi runs.
+	// Both oracle_submit and oracle_recover are capacity-consuming: each
+	// spawns a browser worker. Release the cross-session admission lease as
+	// soon as either finishes (audit round 2026-09-01 P1-3: recover must not
+	// leak its flock until session shutdown). The durable job.json
+	// active-state check still protects the handoff after this point and also
+	// recovers leases from crashed Pi runs.
+	const isCapacityConsumingOracleTool = (toolName: string): boolean => toolName === "oracle_submit" || toolName === "oracle_recover";
 	pi.on("tool_result", async (event) => {
-		if (event.toolName === "oracle_submit") await releaseSubmitLeaseFor(event.toolCallId);
+		if (isCapacityConsumingOracleTool(event.toolName)) await releaseSubmitLeaseFor(event.toolCallId);
 	});
 	pi.on("tool_execution_end", async (event) => {
-		if (event.toolName === "oracle_submit") await releaseSubmitLeaseFor(event.toolCallId);
+		if (isCapacityConsumingOracleTool(event.toolName)) await releaseSubmitLeaseFor(event.toolCallId);
 	});
 	pi.on("session_shutdown", async () => {
 		// One-shot kernel-flock release for every held lease; the kernel
@@ -311,38 +319,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("sol-resume", {
-		description: "Resume an interrupted /sol job whose send succeeded but the browser died (fetch the full answer from the completed ChatGPT conversation)",
+		description: "Recover an interrupted /sol job whose send succeeded but the browser died (read-only: opens the completed ChatGPT conversation and extracts the full answer without sending a new turn)",
 		handler: async (args, ctx) => {
 			try {
 				const input = parseSolInput(`/sol-resume ${args.trim()}`);
 				if (!input || input.command !== "sol-resume") throw new Error("Usage: /sol-resume [job-id] [--bg]");
-				const jobId = input.jobId ?? listRecentSolJobIds().find((id) => {
-					const job = readSolJob(id);
-					return job && job.status !== "complete" && job.conversationId;
-				}) ?? listRecentSolJobIds().find((id) => {
-					const job = readSolJob(id);
-					return job && job.conversationId;
-				});
-				if (!jobId) {
-					emit(pi, ctx, "No recent /sol jobs with a conversationId found. Run /sol first.", "warning");
-					return;
-				}
-				const job = readSolJob(jobId);
-				if (!job) {
-					emit(pi, ctx, `Job ${jobId} not found.`, "warning");
-					return;
-				}
-				if (!job.conversationId && !job.chatUrl) {
-					emit(pi, ctx, `Job ${jobId} has no conversationId — cannot resume. Try /sol-read ${jobId} instead.`, "warning");
-					return;
-				}
-				const formatted = buildSolResumePrompt(job, input.wait);
-				const classification = classifySolTrigger(formatted, { command: "sol-resume", ...input });
+				const classification = classifySolTrigger(input.jobId ? `/sol-resume ${input.jobId}` : "/sol-resume", input);
 				const session = sessionOf(ctx);
 				seenCommandIds.set(`${session}\u0000${classification.id}`, { session, ts: Date.now() });
 				logSolTrigger(recordFromClassification(classification, { session, phase: "command" }));
-				emit(pi, ctx, input.wait ? `Resuming ChatGPT conversation from job ${jobId}…` : `Dispatching background resume for job ${jobId}…`);
-				await pi.sendUserMessage(formatted);
+				const guidance = buildSolRecoverGuidance(input.jobId, input.wait);
+				emit(pi, ctx, input.wait ? "Recovering interrupted ChatGPT conversation…" : "Dispatching background recovery…");
+				await pi.sendUserMessage(guidance);
 			} catch (error) {
 				emit(pi, ctx, error instanceof Error ? error.message : "Usage: /sol-resume [job-id] [--bg]", "warning");
 			}

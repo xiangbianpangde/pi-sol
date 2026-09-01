@@ -44,6 +44,7 @@ describe("sol extension registration", () => {
 		assert.ok(commands.has("sol-read"));
 		assert.ok(commands.has("sol-auth"));
 		assert.ok(commands.has("sol-followup"));
+		assert.ok(commands.has("sol-resume"));
 		assert.ok(handlers.has("before_agent_start"));
 		assert.ok(handlers.has("session_start"));
 		assert.ok(handlers.has("tool_call"));

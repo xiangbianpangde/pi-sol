@@ -93,27 +93,25 @@ ${input.prompt}
 `;
 }
 
-export function buildSolResumePrompt(job: { id: string; conversationId?: string; chatUrl?: string }, wait: boolean): string {
-	const conversation = job.conversationId ?? (job.chatUrl?.match(/\/c\/([0-9a-f-]+)/i)?.[1] ?? undefined);
-	if (!conversation) {
-		return `The user ran /sol-resume ${job.id}, but that job has no conversationId on record, so we cannot continue its ChatGPT thread. Report this and ask the user to run /sol-read ${job.id} instead.`;
-	}
-	return `You are the local relay for /sol-resume — recovering the FULL answer of an interrupted ChatGPT web GPT-5.6 Sol conversation.
+export function buildSolRecoverGuidance(jobId: string | undefined, wait: boolean): string {
+	return `The user ran /sol-resume${jobId ? ` ${jobId}` : ""}${wait ? "" : " --bg"}.
 
-The previous oracle job (${job.id}) was interrupted on our side (browser/worker died) AFTER the send, so ChatGPT web may have completed the answer in the background. We now continue the SAME ChatGPT conversation to retrieve the complete output.
+This is a READ-ONLY recovery: the previous oracle job's send was accepted by ChatGPT web, but the local worker died before the answer was captured. The answer completed server-side in the conversation. Do NOT send a new user turn — extract the existing answer.
+
+Call oracle_recover with:
+- sourceJobId: ${jobId ? `\`${jobId}\`` : "omit (auto-select the latest resumable failed job in this project)"}
+- provider: implicit ChatGPT (recovery is ChatGPT-only)
+
+oracle_recover validates the source job (UUID, ownership, project, provider, conversation) and spawns a read-only recovery worker that opens the conversation WITHOUT sending anything and reads the existing assistant message.
+
+Then:
+1. If oracle_recover returns an error (job not found, no conversation, not resumable, concurrency limit), report it and suggest /sol-read.
+2. On success, ${wait ? "poll oracle_read until the recovery job is terminal and relay the recovered response." : "stop and report the recovery job id; the user can /sol-read it later."}
 
 Hard requirements:
-- Provider: \`${SOL_PROVIDER}\`. Never route to Grok.
-- Preset: \`${SOL_PRESET}\` (${SOL_PRESET_LABEL}). Do not downgrade the preset on failure.
-- Do not use agent_browser on ChatGPT. The isolated oracle worker owns that browser session.
-- Call oracle_preflight with provider \`${SOL_PROVIDER}\` first; if auth is stale, call oracle_auth, then re-run preflight.
-- Then call oracle_submit with:
-  - chatGptConversationId: \`${conversation}\`  (continue the interrupted thread — do NOT open a new chat)
-  - prompt: "Please re-print the COMPLETE final answer from your previous turn in this conversation, in full, without truncation. If you already answered, output the entire answer now."
-  - provider: \`${SOL_PROVIDER}\`, preset: \`${SOL_PRESET}\`, no files.
-- ${waitRules(wait)}
-- Worker High/Power-slider patches are restored automatically before this turn. Never tell the user to run apply scripts.
-`;
+- Never open chatgpt.com with agent_browser.
+- Never fall back to a new oracle_submit to "re-ask" — that would mutate the conversation and is not recovery.
+- Worker patches are restored automatically; never ask the user to run apply scripts.`;
 }
 
 export function buildSolAuthPrompt(): string {

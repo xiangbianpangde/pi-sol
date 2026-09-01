@@ -17,7 +17,7 @@ import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard
 import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
 import { MAX_IMAGE_BYTES, SOL_PRESET } from "../lib/sol/limits.ts";
 import { parseSolInput } from "../lib/sol/parse.ts";
-import { buildSolDispatchPrompt, buildSolResumePrompt, buildSolStandingRule } from "../lib/sol/prompt.ts";
+import { buildSolDispatchPrompt, buildSolRecoverGuidance, buildSolStandingRule } from "../lib/sol/prompt.ts";
 
 describe("parseSolInput", () => {
 	it("parses a plain /sol prompt", () => {
@@ -397,19 +397,18 @@ describe("jobs + prompt", () => {
 		assert.deepEqual(parseSolInput("/sol-resume abc123"), { command: "sol-resume", jobId: "abc123", wait: true });
 	});
 
-	it("builds a resume prompt that continues the interrupted conversation", () => {
-		const prompt = buildSolResumePrompt(
-			{ id: "job-1", conversationId: "conv-abc-123", chatUrl: "https://chatgpt.com/c/conv-abc-123" },
-			true,
-		);
-		assert.match(prompt, /conv-abc-123/);
-		assert.match(prompt, /chatGptConversationId/);
-		assert.match(prompt, /re-print the COMPLETE final answer/);
-		assert.match(prompt, /job-1/);
+	it("builds a recovery guidance that calls oracle_recover", () => {
+		const prompt = buildSolRecoverGuidance("abc-123", true);
+		assert.match(prompt, /oracle_recover/);
+		assert.match(prompt, /sourceJobId/);
+		assert.match(prompt, /abc-123/);
+		assert.match(prompt, /READ-ONLY/);
 	});
 
-	it("fails gracefully when the job has no conversationId", () => {
-		const prompt = buildSolResumePrompt({ id: "job-2" }, true);
-		assert.match(prompt, /no conversationId/);
+	it("builds a recovery guidance without a job id (auto-select)", () => {
+		const prompt = buildSolRecoverGuidance(undefined, false);
+		assert.match(prompt, /auto-select/);
+		assert.match(prompt, /oracle_recover/);
+		assert.match(prompt, /--bg/);
 	});
 });

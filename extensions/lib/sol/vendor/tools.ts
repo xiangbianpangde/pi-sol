@@ -51,6 +51,8 @@ import {
   terminateWorkerPid,
   updateJob,
   writeJob,
+  getOracleJobsDir,
+  hasDurableWorkerHandoff,
   type OracleJob,
 } from "./jobs.js";
 import { isOracleProjectTrusted } from "./trust.js";
@@ -695,6 +697,21 @@ function formatOracleProviderLabel(provider: OracleProvider | undefined): string
   return "configured provider";
 }
 
+function isRecoverableSourceJob(job: OracleJob | undefined, projectId: string): boolean {
+  if (!job) return false;
+  if (job.projectId !== projectId) return false;
+  if (job.status !== "failed") return false;
+  if (job.selection?.provider !== "chatgpt") return false;
+  // Explicit jobKind: only "submission" (or undefined/legacy) jobs are recoverable,
+  // not recovery children (which would form recovery-of-recovery chains).
+  const kind = job.jobKind ?? "submission";
+  if (kind !== "submission") return false;
+  if (!job.conversationId) return false;
+  if (!job.recoverySource?.anchor) return false;
+  if (!job.recoverySource.anchor.sendAcceptedAt) return false;
+  return true;
+}
+
 function formatOracleRecoverResponse(result: { id: string; status: string; sourceJobId: string; sourceJobStatus: string; conversationId?: string; chatUrl?: string }): string {
   return `Oracle recovery job dispatched: ${result.id}
 Recovering from source job: ${result.sourceJobId} (${result.sourceJobStatus})
@@ -1164,99 +1181,60 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
     ],
     parameters: ORACLE_RECOVER_PARAMS,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      try {
-        const projectCwd = getProjectId(ctx.cwd);
-        const baseConfig = loadOracleConfig(projectCwd, { projectConfigTrustCwd: ctx.cwd, projectConfigTrusted: isOracleProjectTrusted(ctx) });
-        const originSessionFile = requirePersistedSessionFile(getSessionFile(ctx), "recover oracle jobs");
-        const projectId = getProjectId(projectCwd);
-        const sessionId = getSessionId(originSessionFile, projectId);
-        const config = resolveOracleConfigForProvider(baseConfig, "chatgpt");
+      const projectCwd = getProjectId(ctx.cwd);
+      const baseConfig = loadOracleConfig(projectCwd, { projectConfigTrustCwd: ctx.cwd, projectConfigTrusted: isOracleProjectTrusted(ctx) });
+      const originSessionFile = requirePersistedSessionFile(getSessionFile(ctx), "recover oracle jobs");
+      const projectId = getProjectId(projectCwd);
+      const sessionId = getSessionId(originSessionFile, projectId);
+      const config = resolveOracleConfigForProvider(baseConfig, "chatgpt");
+      let sourceJob: OracleJob | undefined;
+      let childJobId: string | undefined;
+      let runtimeLeaseAcquired = false;
+      let conversationLeaseAcquired = false;
+      let workerSpawned = false;
+      let spawnedWorker: Awaited<ReturnType<typeof spawnWorker>> | undefined;
+      let runtime: ReturnType<typeof allocateRuntime> | undefined;
 
+      try {
         // Step 1: Determine source job
-        let sourceJob: OracleJob | undefined;
         if (params.sourceJobId) {
           const rawId = params.sourceJobId.trim();
-          // Strict UUIDv4 grammar
           if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(rawId)) {
             throw new Error(`Invalid sourceJobId: "${rawId}" is not a valid UUIDv4.`);
           }
-          sourceJob = readJob(rawId);
-          if (!sourceJob) throw new Error(`Source job ${rawId} not found.`);
+          const candidate = readJob(rawId);
+          if (!candidate) throw new Error(`Source job ${rawId} not found.`);
+          if (!isRecoverableSourceJob(candidate, projectId)) {
+            throw new Error(`Source job ${rawId} is not recoverable: it must be a failed ChatGPT submission with a recovery anchor and sendAcceptedAt.`);
+          }
+          sourceJob = candidate;
         } else {
-          // Auto-select: latest resumable failed job in current project
           const candidates = listOracleJobDirs()
             .map((dir) => readJob(dir))
-            .filter((job): job is OracleJob => Boolean(job && job.projectId === projectId && job.status === "failed" && job.selection?.provider === "chatgpt" && job.conversationId && job.recoverySource?.anchor?.sendAcceptedAt))
+            .filter((job): job is OracleJob => isRecoverableSourceJob(job, projectId))
             .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
           sourceJob = candidates[0];
           if (!sourceJob) throw new Error("No resumable failed job found in the current project. Ensure a failed oracle job with a valid conversationId and sendAcceptedAt exists.");
         }
 
-        // Step 2: Validate source job identity chain
-        // Canonical containment: only accept oracle-<uuid> under the jobs dir
-        const jobsRoot = realpathSync(ORACLE_JOBS_DIR);
+        // Step 2: Canonical identity chain validation
+        const jobsRoot = realpathSync(getOracleJobsDir());
         const sourceDir = getJobDir(sourceJob.id);
         const sourceReal = realpathSync(sourceDir);
         if (dirname(sourceReal) !== jobsRoot || basename(sourceReal) !== "oracle-" + sourceJob.id) {
           throw new Error(`Source job ${sourceJob.id} has unexpected path containment.`);
         }
-        // UID check
         const sourceStat = statSync(sourceReal);
         if (sourceStat.uid !== process.getuid()) {
           throw new Error(`Source job ${sourceJob.id} is owned by another user (UID ${sourceStat.uid}).`);
         }
-        // Project binding
-        if (sourceJob.projectId !== projectId) {
-          throw new Error(`Source job ${sourceJob.id} belongs to project ${sourceJob.projectId}, not current project ${projectId}.`);
-        }
-        // Provider
-        if (sourceJob.selection?.provider !== "chatgpt") {
-          throw new Error(`Source job ${sourceJob.id} provider is "${sourceJob.selection?.provider}", expected "chatgpt".`);
-        }
-        // Conversation identity
-        if (!sourceJob.conversationId) {
-          throw new Error(`Source job ${sourceJob.id} has no conversationId — cannot recover.`);
-        }
-        // Must have recovery anchor
-        if (!sourceJob.recoverySource?.anchor) {
-          throw new Error(`Source job ${sourceJob.id} has no recovery anchor. This job was created before recovery support was added or did not complete the send phase.`);
-        }
+        // isRecoverableSourceJob already validated projectId, provider, conversationId, anchor, sendAcceptedAt
 
-        // Step 3: Create recovery child job with immutable snapshot
-        const childJobId = randomUUID();
-        const runtime = allocateRuntime(config);
-        const childAnchor = { ...sourceJob.recoverySource.anchor };
-        const childJob = await createJob(
-          childJobId,
-          {
-            prompt: "(recovery)",
-            files: ["./recovery-placeholder"],
-            selection: { provider: "chatgpt", preset: "thinking_extended" },
-            chatUrl: sourceJob.chatUrl,
-            requestSource: "tool",
-          },
-          projectCwd,
-          originSessionFile,
-          config,
-          runtime,
-          { initialState: "submitted" },
-        );
-        // Override the created job with recovery-specific fields
-        const recoveryJob = {
-          ...childJob,
-          jobKind: "recovery" as const,
-          recoveryOfJobId: sourceJob.id,
-          recoverySource: {
-            jobId: sourceJob.id,
-            sourceCreatedAt: sourceJob.createdAt,
-            conversationId: sourceJob.conversationId,
-            chatUrl: sourceJob.chatUrl || "",
-            anchor: childAnchor,
-          },
-        };
-        await writeJob(recoveryJob);
+        // Step 3: Admission-first — acquire leases BEFORE creating the child job
+        childJobId = randomUUID();
+        runtime = allocateRuntime(config);
+        const childAnchor = { ...sourceJob.recoverySource!.anchor };
 
-        // Step 4: Admission (runtime lease + conversation lease)
         await withLock("admission", "global", { jobId: childJobId, processPid: process.pid }, async () => {
           await promoteQueuedJobsWithinAdmissionLock({ workerPath, source: "oracle_recover" });
           const admittedAt = new Date().toISOString();
@@ -1272,34 +1250,97 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           if (!runtimeAttempt.acquired) {
             throw new Error("Oracle runtime capacity reached. Cannot spawn a recovery worker. Try again later.");
           }
+          runtimeLeaseAcquired = true;
           const conversationAttempt = await tryAcquireConversationLease({
             jobId: childJobId,
-            conversationId: sourceJob.conversationId,
+            conversationId: sourceJob!.conversationId,
             projectId,
             sessionId,
             createdAt: admittedAt,
           });
           if (!conversationAttempt.acquired) {
             throw new Error(
-              `Conversation ${sourceJob.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
+              `Conversation ${sourceJob!.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
                 "Concurrent recovery and submission targeting the same ChatGPT thread are not allowed.",
             );
           }
+          conversationLeaseAcquired = true;
+
+          // Now create the child job (only after all leases acquired)
+          const childJob = await createJob(
+            childJobId!,
+            {
+              prompt: "(recovery)",
+              files: ["./recovery-placeholder"],
+              selection: { provider: "chatgpt", preset: "thinking_extended" },
+              chatUrl: sourceJob!.chatUrl,
+              requestSource: "tool",
+            },
+            projectCwd,
+            originSessionFile,
+            config,
+            runtime,
+            { initialState: "submitted", createdAt: admittedAt },
+          );
+          const recoveryJob = {
+            ...childJob,
+            jobKind: "recovery" as const,
+            recoveryOfJobId: sourceJob!.id,
+            recoverySource: {
+              jobId: sourceJob!.id,
+              sourceCreatedAt: sourceJob!.createdAt,
+              conversationId: sourceJob!.conversationId,
+              chatUrl: sourceJob!.chatUrl || "",
+              anchor: childAnchor,
+            },
+          };
+          await writeJob(recoveryJob);
+
+          // Spawn the worker
+          spawnedWorker = await spawnWorker(workerPath, childJobId!);
+          workerSpawned = true;
+          const worker = spawnedWorker;
+          await updateJob(childJobId!, (current) => ({
+            ...current,
+            workerPid: worker.pid,
+            workerNonce: worker.nonce,
+            workerStartedAt: worker.startedAt,
+          }));
         });
 
-        // Step 5: Spawn worker
-        const spawnedWorker = await spawnWorker(workerPath, childJobId);
         const result = {
-          id: childJobId,
+          id: childJobId!,
           status: "submitted" as const,
-          sourceJobId: sourceJob.id,
-          sourceJobStatus: sourceJob.status,
-          conversationId: sourceJob.conversationId,
-          chatUrl: sourceJob.chatUrl,
-          orphanWorker: spawnedWorker,
+          sourceJobId: sourceJob!.id,
+          sourceJobStatus: sourceJob!.status,
+          conversationId: sourceJob!.conversationId,
+          chatUrl: sourceJob!.chatUrl,
         };
         return { content: [{ type: "text" as const, text: formatOracleRecoverResponse(result) }], details: result };
       } catch (error) {
+        if (spawnedWorker) {
+          await terminateWorkerPid(spawnedWorker.pid, spawnedWorker.startedAt).catch(() => undefined);
+        }
+        if (childJobId) {
+          const latest = readJob(childJobId);
+          if (latest && !isTerminalOracleJob(latest)) {
+            await updateJob(childJobId, (current) => transitionOracleJobPhase(current, "failed", {
+              at: new Date().toISOString(),
+              source: "oracle:recover",
+              message: `Recovery failed before durable worker handoff: ${getErrorMessage(error)}`,
+              patch: { error: getErrorMessage(error) },
+            })).catch(() => undefined);
+          }
+        }
+        const cleanupReport = await cleanupRuntimeArtifacts({
+          runtimeId: runtimeLeaseAcquired && runtime ? runtime.runtimeId : undefined,
+          runtimeProfileDir: runtimeLeaseAcquired && runtime ? runtime.runtimeProfileDir : undefined,
+          runtimeSessionName: workerSpawned && runtime ? runtime.runtimeSessionName : undefined,
+          conversationId: conversationLeaseAcquired ? sourceJob?.conversationId : undefined,
+        }).catch(() => ({ attempted: [], warnings: [] }));
+        if (childJobId && cleanupReport.warnings.length > 0) {
+          await appendCleanupWarnings(childJobId, cleanupReport.warnings).catch(() => undefined);
+        }
         return buildOracleToolErrorResult("oracle_recover", error, {});
       }
     },

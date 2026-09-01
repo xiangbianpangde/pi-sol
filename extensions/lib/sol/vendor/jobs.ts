@@ -148,7 +148,7 @@ export interface OracleJob {
   selection: OracleResolvedSelection;
   extensionProvenance?: OracleExtensionProvenance;
   followUpToJobId?: string;
-  jobKind?: "submission" | "recovery";
+  jobKind: "submission" | "recovery";
   recoveryOfJobId?: string;
   recoverySource?: {
     jobId: string;
@@ -958,7 +958,7 @@ export async function createJob(
   originSessionFile: string | undefined,
   config: OracleConfig,
   runtime: OracleRuntimeAllocation,
-  options?: { initialState?: "queued" | "submitted"; createdAt?: string },
+  options?: { initialState?: "queued" | "submitted"; createdAt?: string; jobKind?: "submission" | "recovery" },
 ): Promise<OracleJob> {
   const jobDir = getJobDir(id);
   const logsDir = join(jobDir, "logs");
@@ -1000,7 +1000,7 @@ export async function createJob(
     selection: input.selection,
     extensionProvenance: readExtensionProvenance(cwd),
     followUpToJobId: input.followUpToJobId,
-  jobKind: undefined,
+    jobKind: options?.jobKind ?? "submission",
     chatUrl: input.chatUrl,
     conversationId,
     responseFormat: "text/plain",

@@ -14,14 +14,16 @@ import { describe, it } from "node:test";
 import { ensureSolOraclePatches, SOL_PATCH_FILE, SOL_PATCH_MARKERS } from "../lib/sol/patches.ts";
 
 const VENDOR = join(dirname(fileURLToPath(import.meta.url)), "../lib/sol/vendor");
-const WORKER_FILES = ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs"];
+const WORKER_FILES = ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs", "tools.ts", "jobs.ts"];
 
 function fakeOracleRoot(version = "0.7.20") {
 	const root = mkdtempSync(join(tmpdir(), "sol-oracle-"));
 	const worker = join(root, "extensions/oracle/worker");
+	const lib = join(root, "extensions/oracle/lib");
 	mkdirSync(worker, { recursive: true });
+	mkdirSync(lib, { recursive: true });
 	writeFileSync(join(root, "package.json"), JSON.stringify({ name: "pi-oracle", version }));
-	return { root, worker };
+	return { root, worker, lib };
 }
 
 /** Temp vendor dir seeded from the real vendor copies (patch file included). */
@@ -34,9 +36,12 @@ function fakeVendorDir() {
 }
 
 /** Worker files as pristine upstream: vendor content with the patch reversed. */
-function writePristineWorker(root, worker, vendor) {
-	for (const name of WORKER_FILES) {
+function writePristineWorker(root, worker, vendor, lib = join(root, "extensions/oracle/lib")) {
+	for (const name of ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs"]) {
 		copyFileSync(join(vendor, name), join(worker, name));
+	}
+	for (const name of ["tools.ts", "jobs.ts"]) {
+		copyFileSync(join(vendor, name), join(lib, name));
 	}
 	const reversed = spawnSync(
 		"patch",
@@ -46,13 +51,41 @@ function writePristineWorker(root, worker, vendor) {
 	assert.equal(reversed.status, 0, `patch -R failed: ${reversed.stderr}`);
 }
 
+function writePristineLib(root, lib, vendor) {
+	for (const name of ["tools.ts", "jobs.ts"]) {
+		copyFileSync(join(vendor, name), join(lib, name));
+	}
+	// Reverse the patch on a temp tree containing all WORKER_RELATIVE_FILES
+	// (lib files matter, worker files are stubs so patch -R succeeds).
+	const tmp = mkdtempSync(join(tmpdir(), "sol-pristine-lib-"));
+	try {
+		mkdirSync(join(tmp, "extensions/oracle/lib"), { recursive: true });
+		mkdirSync(join(tmp, "extensions/oracle/worker"), { recursive: true });
+		copyFileSync(join(vendor, "tools.ts"), join(tmp, "extensions/oracle/lib/tools.ts"));
+		copyFileSync(join(vendor, "jobs.ts"), join(tmp, "extensions/oracle/lib/jobs.ts"));
+		// Worker file stubs: any content is fine since lib's hash is what we
+		// care about — patch -R will reverse the worker hunks too.
+		for (const name of ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs"]) {
+			copyFileSync(join(vendor, name), join(tmp, "extensions/oracle/worker", name));
+		}
+		const reversed = spawnSync("patch", ["-R", "-p1", "-s", "-t", "--no-backup-if-mismatch", "-d", tmp, "-i", join(vendor, SOL_PATCH_FILE)], { encoding: "utf8" });
+		assert.equal(reversed.status, 0, `patch -R (lib) failed: ${reversed.stderr}`);
+		copyFileSync(join(tmp, "extensions/oracle/lib/tools.ts"), join(lib, "tools.ts"));
+		copyFileSync(join(tmp, "extensions/oracle/lib/jobs.ts"), join(lib, "jobs.ts"));
+	} finally {
+		rmSync(tmp, { recursive: true, force: true });
+	}
+}
+
 describe("ensureSolOraclePatches", () => {
 	it("is a no-op when High/Power-slider markers are already present", () => {
-		const { root, worker } = fakeOracleRoot();
+		const { root, worker, lib } = fakeOracleRoot();
 		try {
 			copyFileSync(join(VENDOR, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
 			copyFileSync(join(VENDOR, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
 			copyFileSync(join(VENDOR, "run-job.mjs"), join(worker, "run-job.mjs"));
+			copyFileSync(join(VENDOR, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(VENDOR, "jobs.ts"), join(lib, "jobs.ts"));
 			const result = ensureSolOraclePatches({ root });
 			assert.equal(result.ok, true);
 			assert.equal(result.restored, false);
@@ -86,18 +119,25 @@ describe("ensureSolOraclePatches", () => {
 	});
 
 	it("refuses to overwrite a newer pi-oracle with 0.7.20 vendor files", () => {
-		const { root, worker } = fakeOracleRoot("0.8.0");
+		const { root, worker, lib } = fakeOracleRoot("0.8.0");
+		const vendor = fakeVendorDir();
 		try {
+			// Write worker files with upstream 0.8.0 content (patch will fail)
 			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
 			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
 			writeFileSync(join(worker, "run-job.mjs"), "UPSTREAM_0_8_0\n");
-			const result = ensureSolOraclePatches({ root });
+			// lib files must be pristine upstream so the authority hash gate
+			// passes and the patch application becomes the failure point.
+			writePristineLib(root, lib, vendor);
+			const result = ensureSolOraclePatches({ root, vendor });
 			assert.equal(result.ok, false);
 			assert.equal(result.restored, false);
 			assert.match(String(result.error), /0\.8\.0/);
+			assert.match(String(result.error), /patch/i);
 			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /UPSTREAM_0_8_0/);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
 		}
 	});
 
@@ -120,6 +160,8 @@ describe("ensureSolOraclePatches", () => {
 	it("ships vendor copies next to the extension", () => {
 		assert.equal(existsSync(join(VENDOR, "run-job.mjs")), true);
 		assert.equal(existsSync(join(VENDOR, "chatgpt-ui-helpers.mjs")), true);
+		assert.equal(existsSync(join(VENDOR, "tools.ts")), true);
+		assert.equal(existsSync(join(VENDOR, "jobs.ts")), true);
 		assert.equal(existsSync(join(VENDOR, SOL_PATCH_FILE)), true);
 	});
 
@@ -153,12 +195,15 @@ describe("ensureSolOraclePatches", () => {
 	});
 
 	it("fails loudly when the patch does not apply to a newer pi-oracle", () => {
-		const { root, worker } = fakeOracleRoot("0.8.0");
+		const { root, worker, lib } = fakeOracleRoot("0.8.0");
 		const vendor = fakeVendorDir();
 		try {
 			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
 			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
 			writeFileSync(join(worker, "run-job.mjs"), "UPSTREAM_0_8_0\n");
+			// lib files must be pristine upstream so the authority hash gate
+			// passes and the patch application becomes the failure point.
+			writePristineLib(root, lib, vendor);
 			const result = ensureSolOraclePatches({ root, vendor });
 			assert.equal(result.ok, false);
 			assert.equal(result.restored, false);
@@ -200,14 +245,16 @@ describe("ensureSolOraclePatches", () => {
 	});
 
 	it("detects that a round-5 helper (no ROLE_WITH_REF) is missing the audit round 6 marker", () => {
-		const { root, worker } = fakeOracleRoot();
+		const { root, worker, lib } = fakeOracleRoot();
 		const vendor = fakeVendorDir();
 		try {
 			// Seed the worker with current vendor copies (as an installed,
 			// previously-patched worker would have), then strip ROLE_WITH_REF to
 			// simulate a round-5 helper. run-job keeps all markers so only the
 			// missing helper marker can drive redeploy.
-			for (const name of WORKER_FILES) copyFileSync(join(vendor, name), join(worker, name));
+			for (const name of ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs"]) copyFileSync(join(vendor, name), join(worker, name));
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
 			const fullHelpers = readFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "utf8");
 			const oldHelpers = fullHelpers.replace(/const ROLE_WITH_REF[^;]+;/, "");
 			assert.notEqual(oldHelpers, fullHelpers, "fixture must actually strip ROLE_WITH_REF");

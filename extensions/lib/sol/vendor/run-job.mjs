@@ -2598,7 +2598,42 @@ async function run() {
     if (currentJob.jobKind === "recovery") {
       const anchor = currentJob.recoverySource?.anchor;
       if (!anchor) throw new Error("Recovery job is missing its recoverySource anchor snapshot");
-      await log(`Recovery job ${currentJob.id}: opening conversation ${currentJob.conversationId || "(unknown)"} for read-only observation`);
+      const sourceConversationId = currentJob.recoverySource?.conversationId;
+      await log(`Recovery job ${currentJob.id}: opening conversation ${sourceConversationId || "(unknown)"} for read-only observation`);
+
+      // Identity guard: the conversation we actually opened must match the
+      // immutable recoverySource snapshot and the job-level conversationId.
+      // Prevents count-based recovery from returning a turn from a different
+      // or drifted conversation (manual regenerate/branch/edit).
+      const openedUrl = stripUrlQueryAndHash(await currentUrl(currentJob));
+      const openedConversationId = conversationIdFromUrl(openedUrl);
+      if (sourceConversationId && openedConversationId && openedConversationId !== sourceConversationId) {
+        throw new Error(
+          `Recovery conversation mismatch: opened ${openedConversationId} but recoverySource recorded ${sourceConversationId}. ` +
+            "Refusing to read a different conversation than the source job's.",
+        );
+      }
+      const jobConversationId = currentJob.conversationId;
+      if (jobConversationId && openedConversationId && openedConversationId !== jobConversationId) {
+        throw new Error(
+          `Recovery conversation mismatch: opened ${openedConversationId} but job records ${jobConversationId}. ` +
+            "Refusing to read a drifted conversation.",
+        );
+      }
+      // Baseline hash guard: when the source conversation already had an
+      // assistant turn before send, verify the last pre-send message matches
+      // the recorded hash so a changed conversation cannot shift the count.
+      if (anchor.baselineAssistantCount > 0 && anchor.baselineLastAssistantHash) {
+        const baselineMessages = await assistantMessages(currentJob);
+        const lastBaselineText = baselineMessages[anchor.baselineAssistantCount - 1]?.text || "";
+        if (lastBaselineText && hashText(lastBaselineText) !== anchor.baselineLastAssistantHash) {
+          throw new Error(
+            "Recovery baseline mismatch: the last assistant message before the source send no longer matches the recorded hash. " +
+              "The conversation may have been edited or regenerated; refusing count-based recovery.",
+          );
+        }
+      }
+      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount}`);
       currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
         at: new Date().toISOString(),
         source: "oracle:worker",
@@ -2645,8 +2680,13 @@ async function run() {
     const baselineLastText = baselineMessages.at(-1)?.text || "";
     const baselineCopyCount = countChatGptCopyControls(await snapshotText(currentJob));
     await log(`Assistant response count before send: ${baselineAssistantCount}`);
-    await clickSend(currentJob, baselineAssistantCount);
-    await log(`Send accepted; recording recovery anchor`);
+
+    // Phase 1 — arm the anchor before send: baseline, prompt hash, armedAt.
+    // This covers the crash window between send acceptance and the first
+    // durable anchor write. If the worker dies between clickSend acceptance
+    // and the Phase 2 commit, the recovery child can still find the baseline
+    // and open the conversation by URL (conversationId is optional at this
+    // stage — the recovery child resolves it from the chat URL).
     await mutateJob((job) => ({
       ...job,
       recoverySource: {
@@ -2658,17 +2698,35 @@ async function run() {
           conversationId: job.conversationId,
           chatUrl: job.chatUrl,
           armedAt: new Date().toISOString(),
-          sendAcceptedAt: new Date().toISOString(),
         },
       },
     }));
-    await log(`Recovery anchor recorded (baseline assistant count: ${baselineAssistantCount})`);
-    await sleep(POST_SEND_SETTLE_MS);
+    await log(`Pre-send anchor armed (baseline assistant count: ${baselineAssistantCount})`);
 
+    await clickSend(currentJob, baselineAssistantCount);
+
+    // Phase 2 — commit the anchor with sendAcceptedAt and the first available
+    // conversation identity. Do this immediately after send acceptance, before
+    // any sleep or URL stabilization, to narrow the crash window to the
+    // absolute minimum.
     const observedChatUrl = isGrokJob(currentJob)
       ? stripUrlQueryAndHash(await currentUrl(currentJob))
       : await waitForStableChatUrl(currentJob, currentJob.chatUrl);
     const observedConversationId = conversationIdFromUrl(observedChatUrl) || currentJob.conversationId;
+    await mutateJob((job) => ({
+      ...job,
+      recoverySource: {
+        ...(job.recoverySource || {}),
+        anchor: {
+          ...(job.recoverySource?.anchor || {}),
+          sendAcceptedAt: new Date().toISOString(),
+          conversationId: observedConversationId || job.conversationId,
+          chatUrl: observedChatUrl || job.chatUrl,
+        },
+      },
+    }));
+    await log(`Recovery anchor committed (sendAccepted, conversation: ${observedConversationId || "(observing)"})`);
+
     const awaitingResponsePatch = {
       heartbeatAt: new Date().toISOString(),
       ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),

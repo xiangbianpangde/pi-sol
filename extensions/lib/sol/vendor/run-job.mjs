@@ -2052,25 +2052,23 @@ async function conversationTurnRecords(job) {
         text = text.split('\\n').map(l => l.trimEnd()).filter(l => l.trim() && !/^Thought for\\b/i.test(l.trim())).join('\\n').trim();
         return text;
       };
+      // Canonical merge: each candidate node resolves to its logical message
+      // container via closest(), so a role container + message-id child +
+      // testid all collapse into ONE record. Id-less records are rejected.
       const seenIds = new Set();
+      const seenContainers = new Set();
       const records = [];
       for (const node of document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]')) {
-        let role = roleOf(node);
-        let id = node.getAttribute('data-message-id') || '';
-        if (!id || !role) {
-          let cur = node.parentElement;
-          while (cur && cur !== document.body) {
-            const r = roleOf(cur);
-            const cid = cur.getAttribute('data-message-id') || '';
-            if (r !== '') role = r || role;
-            if (cid) id = cid;
-            if (role && id) break;
-            cur = cur.parentElement;
-          }
-        }
+        const container = node.closest('[data-message-author-role], [data-message-id]') || node;
+        if (seenContainers.has(container)) continue;
+        const role = roleOf(container);
+        const id = container.getAttribute('data-message-id') || '';
         if (!role || (role !== 'user' && role !== 'assistant')) continue;
-        if (id) { if (seenIds.has(id)) continue; seenIds.add(id); }
-        records.push({ role, id, text: renderText(node) });
+        if (!id) continue; // a logical message must have an id to be addressable
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        seenContainers.add(container);
+        records.push({ role, id, text: renderText(container) });
       }
       return { records };
     `),
@@ -2678,9 +2676,21 @@ async function run() {
           );
         }
       }
-      // submittedPromptHash binding (fail-closed): the target assistant reply
-      // MUST follow a user turn that is readable and whose content matches the
-      // prompt the source job submitted. Unreadable or unmatched = reject.
+      await log(`Recovery identity verified: conversation=${openedConversationId || "(unverifiable)"} baseline=${anchor.baselineAssistantCount}`);
+      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
+        at: new Date().toISOString(),
+        source: "oracle:worker",
+        message: "Opening the existing conversation to recover the completed assistant response.",
+        patch: { heartbeatAt: new Date().toISOString() },
+      }));
+      const completion = await waitForRecoveredAssistant(currentJob, Number(anchor.baselineAssistantCount || 0));
+
+      // submittedPromptHash binding (fail-closed): AFTER the target assistant
+      // reply has been observed, verify it follows a user turn that is
+      // readable and whose content matches the source prompt. Running this
+      // before the observation wait would fail early on the most typical
+      // crash window (send accepted -> worker died before the assistant turn
+      // mounted). Unreadable or unmatched = reject (audit P2-R6-NEW-2).
       if (anchor.submittedPromptHash) {
         const promptProbe = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => ({ ok: false, reason: "eval error" }));
         if (!promptProbe || promptProbe.ok !== true) {
@@ -2696,14 +2706,6 @@ async function run() {
           );
         }
       }
-      await log(`Recovery identity verified: conversation=${openedConversationId || "(unverifiable)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
-      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
-        at: new Date().toISOString(),
-        source: "oracle:worker",
-        message: "Opening the existing conversation to recover the completed assistant response.",
-        patch: { heartbeatAt: new Date().toISOString() },
-      }));
-      const completion = await waitForRecoveredAssistant(currentJob, Number(anchor.baselineAssistantCount || 0));
       currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "extracting_response", {
         at: new Date().toISOString(),
         source: "oracle:worker",

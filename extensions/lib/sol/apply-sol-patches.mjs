@@ -84,6 +84,14 @@ export const SOL_PATCH_MARKERS = {
 		// treat a recovery job as a normal submit and send a new turn).
 		"async function waitForRecoveredAssistant",
 		"Recovery job is missing its recoverySource anchor snapshot",
+		// Audit round 2026-09-01 round 6/7: the canonical logical-turn parser
+		// revision (closest() merge + messageId dedup) must force redeploy of
+		// any worker that still carries the round-5 ordinal-parser body. The
+		// closest-merge line is absent from round-5 workers, so its marker
+		// reliably distinguishes the new parser domain.
+		"const container = node.closest('[data-message-author-role], [data-message-id]') || node;",
+		"no unambiguous user predecessor: target index",
+		"closest() ancestor merge",
 	],
 	lib: [
 		// Audit round 2026-09-01 oracle_recover: old lib files without the

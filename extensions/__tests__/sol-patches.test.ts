@@ -456,3 +456,37 @@ describe("vendor digest + authority gates (audit round 4)", () => {
 		}
 	});
 });
+
+describe("canonical parser redeploy markers (audit round 6/7)", () => {
+	it("ships the canonical closest-merge parser marker in the vendored worker", () => {
+		const runJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
+		// The canonical logical-turn parser revision must be distinguishable by
+		// marker so an already-installed round-5 worker gets redeployed (P1-R6-NEW-1).
+		assert.match(runJob, /node\.closest\('\[data-message-author-role\], \[data-message-id\]'\)/);
+		assert.match(runJob, /no unambiguous user predecessor/);
+		assert.match(runJob, /closest\(\) ancestor merge/);
+	});
+
+	it("rejects a worker that only has the old recovery markers but lacks the canonical parser marker (P1-R6-NEW-1)", () => {
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			// Simulate an installed round-5 worker: has waitForRecoveredAssistant
+			// but NOT the canonical closest-merge parser body.
+			const round5runJob = readFileSync(join(vendor, "run-job.mjs"), "utf8").replace(/node\.closest\('\[data-message-author-role\], \[data-message-id\]'\) \|\| node;/, "let container = node;");
+			writeFileSync(join(worker, "run-job.mjs"), round5runJob);
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true);
+			// The restored worker must contain the canonical parser marker again.
+			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /node\.closest\('\[data-message-author-role\], \[data-message-id\]'\)/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+});

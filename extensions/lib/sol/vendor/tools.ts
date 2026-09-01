@@ -1250,17 +1250,31 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
         // use exactly one canonical { conversationId, chatUrl } (audit
         // P1-NEW-2 / P2-N1).
         const anchorIdentity = sourceJob.recoveryAnchor;
+        // Canonical conversation identity resolution (audit P1-NEW-2):
+        // reuse resolveChatGptConversationReference which handles BOTH
+        // raw conversation IDs (via CHATGPT_CONVERSATION_ID_PATTERN) and
+        // chat URLs (host + /c/ parse), and THROWS on non-empty invalid
+        // claims instead of silently dropping them. Every present claim
+        // participates; conflicting distinct IDs are rejected.
         const candidateIds = new Set<string>();
-        const addCandidateId = (value: string | undefined | null) => {
+        const claimFields: Array<[string, string | undefined | null]> = [
+          ["conversationId", sourceJob.conversationId],
+          ["recoveryAnchor.conversationId", anchorIdentity?.conversationId],
+          ["chatUrl", sourceJob.chatUrl],
+          ["recoveryAnchor.chatUrl", anchorIdentity?.chatUrl],
+        ];
+        for (const [label, value] of claimFields) {
           const trimmed = typeof value === "string" ? value.trim() : "";
-          if (!trimmed) return;
-          const parsed = parseConversationId(trimmed);
-          if (parsed) candidateIds.add(parsed);
-        };
-        addCandidateId(sourceJob.conversationId);
-        addCandidateId(anchorIdentity?.conversationId);
-        addCandidateId(sourceJob.chatUrl);
-        addCandidateId(anchorIdentity?.chatUrl);
+          if (!trimmed) continue;
+          const resolved = resolveChatGptConversationReference(trimmed, config);
+          if (!resolved) {
+            throw new Error(
+              `Source job ${sourceJob.id} has an unresolvable ${label} claim: "${trimmed}". ` +
+                "Cannot determine which conversation to recover.",
+            );
+          }
+          candidateIds.add(resolved.conversationId);
+        }
         const canonicalIds = [...candidateIds];
         if (canonicalIds.length === 0) {
           throw new Error(

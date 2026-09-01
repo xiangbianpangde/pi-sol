@@ -1856,48 +1856,12 @@ async function uploadArchive(job) {
 }
 
 async function assistantMessages(job) {
+  // Delegates to the canonical conversationTurnRecords parser so that
+  // baseline counting (submit), prompt proof (recovery), and target
+  // extraction (recovery) share exactly the same record/index/text domain.
   if (isGrokJob(job)) return grokAssistantMessages(job);
-  const result = await evalPage(
-    job,
-    toJsonScript(`
-      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
-        .filter((el) => (el.textContent || '').trim() === 'ChatGPT said:');
-      const renderText = (node) => {
-        if (!node) return '';
-        const clone = node.cloneNode(true);
-        const host = document.createElement('div');
-        host.style.position = 'fixed';
-        host.style.left = '-99999px';
-        host.style.top = '0';
-        host.style.whiteSpace = 'pre-wrap';
-        host.style.pointerEvents = 'none';
-        host.appendChild(clone);
-        document.body.appendChild(host);
-        let text = (host.innerText || host.textContent || '').trim();
-        host.remove();
-        const endings = ['\\nChatGPT can make mistakes. Check important info.'];
-        for (const ending of endings) {
-          if (text.includes(ending)) text = text.split(ending)[0].trim();
-        }
-        text = text
-          .split('\\n')
-          .map((line) => line.trimEnd())
-          .filter((line) => line.trim() && !/^Thought for\\b/i.test(line.trim()))
-          .join('\\n')
-          .trim();
-        return text;
-      };
-      const headingMessages = headings.map((heading) => ({ text: renderText(heading.nextElementSibling) }));
-      const messageNodes = Array.from(document.querySelectorAll('[data-testid="assistant-message"], [data-message-author-role="assistant"]'));
-      const nodeMessages = messageNodes.map((node) => ({ text: renderText(node) }));
-      return {
-        messages: headingMessages.some((message) => message.text) ? headingMessages : nodeMessages,
-      };
-    `),
-  );
-
-  if (!Array.isArray(result?.messages)) return [];
-  return result.messages.map((message) => ({ text: typeof message?.text === "string" ? message.text : "" }));
+  const records = await conversationTurnRecords(job);
+  return records.filter((r) => r.role === "assistant").map((r) => ({ text: r.text }));
 }
 
 async function grokAssistantMessages(job) {
@@ -2066,24 +2030,47 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
 }
 
 async function conversationTurnRecords(job) {
-  // Unified logical turn parser: deduplicates by messageId so the same
-  // logical message (role container + message-id child + testid) produces
-  // exactly one record. Used for baseline hash, prompt hash, and target
-  // assistant identity — all share the same record/index domain.
+  // Canonical logical turn parser: merges role container + message-id child +
+  // testid into ONE record per logical message via closest() ancestor merge
+  // + messageId dedup. Uses the same renderText normalization as the original
+  // assistantMessages so baseline hashes, prompt proof, and target extraction
+  // all share the exact same text/record/index domain.
   const result = await evalPage(
     job,
     toJsonScript(`
-      const seen = new Set();
+      const roleOf = (n) => n.getAttribute('data-message-author-role') || (n.getAttribute('data-testid') || '').replace('-message', '') || '';
+      const renderText = (n) => {
+        if (!n) return '';
+        const clone = n.cloneNode(true);
+        const host = document.createElement('div');
+        host.style.position = 'fixed'; host.style.left = '-99999px'; host.style.top = '0';
+        host.style.whiteSpace = 'pre-wrap'; host.style.pointerEvents = 'none';
+        host.appendChild(clone); document.body.appendChild(host);
+        let text = (host.innerText || host.textContent || '').trim(); host.remove();
+        const endings = ['\\nChatGPT can make mistakes. Check important info.'];
+        for (const e of endings) { if (text.includes(e)) text = text.split(e)[0].trim(); }
+        text = text.split('\\n').map(l => l.trimEnd()).filter(l => l.trim() && !/^Thought for\\b/i.test(l.trim())).join('\\n').trim();
+        return text;
+      };
+      const seenIds = new Set();
       const records = [];
       for (const node of document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]')) {
-        const role = node.getAttribute('data-message-author-role') || (node.getAttribute('data-testid') || '').replace('-message', '') || '';
-        const id = node.getAttribute('data-message-id') || '';
-        if (id && seen.has(id)) continue;
-        const text = (node.innerText || node.textContent || '').trim();
+        let role = roleOf(node);
+        let id = node.getAttribute('data-message-id') || '';
+        if (!id || !role) {
+          let cur = node.parentElement;
+          while (cur && cur !== document.body) {
+            const r = roleOf(cur);
+            const cid = cur.getAttribute('data-message-id') || '';
+            if (r !== '') role = r || role;
+            if (cid) id = cid;
+            if (role && id) break;
+            cur = cur.parentElement;
+          }
+        }
         if (!role || (role !== 'user' && role !== 'assistant')) continue;
-        if (!text) continue;
-        if (id) seen.add(id);
-        records.push({ role: role, id: id, text: text });
+        if (id) { if (seenIds.has(id)) continue; seenIds.add(id); }
+        records.push({ role, id, text: renderText(node) });
       }
       return { records };
     `),
@@ -2092,34 +2079,23 @@ async function conversationTurnRecords(job) {
 }
 
 async function promptFromConversationUserTurn(job, responseIndex) {
-  // Read the user message that precedes the target assistant reply at
-  // responseIndex in the unified conversationTurnRecords domain. Both
-  // baseline counting and prompt lookup share the same parser, so the
-  // index maps one-to-one to the same logical assistant turn.
-  // Returns { ok: true, text } on an unambiguous predecessor, or
-  // { ok: false, reason } — the caller MUST reject on ok:false (fail-closed).
+  // Canonical predecessor: uses the unified conversationTurnRecords domain
+  // shared with baseline counting and target extraction. The element
+  // immediately before the target record MUST be a user (adjacency check
+  // — another assistant between user and target is rejected).
   const idx = Number(responseIndex);
   const records = await conversationTurnRecords(job);
   const assistantRecords = records.filter((r) => r.role === "assistant");
   const target = assistantRecords[idx] || null;
   if (!target) return { ok: false, reason: "no assistant record at index " + idx };
-  const userRecords = records.filter((r) => r.role === "user");
-  // Immediate predecessor: the user record closest to target without exceeding it.
-  // In the unified records, user and assistant are interleaved in DOM order.
-  const userBeforeTarget = userRecords.filter((r) => {
-    const targetIdx = records.indexOf(target);
-    const userIdx = records.indexOf(r);
-    return userIdx < targetIdx;
-  });
-  const immediate = userBeforeTarget.length > 0 ? userBeforeTarget[userBeforeTarget.length - 1] : null;
-  if (!immediate) return { ok: false, reason: "no user record precedes target assistant at index " + idx };
-  // Ambiguity check: if there are multiple user records with the same
-  // messageId, the dedup failed — reject.
-  const userTexts = new Set(records.filter((r) => r.role === "user").map((r) => r.id || r.text.slice(0, 40)));
-  if (userTexts.size !== records.filter((r) => r.role === "user").length) {
-    return { ok: false, reason: "ambiguous user records: duplicate messageId or identical text" };
+  const targetIdx = records.indexOf(target);
+  if (targetIdx < 0) return { ok: false, reason: "target not found in canonical records" };
+  const predecessor = records[targetIdx - 1];
+  if (!predecessor || predecessor.role !== "user") {
+    return { ok: false, reason: "no unambiguous user predecessor: target index " + targetIdx + " preceded by " + (predecessor ? predecessor.role : "(none)") };
   }
-  return { ok: true, text: immediate.text, messageId: immediate.id };
+  if (!predecessor.text) return { ok: false, reason: "predecessor user record has empty text" };
+  return { ok: true, text: predecessor.text, messageId: predecessor.id };
 }
 
 async function waitForRecoveredAssistant(job, baselineAssistantCount) {
@@ -2790,9 +2766,11 @@ async function run() {
     await clickSend(currentJob, baselineAssistantCount);
 
     // Phase 2 — commit the anchor with sendAcceptedAt and the first available
-    // conversation identity. Do this immediately after send acceptance, before
-    // any sleep or URL stabilization, to narrow the crash window to the
-    // absolute minimum.
+    // conversation identity. The waitForStableChatUrl below resolves the
+    // conversation URL; there is no extra artificial sleep before it.
+    // Recovery no longer requires sendAcceptedAt (Phase-1 armed anchor is
+    // sufficient for eligibility), so this is a best-effort durability
+    // improvement rather than a hard correctness requirement.
     const observedChatUrl = isGrokJob(currentJob)
       ? stripUrlQueryAndHash(await currentUrl(currentJob))
       : await waitForStableChatUrl(currentJob, currentJob.chatUrl);

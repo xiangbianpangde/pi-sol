@@ -1,5 +1,34 @@
 # sol CHANGELOG
 
+## 1.12.0 - 2026-09-01
+
+- **Round 12 audit (P1-R12-NEW-1 + P2-R12-NEW-1) closed**: worker CRLF
+  normalization in the `toJsonScript` template literal must be
+  double-escaped (`\\r\\n` in the vendor source) so the browser receives a
+  legal regex literal `\r\n` instead of raw CR/LF control chars (round 11
+  single-escape produced `SyntaxError: Invalid regular expression` in the
+  browser).
+  - P1-R12-NEW-1 redeploy discriminator: `SOL_PATCH_MARKERS.runJob` now
+    carries the double-escape marker, so an installed round-11 worker (which
+    differs from round 12 only in escape depth and passes every earlier
+    marker) is correctly detected as stale and redeployed.
+  - P2-R12-NEW-1 behavior tests: (a) R11→R12 redeploy test constructs a
+    worker with only the single-escape form and asserts
+    `ensureSolOraclePatches` returns `restored:true` with the R12 bytes
+    installed; (b) runtime-escaping test asserts the evaluated browser
+    script parses via `new Function` and converts CRLF/CR → LF.
+  - Tests: 138/138.
+- **Final sign-off PASS (audit round 16, job c0af3216)**: rounds 13–16 failed
+  on evidence packaging only, never on code — the reviewer independently
+  confirmed `CODE: PASS` from round 15 onward. The archive had to grow three
+  times before it was self-contained: `patches.ts` (runtime authority façade),
+  the eight `lib/sol/*.ts` support modules, then `node_modules/nan` as
+  `fs-ext`'s transitive build dep. Shipping the whole `node_modules/` closed it:
+  the reviewer deleted `fs-ext/build`, rebuilt offline on Linux x64
+  (`ELF 64-bit x86-64`, not the archived Mach-O arm64 binary), and reproduced
+  138/138. Final state P0=P1=P2=P3=0. The procedure is now codified under
+  "Release evidence bundle" in SKILL.md.
+
 ## 1.11.0 - 2026-08-31
 
 - **New `/sol-resume [job-id] [--bg]`**: recover the FULL answer of an

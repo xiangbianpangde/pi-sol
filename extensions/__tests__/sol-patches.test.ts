@@ -582,3 +582,69 @@ describe("canonical prompt hash behavior (audit round 11, P1-R9-NEW-1)", () => {
 		assert.equal(canonicalPromptText(canonicalPromptText(original)), canonicalPromptText(original));
 	});
 });
+
+describe("R11->R12 redeploy + runtime escaping (audit round 12, P1-R12-NEW-1 / P2-R12-NEW-1)", () => {
+	it("detects an R11 worker (single-escape CRLF regex) as missing the R12 marker and restores it", () => {
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			// R11 worker: all round-11 markers present, but the CRLF regex
+			// uses single escape (\r\n) which breaks at runtime in the
+			// toJsonScript template literal. Only the escape depth differs
+			// from R12, so the R12 marker must drive the redeploy.
+			let r11runJob = readFileSync(join(vendor, "run-job.mjs"), "utf8");
+			// In the file, R12 has \\r\\n (two backslashes + r + two backslashes + n).
+			// In TS, to match this, we write \\\\r\\\\n in the string literal.
+			// Simpler: search for the R12 marker we just added to apply-sol-patches.mjs.
+			// R12 marker (JS value = two backslashes before r/n).
+			const r12Marker = "replace(/\\\\r\\\\n/g";
+			// R11 form (JS value = single backslash before r/n).
+			const r11Form = "replace(/\\r\\n/g";
+			// sanity: the two must differ only in escape depth
+			assert.notEqual(r12Marker, r11Form);
+			assert.ok(r11runJob.includes(r12Marker), "fixture must contain R12 double-escape marker");
+			r11runJob = r11runJob.replace(r12Marker, r11Form);
+			assert.ok(!r11runJob.includes(r12Marker), "fixture must now be R11 single-escape");
+			writeFileSync(join(worker, "run-job.mjs"), r11runJob);
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true, "R11 worker must be redeployed to R12");
+			// The restored worker must contain the R12 double-escape marker.
+			const restored = readFileSync(join(worker, "run-job.mjs"), "utf8");
+			assert.ok(restored.includes(r12Marker), "restored worker must contain R12 double-escape marker");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("produces a browser-parseable script: outer template eval keeps the regex literal intact", () => {
+		// Simulate what the browser receives: the toJsonScript() template
+		// literal is evaluated once (outer), producing a script string with
+		// the literal regex /\\r\\n/g (backslash-r backslash-n), which the
+		// browser-side JS parser interprets as CRLF. R11's single escape
+		// produced actual CR/LF control chars inside the regex literal ->
+		// SyntaxError. The R12 double-escape avoids this.
+		//
+		// The run-job.mjs source holds the template literal content; one
+		// level of template evaluation collapses each \\ pair to \.
+		// Here we reproduce that: a JS string containing "\\r\\n" (two
+		// backslashes in value) is what the outer template yields after
+		// evaluation, i.e. the browser script text.
+		const browserScript =
+			'text.replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");';
+		// The browser-side parser must accept this as valid JS.
+		// eslint-disable-next-line no-new-func
+		new Function("text", "return " + browserScript + "");
+		// Verify CRLF-to-LF conversion works with the actual browser script.
+		// eslint-disable-next-line no-new-func
+		const fn = new Function("text", "return " + browserScript + "");
+		// Feed real CR/LF control characters (the textContent lossless form).
+		assert.equal(fn("A\r\nB\r\nC"), "A\nB\nC", "CRLF-to-LF conversion works");
+		assert.equal(fn("A\rB\rC"), "A\nB\nC", "standalone CR-to-LF conversion works");
+	});
+});

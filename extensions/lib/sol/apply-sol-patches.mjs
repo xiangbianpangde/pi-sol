@@ -104,6 +104,13 @@ export const SOL_PATCH_MARKERS = {
 		// the assistant-oriented renderText() trim/filter pipeline.
 		"Lossless extraction: textContent (not innerText)",
 		"const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');",
+		// Audit round 2026-09-01 round 12 (P1-R12-NEW-1): the CRLF->LF
+		// regex inside the toJsonScript template literal must be double-
+		// escaped (\\r\\n) so the browser receives a valid regex literal.
+		// R11 workers have single-escape (\r\n) which breaks at runtime.
+		// This marker distinguishes R12 from R11 (identical apart from
+		// the escape depth).
+		"replace(/\\\\r\\\\n/g",
 	],
 	lib: [
 		// Audit round 2026-09-01 oracle_recover: old lib files without the

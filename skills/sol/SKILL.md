@@ -3,7 +3,7 @@ name: sol
 description: Relay research and planning questions to ChatGPT web GPT-5.6 Sol High via /sol and pi-oracle. Use before solving hard problems, when the user runs /sol, or when the local model needs a web-Sol advisor. Never drive chatgpt.com with agent_browser.
 compatibility: Pi coding agent
 metadata:
-  version: "1.11.0"
+  version: "1.12.0"
   status: "active"
   layer: "task"
   priority: "30"
@@ -112,6 +112,7 @@ Outside-project files are copied to `.pi/sol-staging/<id>/` so `oracle_submit` c
 - `agent_browser` on ChatGPT is blocked on purpose; it would collide with the oracle worker session.
 - pi-oracle jobs live under `$PI_ORACLE_JOBS_DIR` or `/tmp/oracle-<id>/`.
 - If the worker says High is unavailable, stop and report that. Do not invent Instant/Medium as a silent fallback.
+- Before submitting, check system load (`uptime`, `ps`). On a loaded box the isolated Chrome can time out on page load, and a job can be accepted by ChatGPT yet fail the read with `os error 35` (daemon busy); `oracle_recover` then also refuses because no assistant reply exists yet, so the whole round is lost. Wait for quieter load instead of burning audit rounds.
 - After `pi update npm:pi-oracle` the installed worker loses the High/Power-slider patch. `/sol` restores it automatically; on a version change it re-applies `vendor/sol-high-power-slider.patch` to the new worker (auto-revendor, previous vendor kept in `vendor/previous/`). If the patch no longer applies cleanly, `ensureSolOraclePatches` fails loudly with the reject summary — stop and report that blocker; do not silently fall back or hand steps to the user. If you still see the old effort-dropdown error, restore it yourself with the apply script above — never hand that step to the user.
 
 ## Verification
@@ -122,3 +123,31 @@ Outside-project files are copied to `.pi/sol-staging/<id>/` so `oracle_submit` c
 - `agent_browser` open chatgpt.com is blocked
 - A `.exe` in `--files` is rejected before submit
 - `npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-trigger.test.ts` covers classifier normalization/signals/suppressors/vetoes (ruleset detect-v3); `sol-trigger-log.test.ts` covers default-path write (isolated HOME), off-disabling, redact-before-truncate, secret patterns, 0700/0600 create AND upgrade, ruleset stats isolation and version fields; `/sol-diag` shows live rows
+
+## Release evidence bundle
+
+When an audit needs a reviewer to reproduce the suite from the archive, ship the
+**whole `node_modules/`**, never an enumerated subset of source files. A picked
+subset keeps failing on module resolution one dependency at a time (this burned
+three audit rounds: the `patches.ts` façade, then eight `lib/sol/*.ts` modules,
+then `fs-ext`'s build dep `nan`). Closure-by-construction beats guessing.
+
+A native addon's prebuilt `.node` is not portable across OS/arch, so the archive
+carries the addon **source plus its build deps** and the target machine rebuilds.
+Fix the evidence bundle once, then let the reviewer prove it mechanically:
+
+```sh
+find . -name '._*' -type f -delete      # macOS tar emits AppleDouble from xattr
+rm -rf node_modules/fs-ext/build         # do not reuse a foreign native binary
+npm rebuild fs-ext --offline --cache=<empty-dir> --nodedir=<local-node-prefix>
+file node_modules/fs-ext/build/Release/fs_ext.node   # must match the host
+node --experimental-strip-types --test extensions/__tests__/*.test.ts
+```
+
+`--offline` against an empty cache is the actual closure test: any missing
+transitive dep surfaces as `Cannot find module 'nan'` or `ENOTCACHED` rather than
+silently passing. Expect `138 tests / 138 pass / 0 fail`. Host toolchain
+(Node headers, C/C++ compiler, Python/node-gyp) is a normal native-addon
+prerequisite, not a closure defect. `com.apple.provenance` is SIP-protected and
+cannot be stripped with `xattr -c`; AppleDouble noise is archive hygiene, never a
+blocker.

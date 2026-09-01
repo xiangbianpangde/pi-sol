@@ -1184,7 +1184,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
   pi.registerTool({
     name: "oracle_recover",
     label: "Oracle Recover",
-    description: "Read-only recovery of an interrupted ChatGPT conversation. Opens the existing conversation without sending a new user turn and returns the complete last assistant message. Only works for failed jobs whose send was accepted by the provider.",
+    description: "Read-only recovery of an interrupted ChatGPT conversation. Opens the existing conversation without sending a new user turn and returns the assistant reply associated with the interrupted source submission. Only works for failed jobs whose send was accepted by the provider.",
     promptSnippet: "Recover the full answer of an interrupted ChatGPT job.",
     promptGuidelines: [
       "Use oracle_recover when a previous oracle_submit job failed after the send was accepted (browser crash, CDP disconnect, stale worker). The ChatGPT web conversation completed the answer server-side; oracle_recover opens the conversation and reads the existing assistant message without sending anything new.",
@@ -1243,28 +1243,39 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
         // isRecoverableSourceJob already validated projectId, provider, conversation identity, and a Phase-1 armed anchor
 
         // Step 2b: Resolve the CANONICAL source conversation identity once.
-        // Precedence: top-level job identity -> recoveryAnchor identity ->
-        // recoverable URL parse. This single resolved identity is used for
-        // the conversation lease, the child job, the recoverySource
-        // provenance, cleanup, and the worker — so eligibility, child and
-        // worker can never disagree on which conversation is being recovered
-        // (audit P1-NEW-2 / P2-N1).
+        // All present identity claims (top-level job identity, recoveryAnchor
+        // identity, top-level chatUrl, recoveryAnchor chatUrl) are normalized
+        // to conversationIds and cross-validated. Conflicts are rejected, so
+        // eligibility, lease, child, recoverySource, cleanup and worker all
+        // use exactly one canonical { conversationId, chatUrl } (audit
+        // P1-NEW-2 / P2-N1).
         const anchorIdentity = sourceJob.recoveryAnchor;
-        // Precedence: top-level -> recoveryAnchor identity -> anchor URL
-        const resolvedConversationId = sourceJob.conversationId
-          ?? anchorIdentity?.conversationId
-          ?? undefined;
-        const resolvedChatUrl = sourceJob.chatUrl
-          ?? anchorIdentity?.chatUrl
-          ?? (resolvedConversationId
-            ? `${chatGptConversationOrigin(config)}/c/${resolvedConversationId}`
-            : undefined);
-        if (!resolvedConversationId && !resolvedChatUrl) {
+        const candidateIds = new Set<string>();
+        const addCandidateId = (value: string | undefined | null) => {
+          const trimmed = typeof value === "string" ? value.trim() : "";
+          if (!trimmed) return;
+          const parsed = parseConversationId(trimmed);
+          if (parsed) candidateIds.add(parsed);
+        };
+        addCandidateId(sourceJob.conversationId);
+        addCandidateId(anchorIdentity?.conversationId);
+        addCandidateId(sourceJob.chatUrl);
+        addCandidateId(anchorIdentity?.chatUrl);
+        const canonicalIds = [...candidateIds];
+        if (canonicalIds.length === 0) {
           throw new Error(
             `Source job ${sourceJob.id} has no resolvable conversation identity. ` +
               "Cannot open a conversation for recovery.",
           );
         }
+        if (canonicalIds.length > 1) {
+          throw new Error(
+            `Source job ${sourceJob.id} has conflicting conversation identities: ${canonicalIds.join(", ")}. ` +
+              "Refusing recovery because the source conversation cannot be uniquely determined.",
+          );
+        }
+        const resolvedConversationId = canonicalIds[0];
+        const resolvedChatUrl = `${chatGptConversationOrigin(config)}/c/${resolvedConversationId}`;
 
         // Step 3: Admission-first — acquire leases BEFORE creating the child job
         childJobId = randomUUID();

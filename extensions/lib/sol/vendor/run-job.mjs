@@ -2065,40 +2065,61 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
   throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
 }
 
-async function promptFromConversationUserTurn(job, responseIndex) {
-  // Read the user message that immediately precedes the target assistant
-  // reply at responseIndex, so the recovered answer can be bound to the
-  // submitted prompt. Uses a DOM-order turn stream with role + messageId so
-  // edits/regenerates/branches cannot silently shift the pairing.
-  // Returns { ok: true, text } on an unambiguous predecessor, or
-  // { ok: false, reason } — the caller MUST reject on ok:false (fail-closed).
-  const idx = Number(responseIndex);
+async function conversationTurnRecords(job) {
+  // Unified logical turn parser: deduplicates by messageId so the same
+  // logical message (role container + message-id child + testid) produces
+  // exactly one record. Used for baseline hash, prompt hash, and target
+  // assistant identity — all share the same record/index domain.
   const result = await evalPage(
     job,
     toJsonScript(`
-      const nodes = Array.from(document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]'));
-      const turns = nodes
-        .map((node, i) => {
-          const role = node.getAttribute('data-message-author-role') || (node.getAttribute('data-testid') || '').replace('-message', '') || '';
-          const id = node.getAttribute('data-message-id') || '';
-          const text = (node.innerText || node.textContent || '').trim();
-          return { role, id, text, domOrder: i };
-        })
-        .filter((t) => (t.role === 'user' || t.role === 'assistant') && t.text);
-      const assistantTurns = turns.filter((t) => t.role === 'assistant');
-      const target = assistantTurns[${idx}] || null;
-      if (!target) return { ok: false, reason: 'no assistant turn at index ' + ${idx} };
-      const predecessors = turns.filter((t) => t.domOrder < target.domOrder);
-      const userTurnsBefore = predecessors.filter((t) => t.role === 'user');
-      const immediate = userTurnsBefore.length > 0 ? userTurnsBefore[userTurnsBefore.length - 1] : null;
-      if (!immediate) return { ok: false, reason: 'no user turn precedes target assistant at index ' + ${idx} };
-      return { ok: true, text: immediate.text, messageId: immediate.id, domOrder: immediate.domOrder };
+      const seen = new Set();
+      const records = [];
+      for (const node of document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]')) {
+        const role = node.getAttribute('data-message-author-role') || (node.getAttribute('data-testid') || '').replace('-message', '') || '';
+        const id = node.getAttribute('data-message-id') || '';
+        if (id && seen.has(id)) continue;
+        const text = (node.innerText || node.textContent || '').trim();
+        if (!role || (role !== 'user' && role !== 'assistant')) continue;
+        if (!text) continue;
+        if (id) seen.add(id);
+        records.push({ role: role, id: id, text: text });
+      }
+      return { records };
     `),
   );
-  if (!result || result.ok !== true) {
-    return { ok: false, reason: typeof result?.reason === "string" ? result.reason : "unreadable turn stream" };
+  return Array.isArray(result?.records) ? result.records : [];
+}
+
+async function promptFromConversationUserTurn(job, responseIndex) {
+  // Read the user message that precedes the target assistant reply at
+  // responseIndex in the unified conversationTurnRecords domain. Both
+  // baseline counting and prompt lookup share the same parser, so the
+  // index maps one-to-one to the same logical assistant turn.
+  // Returns { ok: true, text } on an unambiguous predecessor, or
+  // { ok: false, reason } — the caller MUST reject on ok:false (fail-closed).
+  const idx = Number(responseIndex);
+  const records = await conversationTurnRecords(job);
+  const assistantRecords = records.filter((r) => r.role === "assistant");
+  const target = assistantRecords[idx] || null;
+  if (!target) return { ok: false, reason: "no assistant record at index " + idx };
+  const userRecords = records.filter((r) => r.role === "user");
+  // Immediate predecessor: the user record closest to target without exceeding it.
+  // In the unified records, user and assistant are interleaved in DOM order.
+  const userBeforeTarget = userRecords.filter((r) => {
+    const targetIdx = records.indexOf(target);
+    const userIdx = records.indexOf(r);
+    return userIdx < targetIdx;
+  });
+  const immediate = userBeforeTarget.length > 0 ? userBeforeTarget[userBeforeTarget.length - 1] : null;
+  if (!immediate) return { ok: false, reason: "no user record precedes target assistant at index " + idx };
+  // Ambiguity check: if there are multiple user records with the same
+  // messageId, the dedup failed — reject.
+  const userTexts = new Set(records.filter((r) => r.role === "user").map((r) => r.id || r.text.slice(0, 40)));
+  if (userTexts.size !== records.filter((r) => r.role === "user").length) {
+    return { ok: false, reason: "ambiguous user records: duplicate messageId or identical text" };
   }
-  return { ok: true, text: typeof result?.text === "string" ? result.text.trim() : "", messageId: result.messageId, domOrder: result.domOrder };
+  return { ok: true, text: immediate.text, messageId: immediate.id };
 }
 
 async function waitForRecoveredAssistant(job, baselineAssistantCount) {
@@ -2661,19 +2682,20 @@ async function run() {
           );
         }
       }
-      // Baseline hash guard (fail-closed): when the source conversation
-      // already had an assistant turn before send, the last pre-send message
-      // MUST be readable and MUST match the recorded hash.
+      // Baseline hash guard (fail-closed): uses the unified conversationTurnRecords
+      // parser (messageId-deduplicated) so the indexed assistant record is the same
+      // logical turn that promptFromConversationUserTurn uses for prompt matching.
       if (anchor.baselineAssistantCount > 0 && anchor.baselineLastAssistantHash) {
-        const baselineMessages = await assistantMessages(currentJob);
-        const lastBaselineText = baselineMessages[anchor.baselineAssistantCount - 1]?.text || "";
-        if (!lastBaselineText) {
+        const turnRecords = await conversationTurnRecords(currentJob);
+        const assistantRecords = turnRecords.filter((r) => r.role === "assistant");
+        const lastBaselineRecord = assistantRecords[anchor.baselineAssistantCount - 1] || null;
+        if (!lastBaselineRecord || !lastBaselineRecord.text) {
           throw new Error(
             "Recovery baseline unreadable: expected baseline assistant count " +
-              `${anchor.baselineAssistantCount} but the message could not be read. Refusing recovery.`,
+              `${anchor.baselineAssistantCount} but the logical turn record could not be resolved. Refusing recovery.`,
           );
         }
-        if (hashText(lastBaselineText) !== anchor.baselineLastAssistantHash) {
+        if (hashText(lastBaselineRecord.text) !== anchor.baselineLastAssistantHash) {
           throw new Error(
             "Recovery baseline mismatch: the last assistant message before the source send no longer matches the recorded hash. " +
               "The conversation may have been edited or regenerated; refusing count-based recovery.",

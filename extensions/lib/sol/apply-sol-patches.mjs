@@ -121,19 +121,20 @@ function readInstalledOracleVersion(root) {
 
 function readVendoredOracleVersion(vendor) {
 	const path = join(vendor, "ORACLE_VERSION");
-	if (!existsSync(path)) return VENDORED_ORACLE_VERSION;
-	const value = readFileSync(path, "utf8").trim();
-	return value || VENDORED_ORACLE_VERSION;
+	if (!existsSync(path)) return undefined;
+	return readFileSync(path, "utf8").trim() || undefined;
 }
 
 function computeVendorDigest(vendor) {
 	// Digest of the authority-sensitive vendor files AND the vendored version
 	// string, so tampering with ORACLE_VERSION cannot skip the revendor branch
 	// or route an old vendor set onto a newer pi-oracle (audit P2-N2).
-	const entries = { oracleVersion: readVendoredOracleVersion(vendor) };
+	const version = readVendoredOracleVersion(vendor);
+	if (!version) return undefined; // missing/unreadable ORACLE_VERSION — fail closed at verify
+	const entries = { oracleVersion: version };
 	for (const name of ["tools.ts", "jobs.ts"]) {
 		const path = join(vendor, name);
-		if (!existsSync(path)) return undefined; // missing vendor authority file — fail closed at verify
+		if (!existsSync(path)) return undefined;
 		entries[name] = sha256File(path);
 	}
 	return entries;
@@ -141,21 +142,25 @@ function computeVendorDigest(vendor) {
 
 function readVendorDigest(vendor) {
 	const path = join(vendor, ".vendor-digest");
-	if (!existsSync(path)) return undefined;
+	if (!existsSync(path)) return { ok: true, missing: true }; // genuinely absent — migration allowed
 	try {
-		return JSON.parse(readFileSync(path, "utf8"));
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		return { ok: true, stored: parsed };
 	} catch {
-		return undefined;
+		// Present but malformed must NOT be treated as missing (audit P2-NEW-2).
+		return { ok: false, error: `vendor .vendor-digest is malformed under ${vendor}; refusing to trust a corrupt digest` };
 	}
 }
 
 function verifyVendorDigest(vendor) {
 	const expected = computeVendorDigest(vendor);
 	if (!expected) {
-		return { ok: false, error: `vendor authority files missing under ${vendor}; refusing to trust an incomplete vendor set` };
+		return { ok: false, error: `vendor authority files missing or ORACLE_VERSION unreadable under ${vendor}; refusing to trust an incomplete vendor set` };
 	}
-	const stored = readVendorDigest(vendor);
-	if (!stored) return { ok: true, missing: true }; // pre-digest vendor — accepted, migration allowed
+	const digest = readVendorDigest(vendor);
+	if (!digest.ok) return digest; // malformed digest fails closed
+	if (digest.missing) return { ok: true, missing: true }; // pre-digest vendor — migration allowed
+	const stored = digest.stored;
 	for (const [name, hash] of Object.entries(expected)) {
 		if (stored[name] !== hash) {
 			return { ok: false, error: `vendor ${name} digest mismatch: expected ${stored[name] ?? "(missing)"}, got ${hash.slice(0, 12)}` };
@@ -165,11 +170,12 @@ function verifyVendorDigest(vendor) {
 }
 
 function ensureVendorDigest(vendor) {
-	// One-time migration for pre-digest vendors: write the current digest so
-	// future tampering is detectable. Never silently trusts a digest that is
-	// present but mismatched.
-	if (!readVendorDigest(vendor) && computeVendorDigest(vendor)) {
-		writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(computeVendorDigest(vendor)), "utf8");
+	// One-time migration: only when .vendor-digest is genuinely ABSENT.
+	// Malformed digests fail closed (verifyVendorDigest) and are never
+	// overwritten by migration.
+	if (!existsSync(join(vendor, ".vendor-digest"))) {
+		const computed = computeVendorDigest(vendor);
+		if (computed) writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(computed), "utf8");
 	}
 }
 
@@ -391,8 +397,13 @@ export function revendorSolOraclePatches(options = {}) {
 		for (const rel of WORKER_RELATIVE_FILES) {
 			copyFileSync(join(staging, rel), join(vendor, rel.split("/").pop()));
 		}
-		writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(computeVendorDigest(vendor)), "utf8");
 		writeFileSync(join(vendor, "ORACLE_VERSION"), `${installedVersion}\n`, "utf8");
+		// Write the digest AFTER ORACLE_VERSION is updated so the recorded
+		// oracleVersion matches the new version (audit P2-NEW-1). Otherwise
+		// the next ensure() would compute a different expected digest and
+		// fail closed forever after every real version upgrade.
+		const refreshedDigest = computeVendorDigest(vendor);
+		if (refreshedDigest) writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(refreshedDigest), "utf8");
 		return { ok: true, revendored: true, version: installedVersion, previousVersion: vendoredVersion };
 	} finally {
 		rmSync(staging, { recursive: true, force: true });

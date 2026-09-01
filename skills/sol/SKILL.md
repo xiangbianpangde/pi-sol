@@ -14,6 +14,8 @@ metadata:
 
 `/sol` is a thin relay to **ChatGPT web GPT-5.6 Sol High** (Plus maximum). Browser automation stays inside **pi-oracle**'s isolated worker. Local Pi only prepares context, submits, and brings the answer back.
 
+Source repository: **https://github.com/xiangbianpangde/pi-sol** — the dispatch prompt tells Sol to fetch the public repo when the archive is incomplete (no .git / partial tree), so it can inspect the full source tree and exact commit.
+
 ## When to Use
 
 - The user runs `/sol`, `/sol-followup`, `/sol-resume`, `/sol-read`, or `/sol-auth`

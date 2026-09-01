@@ -383,6 +383,14 @@ describe("jobs + prompt", () => {
 		assert.match(rule, /before giving a final conclusion/i);
 	});
 
+	it("standing rule and dispatch prompt carry the public repository URL", () => {
+		const rule = buildSolStandingRule();
+		assert.match(rule, /github.com\/xiangbianpangde\/pi-sol/);
+		const dispatch = buildSolDispatchPrompt({ command: "sol", prompt: "x", files: [], wait: true }, []);
+		assert.match(dispatch, /github.com\/xiangbianpangde\/pi-sol/);
+		assert.match(dispatch, /fetch the repository yourself/i);
+	});
+
 	it("parses /sol-resume with and without a job id", () => {
 		assert.deepEqual(parseSolInput("/sol-resume"), { command: "sol-resume", jobId: undefined, wait: true });
 		assert.deepEqual(parseSolInput("/sol-resume abc123 --bg"), { command: "sol-resume", jobId: "abc123", wait: false });

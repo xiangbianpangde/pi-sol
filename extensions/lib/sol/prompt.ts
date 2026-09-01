@@ -8,6 +8,7 @@ import {
 	SOL_PRESET,
 	SOL_PRESET_LABEL,
 	SOL_PROVIDER,
+	SOL_REPO_URL,
 	USER_STORAGE_GB,
 } from "./limits.ts";
 import type { ParsedSolInput, SolRequest } from "./parse.ts";
@@ -20,6 +21,7 @@ export function buildSolStandingRule(): string {
 		"Never open chatgpt.com, chat.openai.com, or auth.openai.com with agent_browser.",
 		`Default advisor model is ${SOL_PRESET_LABEL} via oracle_submit preset \`${SOL_PRESET}\`.`,
 		"High/Power-slider worker patches are auto-restored by /sol. Never ask the user to run apply scripts or pi update.",
+		`Source repository: ${SOL_REPO_URL}. When an oracle job's archive is incomplete, fetch the public repo yourself to inspect the full source tree and commit history.`,
 		"When the user is deciding between designs, plans, or trade-offs (or says 先问/sol / 优先咨询 / 参考/sol 再下结论), consult Sol FIRST and relay its advice, then wait for the user to reference Sol's view before giving a final conclusion. Do not conclude before the user has considered the Sol opinion.",
 	].join(" ");
 }
@@ -52,6 +54,8 @@ export function buildSolDispatchPrompt(input: Extract<ParsedSolInput, SolRequest
 	const isFollowUp = Boolean(followUpJobId);
 
 	return `You are the local relay for /sol — a thin wrapper over pi-oracle that talks to ChatGPT web GPT-5.6 Sol.
+
+Source repository (public): ${SOL_REPO_URL}. When the archive below lacks enough context (e.g. no .git, partial tree, or unlisted files), fetch the repository yourself to inspect the full source tree, exact commit, and history before judging.
 
 Do not answer the user's request yourself. Relay it to web GPT-5.6 Sol and bring the answer back.
 

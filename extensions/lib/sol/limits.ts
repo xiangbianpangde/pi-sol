@@ -6,6 +6,7 @@
 export const SOL_PRESET = "thinking_extended" as const;
 export const SOL_PRESET_LABEL = "GPT-5.6 Sol High";
 export const SOL_PROVIDER = "chatgpt" as const;
+export const SOL_REPO_URL = "https://github.com/xiangbianpangde/pi-sol";
 
 /** Paid ChatGPT rolling upload rate. Free is 3/day; we still cap a single /sol turn. */
 export const MAX_FILES_PER_REQUEST = 10;

@@ -376,6 +376,13 @@ describe("jobs + prompt", () => {
 		assert.match(buildSolStandingRule(), /Never ask the user to run apply scripts/);
 	});
 
+	it("standing rule encodes the consult-first workflow", () => {
+		const rule = buildSolStandingRule();
+		assert.match(rule, /consult Sol FIRST/i);
+		assert.match(rule, /wait for the user to reference Sol/i);
+		assert.match(rule, /before giving a final conclusion/i);
+	});
+
 	it("parses /sol-resume with and without a job id", () => {
 		assert.deepEqual(parseSolInput("/sol-resume"), { command: "sol-resume", jobId: undefined, wait: true });
 		assert.deepEqual(parseSolInput("/sol-resume abc123 --bg"), { command: "sol-resume", jobId: "abc123", wait: false });

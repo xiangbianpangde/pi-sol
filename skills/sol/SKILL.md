@@ -19,6 +19,7 @@ metadata:
 - The user runs `/sol`, `/sol-followup`, `/sol-resume`, `/sol-read`, or `/sol-auth`
 - Before implementing a hard design, you want a second opinion from web GPT-5.6 Sol
 - The user wants to stay in Pi instead of switching to chatgpt.com
+- The user is deciding between designs / plans / trade-offs, or says 先问/sol、优先咨询/sol、参考/sol 再下结论
 
 Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `chat.openai.com` with `agent_browser`.
 
@@ -36,6 +37,16 @@ Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `
 - Default is **synchronous**: wait for the Sol answer in this turn
 - `--bg` dispatches and stops; later `/sol-read`
 - `--files` is an explicit local file list, not a whole-repo archive
+
+## Consult-First Rule (second-opinion-first workflow)
+
+When the user is choosing between designs, plans, or trade-offs — or explicitly asks to 先问/sol / 优先咨询/sol / 参考/sol 再下结论:
+
+1. **Consult Sol first.** Relay the decision + your proposed options/analysis to web GPT-5.6 Sol High via `/sol` (or `oracle_submit` preset `thinking_extended`) before committing to a final position.
+2. **Bring Sol's advice back** and present it clearly to the user.
+3. **Wait for the user to reference Sol's view** before giving the final conclusion. Do not silently override or ignore the Sol opinion; if you disagree, say why, but only after the user has seen it.
+
+This is a standing preference, not a one-off request: it applies to design / plan / trade-off decisions going forward.
 
 ## Trigger Diagnostics (record-only)
 

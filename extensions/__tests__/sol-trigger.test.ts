@@ -152,6 +152,32 @@ describe("classifySolTrigger — suppressors", () => {
 	});
 });
 
+describe("classifySolTrigger — consult-first (second-opinion-first workflow)", () => {
+	it("detects 优先问 Sol 再下结论 as a strong signal", () => {
+		const c = classifySolTrigger("以后优先询问 /sol 的意见，然后我先参考 Sol 的建议，再给出结论");
+		assert.equal(c.candidate, true);
+		assert.ok(c.matches.some((m) => m.reason === "sol_consult_first"), `matches=${c.matches.map((m) => m.reason).join(",")}`);
+	});
+
+	it("detects 先参考 Sol 建议再决定", () => {
+		const c = classifySolTrigger("先参考 Sol 的建议再决定这个方案");
+		assert.equal(c.candidate, true);
+		assert.ok(c.matches.some((m) => m.reason === "sol_consult_first"));
+	});
+
+	it("detects consult Sol first (english)", () => {
+		const c = classifySolTrigger("Consult Sol first before we pick the architecture");
+		assert.equal(c.candidate, true);
+		assert.ok(c.matches.some((m) => m.reason === "sol_consult_first"));
+	});
+
+	it("consult-first is vetoed by explicit opt-out", () => {
+		const c = classifySolTrigger("以后优先询问 /sol 的意见？不了，不用问 Sol，本地处理就行。");
+		assert.equal(c.candidate, false);
+		assert.ok(c.suppressed.some((s) => s.reason === "explicit_optout"));
+	});
+});
+
 describe("classifySolTrigger — stability", () => {
 	it("same prompt yields same id", () => {
 		const a = classifySolTrigger("让 Sol 复核一下这个方案");

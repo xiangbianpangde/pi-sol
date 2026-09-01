@@ -20,6 +20,7 @@ export function buildSolStandingRule(): string {
 		"Never open chatgpt.com, chat.openai.com, or auth.openai.com with agent_browser.",
 		`Default advisor model is ${SOL_PRESET_LABEL} via oracle_submit preset \`${SOL_PRESET}\`.`,
 		"High/Power-slider worker patches are auto-restored by /sol. Never ask the user to run apply scripts or pi update.",
+		"When the user is deciding between designs, plans, or trade-offs (or says 先问/sol / 优先咨询 / 参考/sol 再下结论), consult Sol FIRST and relay its advice, then wait for the user to reference Sol's view before giving a final conclusion. Do not conclude before the user has considered the Sol opinion.",
 	].join(" ");
 }
 

@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import type { ParsedSolInput, SolCommandName } from "./parse.ts";
 
 /** Bump whenever POSITIVE_SIGNALS / NEGATIVE_SIGNALS / VETO_RULES / thresholds change. */
-export const DETECTOR_RULESET = "detect-v3";
+export const DETECTOR_RULESET = "detect-v4";
 
 export type SolDetectSignal = { reason: string; weight: number };
 export type SolDetectVeto = { reason: string; weight: number };
@@ -72,6 +72,7 @@ const NEAR_CONFIDENCE = 1.0;
 const VETO_SCORE = -100;
 
 const POSITIVE_SIGNALS: ReadonlyArray<SolDetectSignal & { re: RegExp; useBreaks?: boolean }> = [
+	{ reason: "sol_consult_first", weight: 2.5, re: /(?:优先|先).{0,8}(?:问|咨询|找|征求|询问|给|请教).{0,8}(?:[Ss]ol|[Gg][Pp][Tt]|[Cc]hat[Gg][Pp][Tt]|外部|外部意见)|(?:先参考|参考).{0,20}(?:建议|意见).{0,20}再(?:下|给出|做|给|决定)|(?:ask|consult).{0,20}(?:[Ss]ol|[Gg][Pp][Tt]).{0,20}(?:first|before|先|再)|(?:征求|征询|求).{0,8}(?:[Ss]ol|[Gg][Pp][Tt]|[Cc]hat[Gg][Pp][Tt]|外部|外部意见).{0,8}(?:建议|意见|看法)/i },
 	{ reason: "second_opinion", weight: 2.5, re: /(?:第二意见|second\s*opinion)|(?:让|叫|请|问问?)\s*(?:[Ss]ol|[Gg][Pp][Tt]|[Cc]hat[Gg][Pp][Tt])\b/ },
 	{ reason: "advisory_ask", weight: 1.5, re: /(?:复核|评估|评审|审查|论证|权衡|给(?:个|点|我)?建议|你怎么看|怎么看|如何抉择|抉择|选型|要不要|该不该|哪个更好|如何取舍|利弊|pros\s*and\s*cons|trade[- ]?offs?|weigh\b|advise|evaluate|review\b)/i },
 	{ reason: "decision_ask", weight: 1.5, re: /(?:应该|该选|推荐|更合适|选哪个|哪个更好|compare\b|vs\.?|versus|choose\b|which (?:should|is better)|should (?:we|i)\b|recommend\b|哪种|哪条|权衡.*(?:方案|路线|选择)|(?:方案|路线|选择).*权衡)/i },

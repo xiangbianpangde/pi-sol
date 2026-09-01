@@ -121,12 +121,18 @@ function hashText(text) {
 // closed at the prompt-proof step. The normalization mirrors what the DOM
 // renderer produces for a user turn body.
 function canonicalPromptText(text) {
-  return String(text || "")
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .filter((line) => line.trim() && !/^Thought for\b/i.test(line.trim()))
-    .join("\n")
-    .trim();
+  // Minimal-loss normalization for user-prompt identity (audit P1-R9-NEW-1):
+  // ONLY normalize platform representation differences that are guaranteed
+  // not to change prompt semantics (CRLF -> LF, strip a single BOM).
+  // Deliberately NOT done here:
+  //  - dropping blank lines (would merge distinct multi-paragraph prompts)
+  //  - stripping 'Thought for' lines (can be legitimate user text)
+  //  - trimEnd per line (would merge "line \n" and "line\n" distinctions)
+  // The DOM body extraction must therefore preserve the original text as
+  // closely as possible; see the user body selector below.
+  let normalized = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (normalized.charCodeAt(0) === 0xfeff) normalized = normalized.slice(1);
+  return normalized;
 }
 
 function providerForJob(job) {
@@ -2096,11 +2102,18 @@ async function conversationTurnRecords(job) {
         seenIds.add(id);
         // For user turns, extract the actual prompt body node instead of the
         // whole role container, so attachment previews / UI chrome are not
-        // included in the prompt hash comparison. Fall back to the container.
+        // included in the prompt hash comparison (audit P2-R9-NEW-1).
+        // Specific-first two-step lookup (querySelector("A, B") does NOT
+        // implement selector priority — it returns DOM-order first match).
         let text;
         if (role === 'user') {
-          const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap, .whitespace-pre-wrap');
-          text = bodyNode ? renderText(bodyNode) : renderText(roleContainer);
+          const specificBody = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');
+          const bodyNode = specificBody || roleContainer.querySelector('.user-message-bubble-color');
+          if (!bodyNode) {
+            // Cannot prove which text is the prompt body — fail closed.
+            continue;
+          }
+          text = renderText(bodyNode);
         } else {
           text = renderText(roleContainer);
         }

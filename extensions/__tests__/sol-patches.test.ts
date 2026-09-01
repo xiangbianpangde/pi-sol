@@ -507,11 +507,16 @@ describe("canonical prompt domain (audit round 9, P1-R8-NEW-1)", () => {
 
 	it("canonicalizes multi-paragraph prompts the same way on both ends", () => {
 		const runJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
-		// Verify the canonicalization function exists and is referenced at
-		// both ends (source hash + recovery check). The exact split/join
-		// tokens are already covered by the call-site assertions above.
-		assert.ok(runJob.includes("function canonicalPromptText(text)"));
-		assert.ok(runJob.includes("line.trimEnd()"));
-		assert.ok(runJob.includes("line.trim()"));
+		// Lossless canonicalization (audit P1-R9-NEW-1): must NOT filter blank
+		// lines or 'Thought for' lines, must NOT trimEnd each line — those
+		// would merge distinct prompts into the same hash (identity loss).
+		const fnStart = runJob.indexOf("function canonicalPromptText(text)");
+		assert.ok(fnStart >= 0, "canonicalPromptText not found");
+		const fnChunk = runJob.slice(fnStart, fnStart + 1200);
+		assert.ok(fnChunk.includes("charCodeAt(0) === 0xfeff"), "BOM strip expected");
+		assert.ok(fnChunk.includes(".replace(/\\r") || fnChunk.includes("\\r\\n"), "CRLF->LF expected");
+		// No lossy filter inside canonicalPromptText (no .filter, no trimEnd)
+		assert.ok(!fnChunk.includes(".filter("), "canonicalPromptText must not filter lines");
+		assert.ok(!fnChunk.includes(".trimEnd()"), "canonicalPromptText must not trimEnd per line");
 	});
 });

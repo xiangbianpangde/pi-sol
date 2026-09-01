@@ -388,7 +388,7 @@
      conversationId,
      responseFormat: "text/plain",
 --- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 13:29:06
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 13:42:00
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -418,11 +418,10 @@
  const AGENT_BROWSER_BIN = [process.env.AGENT_BROWSER_PATH, "/opt/homebrew/bin/agent-browser", "/usr/local/bin/agent-browser"].find(
    (candidate) => typeof candidate === "string" && candidate && existsSync(candidate),
  ) || "agent-browser";
-@@ -101,6 +109,25 @@
- let cleaningUpRuntime = false;
+@@ -102,6 +110,31 @@
  let shuttingDown = false;
  let lastHeartbeatMs = 0;
-+
+ 
 +function hashText(text) {
 +  return createHash("sha256").update(text, "utf8").digest("hex");
 +}
@@ -434,17 +433,24 @@
 +// closed at the prompt-proof step. The normalization mirrors what the DOM
 +// renderer produces for a user turn body.
 +function canonicalPromptText(text) {
-+  return String(text || "")
-+    .split("\n")
-+    .map((line) => line.trimEnd())
-+    .filter((line) => line.trim() && !/^Thought for\b/i.test(line.trim()))
-+    .join("\n")
-+    .trim();
++  // Minimal-loss normalization for user-prompt identity (audit P1-R9-NEW-1):
++  // ONLY normalize platform representation differences that are guaranteed
++  // not to change prompt semantics (CRLF -> LF, strip a single BOM).
++  // Deliberately NOT done here:
++  //  - dropping blank lines (would merge distinct multi-paragraph prompts)
++  //  - stripping 'Thought for' lines (can be legitimate user text)
++  //  - trimEnd per line (would merge "line \n" and "line\n" distinctions)
++  // The DOM body extraction must therefore preserve the original text as
++  // closely as possible; see the user body selector below.
++  let normalized = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
++  if (normalized.charCodeAt(0) === 0xfeff) normalized = normalized.slice(1);
++  return normalized;
 +}
- 
++
  function providerForJob(job) {
    return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
-@@ -706,7 +733,11 @@
+ }
+@@ -706,7 +739,11 @@
  
  async function ensureBrowserConnected(job) {
    if (!browserStarted || cleaningUpBrowser) return;
@@ -457,7 +463,7 @@
    if (status.connected === false) {
      throw new Error("The isolated oracle browser disconnected during the job.");
    }
-@@ -1065,7 +1096,9 @@
+@@ -1065,7 +1102,9 @@
      return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
    }
  
@@ -468,7 +474,7 @@
    if (outageText) {
      return { state: "transient_outage_error", message: `ChatGPT is showing a transient outage/rate-limit page: ${outageText}` };
    }
-@@ -1244,8 +1277,32 @@
+@@ -1244,8 +1283,32 @@
    return `${providerLabel} is showing a transient outage/rate-limit page${context ? ` while ${context}` : ""}: ${errorText}`;
  }
  
@@ -503,7 +509,7 @@
    if (!errorText) return "";
    return formatProviderTransientErrorMessage(job, errorText, context);
  }
-@@ -1372,8 +1429,18 @@
+@@ -1372,8 +1435,18 @@
      url: urlResult.url,
      urlKnown: urlResult.ok,
      assistantCount: Math.max(baselineAssistantCount, messages.length),
@@ -524,7 +530,7 @@
    };
  }
  
-@@ -1390,11 +1457,18 @@
+@@ -1390,11 +1463,18 @@
  }
  
  async function waitForSendAccepted(job, beforeSend, options = {}) {
@@ -543,7 +549,7 @@
      if (providerSendAccepted(beforeSend, afterSend)) return true;
      await sleep(500);
    }
-@@ -1428,6 +1502,37 @@
+@@ -1428,6 +1508,37 @@
    return Boolean(dismissed);
  }
  
@@ -581,7 +587,7 @@
  async function openModelConfiguration(job) {
    const timeoutAt = Date.now() + MODEL_CONFIGURATION_OPEN_TIMEOUT_MS;
    let lastSnapshot = "";
-@@ -1451,6 +1556,9 @@
+@@ -1451,6 +1562,9 @@
        throwIfProviderTransientError(job, after, "opening model configuration");
        if (snapshotHasModelConfigurationUi(after)) return after;
        if (canUseOpenModelMenuForSelection(after, job.selection)) return after;
@@ -591,7 +597,7 @@
  
        const configureEntry = findEntry(
          after,
-@@ -1465,6 +1573,9 @@
+@@ -1465,6 +1579,9 @@
          throwIfProviderTransientError(job, postConfigure, "opening model configuration");
          if (snapshotHasModelConfigurationUi(postConfigure)) return postConfigure;
          if (canUseOpenModelMenuForSelection(postConfigure, job.selection)) return postConfigure;
@@ -601,7 +607,7 @@
        }
      }
  
-@@ -1526,14 +1637,49 @@
+@@ -1526,14 +1643,49 @@
    throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
  }
  
@@ -652,7 +658,7 @@
    await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
    let familySnapshot = await openModelConfiguration(job);
    let verificationSnapshot = familySnapshot;
-@@ -1553,7 +1699,21 @@
+@@ -1553,7 +1705,21 @@
    } else if (familyAlreadySelectedInUi) {
      await log("Model family already appears selected; verifying effort-specific settings");
    } else if (!familyEntry) {
@@ -675,7 +681,7 @@
    }
  
    let compactSelectionVerifiedAfterClick = false;
-@@ -1577,7 +1737,7 @@
+@@ -1577,7 +1743,7 @@
      }
    }
  
@@ -684,7 +690,7 @@
      const effortLabel = requestedEffortLabel(job.selection);
      if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
        const opened = await openEffortDropdown(job);
-@@ -1626,7 +1786,7 @@
+@@ -1626,7 +1792,7 @@
      }
    }
  
@@ -693,7 +699,7 @@
    if (!stronglyVerified) {
      throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
    }
-@@ -1711,48 +1871,12 @@
+@@ -1711,48 +1877,12 @@
  }
  
  async function assistantMessages(job) {
@@ -747,7 +753,7 @@
  }
  
  async function grokAssistantMessages(job) {
-@@ -1812,24 +1936,49 @@
+@@ -1812,24 +1942,49 @@
    return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
  }
  
@@ -803,7 +809,7 @@
  
      if (!hasStopStreaming && hasRetryButton && responseFailureText) {
        if (!retriedAfterFailure) {
-@@ -1851,6 +2000,15 @@
+@@ -1851,6 +2006,15 @@
      }
  
      let completionSignature;
@@ -819,12 +825,10 @@
      if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
        completionSignature = deriveAssistantCompletionSignature({
          hasStopStreaming,
-@@ -1884,6 +2042,151 @@
-   }
- 
+@@ -1886,6 +2050,158 @@
    throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
-+}
-+
+ }
+ 
 +async function conversationTurnRecords(job) {
 +  // Canonical logical turn parser: merges role container + message-id child +
 +  // testid into ONE record per logical message via closest() role merge
@@ -877,11 +881,18 @@
 +        seenIds.add(id);
 +        // For user turns, extract the actual prompt body node instead of the
 +        // whole role container, so attachment previews / UI chrome are not
-+        // included in the prompt hash comparison. Fall back to the container.
++        // included in the prompt hash comparison (audit P2-R9-NEW-1).
++        // Specific-first two-step lookup (querySelector("A, B") does NOT
++        // implement selector priority — it returns DOM-order first match).
 +        let text;
 +        if (role === 'user') {
-+          const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap, .whitespace-pre-wrap');
-+          text = bodyNode ? renderText(bodyNode) : renderText(roleContainer);
++          const specificBody = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');
++          const bodyNode = specificBody || roleContainer.querySelector('.user-message-bubble-color');
++          if (!bodyNode) {
++            // Cannot prove which text is the prompt body — fail closed.
++            continue;
++          }
++          text = renderText(bodyNode);
 +        } else {
 +          text = renderText(roleContainer);
 +        }
@@ -968,10 +979,12 @@
 +    await sleep(job.config.worker.pollMs);
 +  }
 +  throw new Error(`Timed out waiting for the recovered assistant response (baseline assistant count: ${baselineAssistantCount})`);
- }
- 
++}
++
  async function sha256(path) {
-@@ -2355,6 +2658,108 @@
+   const buffer = await readFile(path);
+   return createHash("sha256").update(buffer).digest("hex");
+@@ -2355,6 +2671,108 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await waitForOracleReady(currentJob);
@@ -1080,7 +1093,7 @@
      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
        at: new Date().toISOString(),
        source: "oracle:worker",
-@@ -2369,17 +2774,56 @@
+@@ -2369,17 +2787,56 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await uploadArchive(currentJob);
@@ -1141,7 +1154,7 @@
      const awaitingResponsePatch = {
        heartbeatAt: new Date().toISOString(),
        ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
-@@ -2391,7 +2835,7 @@
+@@ -2391,7 +2848,7 @@
        patch: awaitingResponsePatch,
      }));
  

@@ -1,5 +1,5 @@
 --- a/extensions/oracle/lib/tools.ts	2026-09-01 10:14:12
-+++ b/extensions/oracle/lib/tools.ts	2026-09-01 12:20:30
++++ b/extensions/oracle/lib/tools.ts	2026-09-01 12:34:00
 @@ -4,9 +4,10 @@
  // Usage: Imported by the oracle extension entrypoint and sanity tests to register tools against the pi API.
  // Invariants/Assumptions: The pi runtime validates TypeBox schemas before execute, while execute owns semantic normalization.
@@ -21,21 +21,21 @@
    type OracleJob,
  } from "./jobs.js";
  import { isOracleProjectTrusted } from "./trust.js";
-@@ -123,6 +126,14 @@
- 
- const ORACLE_CANCEL_PARAMS = Type.Object({
+@@ -125,6 +128,14 @@
    jobId: Type.String({ description: "Oracle job id." }),
-+}, { additionalProperties: false });
-+
+ }, { additionalProperties: false });
+ 
 +const ORACLE_RECOVER_PARAMS = Type.Object({
 +  sourceJobId: Type.Optional(Type.String({
 +    description: "UUID of a failed oracle job to recover. Omit for auto-selection (latest resumable job in current project).",
 +    minLength: 1,
 +    pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 +  })),
- }, { additionalProperties: false });
- 
++}, { additionalProperties: false });
++
  const MAX_QUEUED_JOBS_PER_ACTIVE_RUNTIME = 1;
+ const MAX_QUEUED_ARCHIVE_BYTES_PER_ACTIVE_RUNTIME = resolveOracleProviderArchivePlan("chatgpt").maxArchiveBytes;
+ function prepareOracleProviderAliases<T>(args: unknown, toolName: string): T {
 @@ -305,7 +316,7 @@
    return resolveFollowUp(args.followUpJobId, args.cwd);
  }
@@ -97,7 +97,7 @@
  function formatOraclePreflightResponse(details: OraclePreflightDetails): string {
    const providerLabel = formatOracleProviderLabel(details.provider);
    if (details.ready) {
-@@ -1130,6 +1177,183 @@
+@@ -1130,6 +1177,207 @@
          }
        } catch (error) {
          return buildOracleToolErrorResult("oracle_submit", error, params);
@@ -141,7 +141,7 @@
 +          const candidate = readJob(rawId);
 +          if (!candidate) throw new Error(`Source job ${rawId} not found.`);
 +          if (!isRecoverableSourceJob(candidate, projectId)) {
-+            throw new Error(`Source job ${rawId} is not recoverable: it must be a failed ChatGPT submission with a recovery anchor and sendAcceptedAt.`);
++            throw new Error(`Source job ${rawId} is not recoverable: it must be a failed ChatGPT submission with a Phase-1 recovery anchor.`);
 +          }
 +          sourceJob = candidate;
 +        } else {
@@ -150,7 +150,7 @@
 +            .filter((job): job is OracleJob => isRecoverableSourceJob(job, projectId))
 +            .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 +          sourceJob = candidates[0];
-+          if (!sourceJob) throw new Error("No resumable failed job found in the current project. Ensure a failed oracle job with a valid conversationId and sendAcceptedAt exists.");
++          if (!sourceJob) throw new Error("No resumable failed job found in the current project. Ensure a failed oracle job with a Phase-1 recovery anchor exists.");
 +        }
 +
 +        // Step 2: Canonical identity chain validation
@@ -165,6 +165,30 @@
 +          throw new Error(`Source job ${sourceJob.id} is owned by another user (UID ${sourceStat.uid}).`);
 +        }
 +        // isRecoverableSourceJob already validated projectId, provider, conversation identity, and a Phase-1 armed anchor
++
++        // Step 2b: Resolve the CANONICAL source conversation identity once.
++        // Precedence: top-level job identity -> recoveryAnchor identity ->
++        // recoverable URL parse. This single resolved identity is used for
++        // the conversation lease, the child job, the recoverySource
++        // provenance, cleanup, and the worker — so eligibility, child and
++        // worker can never disagree on which conversation is being recovered
++        // (audit P1-NEW-2 / P2-N1).
++        const anchorIdentity = sourceJob.recoveryAnchor;
++        // Precedence: top-level -> recoveryAnchor identity -> anchor URL
++        const resolvedConversationId = sourceJob.conversationId
++          ?? anchorIdentity?.conversationId
++          ?? undefined;
++        const resolvedChatUrl = sourceJob.chatUrl
++          ?? anchorIdentity?.chatUrl
++          ?? (resolvedConversationId
++            ? `${chatGptConversationOrigin(config)}/c/${resolvedConversationId}`
++            : undefined);
++        if (!resolvedConversationId && !resolvedChatUrl) {
++          throw new Error(
++            `Source job ${sourceJob.id} has no resolvable conversation identity. ` +
++              "Cannot open a conversation for recovery.",
++          );
++        }
 +
 +        // Step 3: Admission-first — acquire leases BEFORE creating the child job
 +        childJobId = randomUUID();
@@ -189,14 +213,14 @@
 +          runtimeLeaseAcquired = true;
 +          const conversationAttempt = await tryAcquireConversationLease({
 +            jobId: childJobId,
-+            conversationId: sourceJob!.conversationId,
++            conversationId: resolvedConversationId ?? resolvedChatUrl!,
 +            projectId,
 +            sessionId,
 +            createdAt: admittedAt,
 +          });
 +          if (!conversationAttempt.acquired) {
 +            throw new Error(
-+              `Conversation ${sourceJob!.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
++              `Conversation ${resolvedConversationId ?? resolvedChatUrl} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
 +                "Concurrent recovery and submission targeting the same ChatGPT thread are not allowed.",
 +            );
 +          }
@@ -209,7 +233,7 @@
 +              prompt: "(recovery)",
 +              files: ["./recovery-placeholder"],
 +              selection: { provider: "chatgpt", preset: "thinking_extended" },
-+              chatUrl: sourceJob!.chatUrl,
++              chatUrl: resolvedChatUrl,
 +              requestSource: "tool",
 +            },
 +            projectCwd,
@@ -225,8 +249,8 @@
 +            recoverySource: {
 +              jobId: sourceJob!.id,
 +              sourceCreatedAt: sourceJob!.createdAt,
-+              conversationId: sourceJob!.conversationId,
-+              chatUrl: sourceJob!.chatUrl || "",
++              conversationId: resolvedConversationId ?? "",
++              chatUrl: resolvedChatUrl ?? "",
 +              anchor: childAnchor,
 +            },
 +          };
@@ -249,8 +273,8 @@
 +          status: "submitted" as const,
 +          sourceJobId: sourceJob!.id,
 +          sourceJobStatus: sourceJob!.status,
-+          conversationId: sourceJob!.conversationId,
-+          chatUrl: sourceJob!.chatUrl,
++          conversationId: resolvedConversationId,
++          chatUrl: resolvedChatUrl,
 +        };
 +        return { content: [{ type: "text" as const, text: formatOracleRecoverResponse(result) }], details: result };
 +      } catch (error) {
@@ -272,7 +296,7 @@
 +          runtimeId: runtimeLeaseAcquired && runtime ? runtime.runtimeId : undefined,
 +          runtimeProfileDir: runtimeLeaseAcquired && runtime ? runtime.runtimeProfileDir : undefined,
 +          runtimeSessionName: workerSpawned && runtime ? runtime.runtimeSessionName : undefined,
-+          conversationId: conversationLeaseAcquired ? sourceJob?.conversationId : undefined,
++          conversationId: conversationLeaseAcquired ? resolvedConversationId ?? resolvedChatUrl : undefined,
 +        }).catch(() => ({ attempted: [], warnings: [] }));
 +        if (childJobId && cleanupReport.warnings.length > 0) {
 +          await appendCleanupWarnings(childJobId, cleanupReport.warnings).catch(() => undefined);
@@ -339,7 +363,7 @@
      conversationId,
      responseFormat: "text/plain",
 --- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 12:20:04
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 12:32:16
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -380,19 +404,20 @@
  
  function providerForJob(job) {
    return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
-@@ -706,7 +718,11 @@
+@@ -706,8 +718,12 @@
  
  async function ensureBrowserConnected(job) {
    if (!browserStarted || cleaningUpBrowser) return;
 -  const status = await streamStatus(job);
 +  let status = await streamStatus(job);
-+  if (status.connected === false) {
+   if (status.connected === false) {
 +    await sleep(1000);
 +    status = await streamStatus(job);
 +  }
-   if (status.connected === false) {
++  if (status.connected === false) {
      throw new Error("The isolated oracle browser disconnected during the job.");
    }
+ }
 @@ -1065,7 +1081,9 @@
      return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
    }
@@ -537,10 +562,12 @@
        }
      }
  
-@@ -1526,14 +1622,49 @@
-   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
- }
+@@ -1524,14 +1620,49 @@
+   }
  
+   throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
++}
++
 +async function waitForChatGptModelPicker(job, timeoutMs = 20_000) {
 +  const deadline = Date.now() + timeoutMs;
 +  let lastSnapshot = "";
@@ -555,8 +582,8 @@
 +    await agentBrowser(job, "wait", "500");
 +  }
 +  return lastSnapshot;
-+}
-+
+ }
+ 
  async function configureModel(job) {
    if (isGrokJob(job)) return configureGrokModel(job);
 -  const initialSnapshot = await snapshotText(job);
@@ -574,8 +601,8 @@
    if (snapshotCanSafelySkipModelConfiguration(initialSnapshot, job.selection)) {
      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
      return;
-   }
- 
++  }
++
 +  if (snapshotHasPowerSliderCompactMenu(initialSnapshot) || /menuitem "Show advanced options"/i.test(initialSnapshot) || /menuitem "Power"/i.test(initialSnapshot)) {
 +    await log(`Power-slider compact UI visible; selecting High instead of the legacy Instant/Thinking/Pro sheet`);
 +    initialSnapshot = await trySelectPowerSliderHigh(job);
@@ -583,11 +610,9 @@
 +      await log(`Model already appears configured for family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}; skipping reconfiguration`);
 +      return;
 +    }
-+  }
-+
+   }
+ 
    await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
-   let familySnapshot = await openModelConfiguration(job);
-   let verificationSnapshot = familySnapshot;
 @@ -1553,7 +1684,21 @@
    } else if (familyAlreadySelectedInUi) {
      await log("Model family already appears selected; verifying effort-specific settings");
@@ -701,28 +726,46 @@
      if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
        completionSignature = deriveAssistantCompletionSignature({
          hasStopStreaming,
-@@ -1884,6 +2063,81 @@
+@@ -1884,6 +2063,99 @@
    }
  
    throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
 +}
 +
 +async function promptFromConversationUserTurn(job, responseIndex) {
-+  // Read the user message that precedes the target assistant reply at
-+  // responseIndex, so the recovered answer can be bound to the submitted
-+  // prompt. Returns the user message text (or "" if not resolvable).
++  // Read the user message that immediately precedes the target assistant
++  // reply at responseIndex, so the recovered answer can be bound to the
++  // submitted prompt. Uses a DOM-order turn stream with role + messageId so
++  // edits/regenerates/branches cannot silently shift the pairing.
++  // Returns { ok: true, text } on an unambiguous predecessor, or
++  // { ok: false, reason } — the caller MUST reject on ok:false (fail-closed).
 +  const idx = Number(responseIndex);
 +  const result = await evalPage(
 +    job,
 +    toJsonScript(`
-+      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-testid="user-message"]'));
-+      const texts = nodes.map((node) => (node.innerText || node.textContent || '').trim()).filter(Boolean);
-+      const userTurn = texts[${idx}] || (texts.length > 0 ? texts[texts.length - 1] : "");
-+      return { text: userTurn };
++      const nodes = Array.from(document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]'));
++      const turns = nodes
++        .map((node, i) => {
++          const role = node.getAttribute('data-message-author-role') || (node.getAttribute('data-testid') || '').replace('-message', '') || '';
++          const id = node.getAttribute('data-message-id') || '';
++          const text = (node.innerText || node.textContent || '').trim();
++          return { role, id, text, domOrder: i };
++        })
++        .filter((t) => (t.role === 'user' || t.role === 'assistant') && t.text);
++      const assistantTurns = turns.filter((t) => t.role === 'assistant');
++      const target = assistantTurns[${idx}] || null;
++      if (!target) return { ok: false, reason: 'no assistant turn at index ' + ${idx} };
++      const predecessors = turns.filter((t) => t.domOrder < target.domOrder);
++      const userTurnsBefore = predecessors.filter((t) => t.role === 'user');
++      const immediate = userTurnsBefore.length > 0 ? userTurnsBefore[userTurnsBefore.length - 1] : null;
++      if (!immediate) return { ok: false, reason: 'no user turn precedes target assistant at index ' + ${idx} };
++      return { ok: true, text: immediate.text, messageId: immediate.id, domOrder: immediate.domOrder };
 +    `),
 +  );
-+  const text = typeof result?.text === "string" ? result.text.trim() : "";
-+  return text;
++  if (!result || result.ok !== true) {
++    return { ok: false, reason: typeof result?.reason === "string" ? result.reason : "unreadable turn stream" };
++  }
++  return { ok: true, text: typeof result?.text === "string" ? result.text.trim() : "", messageId: result.messageId, domOrder: result.domOrder };
 +}
 +
 +async function waitForRecoveredAssistant(job, baselineAssistantCount) {
@@ -783,7 +826,7 @@
  }
  
  async function sha256(path) {
-@@ -2355,6 +2609,88 @@
+@@ -2355,6 +2627,103 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await waitForOracleReady(currentJob);
@@ -797,53 +840,68 @@
 +      const sourceConversationId = currentJob.recoverySource?.conversationId;
 +      await log(`Recovery job ${currentJob.id}: opening conversation ${sourceConversationId || "(unknown)"} for read-only observation`);
 +
-+      // Identity guard: the conversation we actually opened must match the
-+      // immutable recoverySource snapshot and the job-level conversationId.
-+      // Prevents count-based recovery from returning a turn from a different
-+      // or drifted conversation (manual regenerate/branch/edit).
++      // Identity guard (fail-closed, audit round 4): the conversation we
++      // actually opened must match the immutable recoverySource snapshot and
++      // the job-level conversationId. When an expected identity is recorded,
++      // the observed identity MUST be present and equal — an unreadable
++      // observation is a rejection, never a pass.
 +      const openedUrl = stripUrlQueryAndHash(await currentUrl(currentJob));
 +      const openedConversationId = conversationIdFromUrl(openedUrl);
-+      if (sourceConversationId && openedConversationId && openedConversationId !== sourceConversationId) {
-+        throw new Error(
-+          `Recovery conversation mismatch: opened ${openedConversationId} but recoverySource recorded ${sourceConversationId}. ` +
-+            "Refusing to read a different conversation than the source job's.",
-+        );
++      if (sourceConversationId) {
++        if (!openedConversationId || openedConversationId !== sourceConversationId) {
++          throw new Error(
++            `Recovery conversation mismatch: opened ${openedConversationId || "(unreadable)"} but recoverySource recorded ${sourceConversationId}. ` +
++              "Refusing to read a different or unverifiable conversation.",
++          );
++        }
 +      }
 +      const jobConversationId = currentJob.conversationId;
-+      if (jobConversationId && openedConversationId && openedConversationId !== jobConversationId) {
-+        throw new Error(
-+          `Recovery conversation mismatch: opened ${openedConversationId} but job records ${jobConversationId}. ` +
-+            "Refusing to read a drifted conversation.",
-+        );
++      if (jobConversationId) {
++        if (!openedConversationId || openedConversationId !== jobConversationId) {
++          throw new Error(
++            `Recovery conversation mismatch: opened ${openedConversationId || "(unreadable)"} but job records ${jobConversationId}. ` +
++              "Refusing to read a drifted or unverifiable conversation.",
++          );
++        }
 +      }
-+      // Baseline hash guard: when the source conversation already had an
-+      // assistant turn before send, verify the last pre-send message matches
-+      // the recorded hash so a changed conversation cannot shift the count.
++      // Baseline hash guard (fail-closed): when the source conversation
++      // already had an assistant turn before send, the last pre-send message
++      // MUST be readable and MUST match the recorded hash.
 +      if (anchor.baselineAssistantCount > 0 && anchor.baselineLastAssistantHash) {
 +        const baselineMessages = await assistantMessages(currentJob);
 +        const lastBaselineText = baselineMessages[anchor.baselineAssistantCount - 1]?.text || "";
-+        if (lastBaselineText && hashText(lastBaselineText) !== anchor.baselineLastAssistantHash) {
++        if (!lastBaselineText) {
++          throw new Error(
++            "Recovery baseline unreadable: expected baseline assistant count " +
++              `${anchor.baselineAssistantCount} but the message could not be read. Refusing recovery.`,
++          );
++        }
++        if (hashText(lastBaselineText) !== anchor.baselineLastAssistantHash) {
 +          throw new Error(
 +            "Recovery baseline mismatch: the last assistant message before the source send no longer matches the recorded hash. " +
 +              "The conversation may have been edited or regenerated; refusing count-based recovery.",
 +          );
 +        }
 +      }
-+      // submittedPromptHash binding: the target assistant reply must follow a
-+      // user turn whose content matches the prompt the source job submitted.
-+      // This guards against edited/regenerated source user turns that keep the
-+      // conversation id and preceding assistant hash intact but no longer
-+      // correspond to the submitted prompt (audit P2-3).
++      // submittedPromptHash binding (fail-closed): the target assistant reply
++      // MUST follow a user turn that is readable and whose content matches the
++      // prompt the source job submitted. Unreadable or unmatched = reject.
 +      if (anchor.submittedPromptHash) {
-+        const observedPromptText = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => "");
-+        if (observedPromptText && hashText(observedPromptText) !== anchor.submittedPromptHash) {
++        const promptProbe = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => ({ ok: false, reason: "eval error" }));
++        if (!promptProbe || promptProbe.ok !== true) {
++          throw new Error(
++            `Recovery prompt unreadable: ${promptProbe?.reason || "could not resolve the user turn preceding the target reply"}. ` +
++              "Cannot prove the source prompt was sent; refusing recovery.",
++          );
++        }
++        if (hashText(promptProbe.text) !== anchor.submittedPromptHash) {
 +          throw new Error(
 +            "Recovery prompt mismatch: the user turn preceding the target assistant reply does not match the source job's submitted prompt hash. " +
 +              "The conversation may have been edited or regenerated; refusing recovery.",
 +          );
 +        }
 +      }
-+      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
++      await log(`Recovery identity verified: conversation=${openedConversationId || "(unverifiable)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
 +      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
 +        at: new Date().toISOString(),
 +        source: "oracle:worker",
@@ -872,7 +930,7 @@
      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
        at: new Date().toISOString(),
        source: "oracle:worker",
-@@ -2369,17 +2705,54 @@
+@@ -2369,17 +2738,54 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await uploadArchive(currentJob);
@@ -931,7 +989,7 @@
      const awaitingResponsePatch = {
        heartbeatAt: new Date().toISOString(),
        ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
-@@ -2391,7 +2764,7 @@
+@@ -2391,7 +2797,7 @@
        patch: awaitingResponsePatch,
      }));
  

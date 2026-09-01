@@ -126,6 +126,19 @@ function readVendoredOracleVersion(vendor) {
 	return value || VENDORED_ORACLE_VERSION;
 }
 
+function computeVendorDigest(vendor) {
+	// Digest of the authority-sensitive vendor files AND the vendored version
+	// string, so tampering with ORACLE_VERSION cannot skip the revendor branch
+	// or route an old vendor set onto a newer pi-oracle (audit P2-N2).
+	const entries = { oracleVersion: readVendoredOracleVersion(vendor) };
+	for (const name of ["tools.ts", "jobs.ts"]) {
+		const path = join(vendor, name);
+		if (!existsSync(path)) return undefined; // missing vendor authority file — fail closed at verify
+		entries[name] = sha256File(path);
+	}
+	return entries;
+}
+
 function readVendorDigest(vendor) {
 	const path = join(vendor, ".vendor-digest");
 	if (!existsSync(path)) return undefined;
@@ -136,24 +149,28 @@ function readVendorDigest(vendor) {
 	}
 }
 
-function computeVendorDigest(vendor) {
-	// Hash of the authority-sensitive vendor files only (tools.ts + jobs.ts).
-	// This binds the ORACLE_VERSION to the actual file content so a tampered
-	// version string cannot skip the revendor branch (audit P2-N2).
-	const entries = ["tools.ts", "jobs.ts"].map((name) => [name, sha256File(join(vendor, name))]);
-	return Object.fromEntries(entries);
-}
-
 function verifyVendorDigest(vendor) {
 	const expected = computeVendorDigest(vendor);
+	if (!expected) {
+		return { ok: false, error: `vendor authority files missing under ${vendor}; refusing to trust an incomplete vendor set` };
+	}
 	const stored = readVendorDigest(vendor);
-	if (!stored) return { ok: true }; // pre-digest vendor — accept
+	if (!stored) return { ok: true, missing: true }; // pre-digest vendor — accepted, migration allowed
 	for (const [name, hash] of Object.entries(expected)) {
 		if (stored[name] !== hash) {
 			return { ok: false, error: `vendor ${name} digest mismatch: expected ${stored[name] ?? "(missing)"}, got ${hash.slice(0, 12)}` };
 		}
 	}
 	return { ok: true };
+}
+
+function ensureVendorDigest(vendor) {
+	// One-time migration for pre-digest vendors: write the current digest so
+	// future tampering is detectable. Never silently trusts a digest that is
+	// present but mismatched.
+	if (!readVendorDigest(vendor) && computeVendorDigest(vendor)) {
+		writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(computeVendorDigest(vendor)), "utf8");
+	}
 }
 
 function missingNeedles(path, needles) {
@@ -397,6 +414,18 @@ export function ensureSolOraclePatches(options = {}) {
 	const vendorJobs = join(vendor, "jobs.ts");
 
 	const missing = missingMarkers(root);
+
+	// Vendor digest gate (audit P2-N2): every path that trusts the vendor set
+	// — fast-path, restore, revendor decision — verifies the digest binding
+	// ORACLE_VERSION to the authority lib bytes BEFORE reading/trusting
+	// vendoredVersion. Pre-digest vendors get a one-time migration write.
+	const digestCheck = verifyVendorDigest(vendor);
+	if (!digestCheck.ok) {
+		return { ok: false, restored: false, missing, root, error: digestCheck.error };
+	}
+	if (digestCheck.missing) {
+		ensureVendorDigest(vendor);
+	}
 
 	// Authority hash gate on the no-op fast path too (audit P1-N1): marker
 	// presence alone is not authority. A marker-preserving third-hash mutation

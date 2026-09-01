@@ -1217,7 +1217,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           const candidate = readJob(rawId);
           if (!candidate) throw new Error(`Source job ${rawId} not found.`);
           if (!isRecoverableSourceJob(candidate, projectId)) {
-            throw new Error(`Source job ${rawId} is not recoverable: it must be a failed ChatGPT submission with a recovery anchor and sendAcceptedAt.`);
+            throw new Error(`Source job ${rawId} is not recoverable: it must be a failed ChatGPT submission with a Phase-1 recovery anchor.`);
           }
           sourceJob = candidate;
         } else {
@@ -1226,7 +1226,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
             .filter((job): job is OracleJob => isRecoverableSourceJob(job, projectId))
             .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
           sourceJob = candidates[0];
-          if (!sourceJob) throw new Error("No resumable failed job found in the current project. Ensure a failed oracle job with a valid conversationId and sendAcceptedAt exists.");
+          if (!sourceJob) throw new Error("No resumable failed job found in the current project. Ensure a failed oracle job with a Phase-1 recovery anchor exists.");
         }
 
         // Step 2: Canonical identity chain validation
@@ -1241,6 +1241,30 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           throw new Error(`Source job ${sourceJob.id} is owned by another user (UID ${sourceStat.uid}).`);
         }
         // isRecoverableSourceJob already validated projectId, provider, conversation identity, and a Phase-1 armed anchor
+
+        // Step 2b: Resolve the CANONICAL source conversation identity once.
+        // Precedence: top-level job identity -> recoveryAnchor identity ->
+        // recoverable URL parse. This single resolved identity is used for
+        // the conversation lease, the child job, the recoverySource
+        // provenance, cleanup, and the worker — so eligibility, child and
+        // worker can never disagree on which conversation is being recovered
+        // (audit P1-NEW-2 / P2-N1).
+        const anchorIdentity = sourceJob.recoveryAnchor;
+        // Precedence: top-level -> recoveryAnchor identity -> anchor URL
+        const resolvedConversationId = sourceJob.conversationId
+          ?? anchorIdentity?.conversationId
+          ?? undefined;
+        const resolvedChatUrl = sourceJob.chatUrl
+          ?? anchorIdentity?.chatUrl
+          ?? (resolvedConversationId
+            ? `${chatGptConversationOrigin(config)}/c/${resolvedConversationId}`
+            : undefined);
+        if (!resolvedConversationId && !resolvedChatUrl) {
+          throw new Error(
+            `Source job ${sourceJob.id} has no resolvable conversation identity. ` +
+              "Cannot open a conversation for recovery.",
+          );
+        }
 
         // Step 3: Admission-first — acquire leases BEFORE creating the child job
         childJobId = randomUUID();
@@ -1265,14 +1289,14 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           runtimeLeaseAcquired = true;
           const conversationAttempt = await tryAcquireConversationLease({
             jobId: childJobId,
-            conversationId: sourceJob!.conversationId,
+            conversationId: resolvedConversationId ?? resolvedChatUrl!,
             projectId,
             sessionId,
             createdAt: admittedAt,
           });
           if (!conversationAttempt.acquired) {
             throw new Error(
-              `Conversation ${sourceJob!.conversationId} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
+              `Conversation ${resolvedConversationId ?? resolvedChatUrl} is already in use by job ${conversationAttempt.blocker?.jobId ?? "unknown"}. ` +
                 "Concurrent recovery and submission targeting the same ChatGPT thread are not allowed.",
             );
           }
@@ -1285,7 +1309,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
               prompt: "(recovery)",
               files: ["./recovery-placeholder"],
               selection: { provider: "chatgpt", preset: "thinking_extended" },
-              chatUrl: sourceJob!.chatUrl,
+              chatUrl: resolvedChatUrl,
               requestSource: "tool",
             },
             projectCwd,
@@ -1301,8 +1325,8 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
             recoverySource: {
               jobId: sourceJob!.id,
               sourceCreatedAt: sourceJob!.createdAt,
-              conversationId: sourceJob!.conversationId,
-              chatUrl: sourceJob!.chatUrl || "",
+              conversationId: resolvedConversationId ?? "",
+              chatUrl: resolvedChatUrl ?? "",
               anchor: childAnchor,
             },
           };
@@ -1325,8 +1349,8 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           status: "submitted" as const,
           sourceJobId: sourceJob!.id,
           sourceJobStatus: sourceJob!.status,
-          conversationId: sourceJob!.conversationId,
-          chatUrl: sourceJob!.chatUrl,
+          conversationId: resolvedConversationId,
+          chatUrl: resolvedChatUrl,
         };
         return { content: [{ type: "text" as const, text: formatOracleRecoverResponse(result) }], details: result };
       } catch (error) {
@@ -1348,7 +1372,7 @@ export function registerOracleTools(pi: ExtensionAPI, workerPath: string, authWo
           runtimeId: runtimeLeaseAcquired && runtime ? runtime.runtimeId : undefined,
           runtimeProfileDir: runtimeLeaseAcquired && runtime ? runtime.runtimeProfileDir : undefined,
           runtimeSessionName: workerSpawned && runtime ? runtime.runtimeSessionName : undefined,
-          conversationId: conversationLeaseAcquired ? sourceJob?.conversationId : undefined,
+          conversationId: conversationLeaseAcquired ? resolvedConversationId ?? resolvedChatUrl : undefined,
         }).catch(() => ({ attempted: [], warnings: [] }));
         if (childJobId && cleanupReport.warnings.length > 0) {
           await appendCleanupWarnings(childJobId, cleanupReport.warnings).catch(() => undefined);

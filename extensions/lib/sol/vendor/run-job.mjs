@@ -2066,21 +2066,39 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
 }
 
 async function promptFromConversationUserTurn(job, responseIndex) {
-  // Read the user message that precedes the target assistant reply at
-  // responseIndex, so the recovered answer can be bound to the submitted
-  // prompt. Returns the user message text (or "" if not resolvable).
+  // Read the user message that immediately precedes the target assistant
+  // reply at responseIndex, so the recovered answer can be bound to the
+  // submitted prompt. Uses a DOM-order turn stream with role + messageId so
+  // edits/regenerates/branches cannot silently shift the pairing.
+  // Returns { ok: true, text } on an unambiguous predecessor, or
+  // { ok: false, reason } — the caller MUST reject on ok:false (fail-closed).
   const idx = Number(responseIndex);
   const result = await evalPage(
     job,
     toJsonScript(`
-      const nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"], [data-testid="user-message"]'));
-      const texts = nodes.map((node) => (node.innerText || node.textContent || '').trim()).filter(Boolean);
-      const userTurn = texts[${idx}] || (texts.length > 0 ? texts[texts.length - 1] : "");
-      return { text: userTurn };
+      const nodes = Array.from(document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]'));
+      const turns = nodes
+        .map((node, i) => {
+          const role = node.getAttribute('data-message-author-role') || (node.getAttribute('data-testid') || '').replace('-message', '') || '';
+          const id = node.getAttribute('data-message-id') || '';
+          const text = (node.innerText || node.textContent || '').trim();
+          return { role, id, text, domOrder: i };
+        })
+        .filter((t) => (t.role === 'user' || t.role === 'assistant') && t.text);
+      const assistantTurns = turns.filter((t) => t.role === 'assistant');
+      const target = assistantTurns[${idx}] || null;
+      if (!target) return { ok: false, reason: 'no assistant turn at index ' + ${idx} };
+      const predecessors = turns.filter((t) => t.domOrder < target.domOrder);
+      const userTurnsBefore = predecessors.filter((t) => t.role === 'user');
+      const immediate = userTurnsBefore.length > 0 ? userTurnsBefore[userTurnsBefore.length - 1] : null;
+      if (!immediate) return { ok: false, reason: 'no user turn precedes target assistant at index ' + ${idx} };
+      return { ok: true, text: immediate.text, messageId: immediate.id, domOrder: immediate.domOrder };
     `),
   );
-  const text = typeof result?.text === "string" ? result.text.trim() : "";
-  return text;
+  if (!result || result.ok !== true) {
+    return { ok: false, reason: typeof result?.reason === "string" ? result.reason : "unreadable turn stream" };
+  }
+  return { ok: true, text: typeof result?.text === "string" ? result.text.trim() : "", messageId: result.messageId, domOrder: result.domOrder };
 }
 
 async function waitForRecoveredAssistant(job, baselineAssistantCount) {
@@ -2619,53 +2637,68 @@ async function run() {
       const sourceConversationId = currentJob.recoverySource?.conversationId;
       await log(`Recovery job ${currentJob.id}: opening conversation ${sourceConversationId || "(unknown)"} for read-only observation`);
 
-      // Identity guard: the conversation we actually opened must match the
-      // immutable recoverySource snapshot and the job-level conversationId.
-      // Prevents count-based recovery from returning a turn from a different
-      // or drifted conversation (manual regenerate/branch/edit).
+      // Identity guard (fail-closed, audit round 4): the conversation we
+      // actually opened must match the immutable recoverySource snapshot and
+      // the job-level conversationId. When an expected identity is recorded,
+      // the observed identity MUST be present and equal — an unreadable
+      // observation is a rejection, never a pass.
       const openedUrl = stripUrlQueryAndHash(await currentUrl(currentJob));
       const openedConversationId = conversationIdFromUrl(openedUrl);
-      if (sourceConversationId && openedConversationId && openedConversationId !== sourceConversationId) {
-        throw new Error(
-          `Recovery conversation mismatch: opened ${openedConversationId} but recoverySource recorded ${sourceConversationId}. ` +
-            "Refusing to read a different conversation than the source job's.",
-        );
+      if (sourceConversationId) {
+        if (!openedConversationId || openedConversationId !== sourceConversationId) {
+          throw new Error(
+            `Recovery conversation mismatch: opened ${openedConversationId || "(unreadable)"} but recoverySource recorded ${sourceConversationId}. ` +
+              "Refusing to read a different or unverifiable conversation.",
+          );
+        }
       }
       const jobConversationId = currentJob.conversationId;
-      if (jobConversationId && openedConversationId && openedConversationId !== jobConversationId) {
-        throw new Error(
-          `Recovery conversation mismatch: opened ${openedConversationId} but job records ${jobConversationId}. ` +
-            "Refusing to read a drifted conversation.",
-        );
+      if (jobConversationId) {
+        if (!openedConversationId || openedConversationId !== jobConversationId) {
+          throw new Error(
+            `Recovery conversation mismatch: opened ${openedConversationId || "(unreadable)"} but job records ${jobConversationId}. ` +
+              "Refusing to read a drifted or unverifiable conversation.",
+          );
+        }
       }
-      // Baseline hash guard: when the source conversation already had an
-      // assistant turn before send, verify the last pre-send message matches
-      // the recorded hash so a changed conversation cannot shift the count.
+      // Baseline hash guard (fail-closed): when the source conversation
+      // already had an assistant turn before send, the last pre-send message
+      // MUST be readable and MUST match the recorded hash.
       if (anchor.baselineAssistantCount > 0 && anchor.baselineLastAssistantHash) {
         const baselineMessages = await assistantMessages(currentJob);
         const lastBaselineText = baselineMessages[anchor.baselineAssistantCount - 1]?.text || "";
-        if (lastBaselineText && hashText(lastBaselineText) !== anchor.baselineLastAssistantHash) {
+        if (!lastBaselineText) {
+          throw new Error(
+            "Recovery baseline unreadable: expected baseline assistant count " +
+              `${anchor.baselineAssistantCount} but the message could not be read. Refusing recovery.`,
+          );
+        }
+        if (hashText(lastBaselineText) !== anchor.baselineLastAssistantHash) {
           throw new Error(
             "Recovery baseline mismatch: the last assistant message before the source send no longer matches the recorded hash. " +
               "The conversation may have been edited or regenerated; refusing count-based recovery.",
           );
         }
       }
-      // submittedPromptHash binding: the target assistant reply must follow a
-      // user turn whose content matches the prompt the source job submitted.
-      // This guards against edited/regenerated source user turns that keep the
-      // conversation id and preceding assistant hash intact but no longer
-      // correspond to the submitted prompt (audit P2-3).
+      // submittedPromptHash binding (fail-closed): the target assistant reply
+      // MUST follow a user turn that is readable and whose content matches the
+      // prompt the source job submitted. Unreadable or unmatched = reject.
       if (anchor.submittedPromptHash) {
-        const observedPromptText = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => "");
-        if (observedPromptText && hashText(observedPromptText) !== anchor.submittedPromptHash) {
+        const promptProbe = await promptFromConversationUserTurn(currentJob, Number(anchor.baselineAssistantCount || 0)).catch(() => ({ ok: false, reason: "eval error" }));
+        if (!promptProbe || promptProbe.ok !== true) {
+          throw new Error(
+            `Recovery prompt unreadable: ${promptProbe?.reason || "could not resolve the user turn preceding the target reply"}. ` +
+              "Cannot prove the source prompt was sent; refusing recovery.",
+          );
+        }
+        if (hashText(promptProbe.text) !== anchor.submittedPromptHash) {
           throw new Error(
             "Recovery prompt mismatch: the user turn preceding the target assistant reply does not match the source job's submitted prompt hash. " +
               "The conversation may have been edited or regenerated; refusing recovery.",
           );
         }
       }
-      await log(`Recovery identity verified: conversation=${openedConversationId || "(unknown)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
+      await log(`Recovery identity verified: conversation=${openedConversationId || "(unverifiable)"} baseline=${anchor.baselineAssistantCount} promptHash=${anchor.submittedPromptHash ? "verified" : "(none)"}`);
       currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "awaiting_response", {
         at: new Date().toISOString(),
         source: "oracle:worker",

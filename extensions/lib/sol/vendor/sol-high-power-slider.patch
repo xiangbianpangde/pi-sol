@@ -388,7 +388,7 @@
      conversationId,
      responseFormat: "text/plain",
 --- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 13:11:33
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 13:20:20
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -804,15 +804,13 @@
      if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
        completionSignature = deriveAssistantCompletionSignature({
          hasStopStreaming,
-@@ -1884,8 +2027,132 @@
-   }
- 
+@@ -1886,6 +2029,137 @@
    throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
-+}
-+
+ }
+ 
 +async function conversationTurnRecords(job) {
 +  // Canonical logical turn parser: merges role container + message-id child +
-+  // testid into ONE record per logical message via closest() ancestor merge
++  // testid into ONE record per logical message via closest() role merge
 +  // + messageId dedup. Uses the same renderText normalization as the original
 +  // assistantMessages so baseline hashes, prompt proof, and target extraction
 +  // all share the exact same text/record/index domain.
@@ -836,27 +834,34 @@
 +      // Canonical merge: each candidate node resolves to its logical message
 +      // container via closest(), so a role container + message-id child +
 +      // testid all collapse into ONE record. Id-less records are rejected.
++      const seenRoles = new Set();
 +      const seenIds = new Set();
-+      const seenContainers = new Set();
 +      const records = [];
 +      for (const node of document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]')) {
-+        const container = node.closest('[data-message-author-role], [data-message-id]') || node;
-+        if (seenContainers.has(container)) continue;
-+        const role = roleOf(container);
-+        const id = container.getAttribute('data-message-id') || '';
-+        if (!role || (role !== 'user' && role !== 'assistant')) continue;
-+        if (!id) continue; // a logical message must have an id to be addressable
++        // Two-step canonical merge (audit round 8):
++        // 1. Find the role container via closest('[data-message-author-role]').
++        // 2. Within that container, find the message-id (own or descendant).
++        // This correctly handles outer role container + child message-id DOM.
++        const roleContainer = node.closest('[data-message-author-role]')
++          || node.closest('[data-testid="user-message"],[data-testid="assistant-message"]');
++        if (!roleContainer) continue;
++        const role = roleOf(roleContainer);
++        if (role !== 'user' && role !== 'assistant') continue;
++        if (seenRoles.has(roleContainer)) continue;
++        seenRoles.add(roleContainer);
++        const idNode = roleContainer.querySelector('[data-message-id]') || roleContainer;
++        const id = idNode.getAttribute('data-message-id') || '';
++        if (!id) continue;
 +        if (seenIds.has(id)) continue;
 +        seenIds.add(id);
-+        seenContainers.add(container);
-+        records.push({ role, id, text: renderText(container) });
++        records.push({ role, id, text: renderText(roleContainer) });
 +      }
 +      return { records };
 +    `),
 +  );
 +  return Array.isArray(result?.records) ? result.records : [];
- }
- 
++}
++
 +async function promptFromConversationUserTurn(job, responseIndex) {
 +  // Canonical predecessor: uses the unified conversationTurnRecords domain
 +  // shared with baseline counting and target extraction. The element
@@ -937,7 +942,7 @@
  async function sha256(path) {
    const buffer = await readFile(path);
    return createHash("sha256").update(buffer).digest("hex");
-@@ -2355,6 +2622,108 @@
+@@ -2355,6 +2629,108 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await waitForOracleReady(currentJob);
@@ -1046,7 +1051,7 @@
      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
        at: new Date().toISOString(),
        source: "oracle:worker",
-@@ -2369,17 +2738,56 @@
+@@ -2369,17 +2745,56 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await uploadArchive(currentJob);
@@ -1107,7 +1112,7 @@
      const awaitingResponsePatch = {
        heartbeatAt: new Date().toISOString(),
        ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
-@@ -2391,7 +2799,7 @@
+@@ -2391,7 +2806,7 @@
        patch: awaitingResponsePatch,
      }));
  

@@ -2031,7 +2031,7 @@ async function waitForChatCompletion(job, baselineAssistantCount, options = {}) 
 
 async function conversationTurnRecords(job) {
   // Canonical logical turn parser: merges role container + message-id child +
-  // testid into ONE record per logical message via closest() ancestor merge
+  // testid into ONE record per logical message via closest() role merge
   // + messageId dedup. Uses the same renderText normalization as the original
   // assistantMessages so baseline hashes, prompt proof, and target extraction
   // all share the exact same text/record/index domain.
@@ -2055,20 +2055,27 @@ async function conversationTurnRecords(job) {
       // Canonical merge: each candidate node resolves to its logical message
       // container via closest(), so a role container + message-id child +
       // testid all collapse into ONE record. Id-less records are rejected.
+      const seenRoles = new Set();
       const seenIds = new Set();
-      const seenContainers = new Set();
       const records = [];
       for (const node of document.querySelectorAll('[data-message-author-role], [data-message-id], [data-testid="user-message"], [data-testid="assistant-message"]')) {
-        const container = node.closest('[data-message-author-role], [data-message-id]') || node;
-        if (seenContainers.has(container)) continue;
-        const role = roleOf(container);
-        const id = container.getAttribute('data-message-id') || '';
-        if (!role || (role !== 'user' && role !== 'assistant')) continue;
-        if (!id) continue; // a logical message must have an id to be addressable
+        // Two-step canonical merge (audit round 8):
+        // 1. Find the role container via closest('[data-message-author-role]').
+        // 2. Within that container, find the message-id (own or descendant).
+        // This correctly handles outer role container + child message-id DOM.
+        const roleContainer = node.closest('[data-message-author-role]')
+          || node.closest('[data-testid="user-message"],[data-testid="assistant-message"]');
+        if (!roleContainer) continue;
+        const role = roleOf(roleContainer);
+        if (role !== 'user' && role !== 'assistant') continue;
+        if (seenRoles.has(roleContainer)) continue;
+        seenRoles.add(roleContainer);
+        const idNode = roleContainer.querySelector('[data-message-id]') || roleContainer;
+        const id = idNode.getAttribute('data-message-id') || '';
+        if (!id) continue;
         if (seenIds.has(id)) continue;
         seenIds.add(id);
-        seenContainers.add(container);
-        records.push({ role, id, text: renderText(container) });
+        records.push({ role, id, text: renderText(roleContainer) });
       }
       return { records };
     `),

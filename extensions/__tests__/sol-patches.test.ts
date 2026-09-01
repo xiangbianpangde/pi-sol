@@ -32,6 +32,11 @@ function fakeVendorDir() {
 	for (const name of [...WORKER_FILES, "ORACLE_VERSION", SOL_PATCH_FILE]) {
 		copyFileSync(join(VENDOR, name), join(vendor, name));
 	}
+	// Seed the digest too when the real vendor has one, so digest-gate tests
+	// start from a trusted baseline and tampering actually trips the gate.
+	if (existsSync(join(VENDOR, ".vendor-digest"))) {
+		copyFileSync(join(VENDOR, ".vendor-digest"), join(vendor, ".vendor-digest"));
+	}
 	return vendor;
 }
 
@@ -344,6 +349,107 @@ describe("ensureSolOraclePatches", () => {
 			for (const needle of SOL_PATCH_MARKERS.runJob) {
 				assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("vendor digest + authority gates (audit round 4)", () => {
+	it("rejects a marker-preserving third-hash mutation of installed lib on the no-op fast path (P1-N1)", () => {
+		// All markers present (fast-path), but installed tools.ts is a third
+		// hash that still contains the marker strings. Must fail closed.
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			// Full markers present: worker files are the vendored patched copies.
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
+			copyFileSync(join(vendor, "run-job.mjs"), join(worker, "run-job.mjs"));
+			// Installed lib is a marker-preserving third hash.
+			const patchedTools = readFileSync(join(vendor, "tools.ts"), "utf8");
+			const mutated = patchedTools.replace("oracle_recover", "oracle_recover_mutated");
+			writeFileSync(join(lib, "tools.ts"), mutated);
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.match(String(result.error), /authority hash fail-closed/);
+			// The mutated lib must NOT have been touched/restored-over.
+			assert.match(readFileSync(join(lib, "tools.ts"), "utf8"), /oracle_recover_mutated/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a tampered vendor ORACLE_VERSION that would skip the revendor branch (P2-N2)", () => {
+		// installed package version claims 9.9.9; vendor ORACLE_VERSION tampered
+		// to 9.9.9 so the version-mismatch revendor branch is skipped. The
+		// vendor digest binds ORACLE_VERSION to the vendor bytes, so the digest
+		// gate must fail closed before any restore/revendor decision.
+		const { root, worker, lib } = fakeOracleRoot("9.9.9");
+		const vendor = fakeVendorDir();
+		try {
+			// Tamper the vendored version to match the installed one.
+			writeFileSync(join(vendor, "ORACLE_VERSION"), "9.9.9\n");
+			// Worker markers missing so a restore would otherwise run.
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.match(String(result.error), /digest mismatch/);
+			// Nothing must have been copied into the installed tree.
+			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /export \{\}/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("migrates a pre-digest vendor by writing .vendor-digest once (P2-N2 compatibility)", () => {
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			// Remove any digest (pre-digest vendor state).
+			rmSync(join(vendor, ".vendor-digest"), { force: true });
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true);
+			// Digest should now exist and be valid.
+			const digest = JSON.parse(readFileSync(join(vendor, ".vendor-digest"), "utf8"));
+			assert.equal(typeof digest.oracleVersion, "string");
+			assert.equal(typeof digest["tools.ts"], "string");
+			assert.equal(typeof digest["jobs.ts"], "string");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a vendor whose authority lib bytes changed after the digest was written (P2-N2)", () => {
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			// Tamper a vendor lib file AFTER the digest was recorded.
+			const toolsPath = join(vendor, "tools.ts");
+			writeFileSync(toolsPath, readFileSync(toolsPath, "utf8") + "\n// tampered\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
+			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
+			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.match(String(result.error), /digest mismatch/);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(vendor, { recursive: true, force: true });

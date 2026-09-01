@@ -4,6 +4,7 @@
  * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-patches.test.ts
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -507,16 +508,77 @@ describe("canonical prompt domain (audit round 9, P1-R8-NEW-1)", () => {
 
 	it("canonicalizes multi-paragraph prompts the same way on both ends", () => {
 		const runJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
-		// Lossless canonicalization (audit P1-R9-NEW-1): must NOT filter blank
-		// lines or 'Thought for' lines, must NOT trimEnd each line — those
-		// would merge distinct prompts into the same hash (identity loss).
 		const fnStart = runJob.indexOf("function canonicalPromptText(text)");
 		assert.ok(fnStart >= 0, "canonicalPromptText not found");
 		const fnChunk = runJob.slice(fnStart, fnStart + 1200);
 		assert.ok(fnChunk.includes("charCodeAt(0) === 0xfeff"), "BOM strip expected");
 		assert.ok(fnChunk.includes(".replace(/\\r") || fnChunk.includes("\\r\\n"), "CRLF->LF expected");
-		// No lossy filter inside canonicalPromptText (no .filter, no trimEnd)
 		assert.ok(!fnChunk.includes(".filter("), "canonicalPromptText must not filter lines");
 		assert.ok(!fnChunk.includes(".trimEnd()"), "canonicalPromptText must not trimEnd per line");
+		// The user prompt identity path must NOT use the assistant-oriented
+		// renderText() pipeline (trim/trimEnd/filter). It must use lossless
+		// textContent extraction, otherwise blank lines / 'Thought for'
+		// lines / trailing spaces collapse and distinct prompts collide.
+		const userBodyIdx = runJob.indexOf("const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap')");
+		assert.ok(userBodyIdx >= 0, "user body selector missing");
+		// Slice only up to the } else { boundary so the assistant branch's
+		// renderText() is NOT part of the user-extraction chunk under test.
+		const userElseIdx = runJob.indexOf("} else {", userBodyIdx);
+		const userEnd = userElseIdx > userBodyIdx ? userElseIdx : userBodyIdx + 500;
+		const userChunk = runJob.slice(userBodyIdx, userEnd);
+		assert.ok(userChunk.includes("textContent"), "user extraction must use textContent");
+		assert.ok(!userChunk.includes(".innerText"), "user extraction must not use innerText");
+		assert.ok(!userChunk.includes("renderText("), "user extraction must not use assistant renderText");
+		assert.ok(userChunk.includes("if (!bodyNode) {"), "missing specific body must fail closed");
+		assert.ok(userChunk.includes("continue"), "missing specific body must reject the record");
+	});
+});
+
+describe("canonical prompt hash behavior (audit round 11, P1-R9-NEW-1)", () => {
+	// Replicates the exact canonicalPromptText from the vendored worker and
+	// executes real hashing to lock the identity anti-collision invariants.
+	function canonicalPromptText(text) {
+		let normalized = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+		if (normalized.charCodeAt(0) === 0xfeff) normalized = normalized.slice(1);
+		return normalized;
+	}
+	function hashText(text) {
+		return createHash("sha256").update(text, "utf8").digest("hex");
+	}
+
+	it("keeps blank lines distinct (A\\n\\nB != A\\nB)", () => {
+		const withBlank = canonicalPromptText("A\n\nB");
+		const withoutBlank = canonicalPromptText("A\nB");
+		assert.notEqual(withBlank, withoutBlank);
+		assert.notEqual(hashText(withBlank), hashText(withoutBlank));
+	});
+
+	it("keeps 'Thought for' lines as user content (anti-false-accept)", () => {
+		const a = canonicalPromptText("A\nThought for X\nB");
+		const b = canonicalPromptText("A\nThought for Y\nB");
+		assert.notEqual(hashText(a), hashText(b), "edited Thought-for line must mismatch");
+	});
+
+	it("trailing per-line spaces are identity (anti-collision)", () => {
+		const a = canonicalPromptText("line \nnext");
+		const b = canonicalPromptText("line\nnext");
+		assert.notEqual(hashText(a), hashText(b), "trailing space must be preserved");
+	});
+
+	it("CRLF and LF are equivalent by design", () => {
+		const a = canonicalPromptText("A\r\nB");
+		const b = canonicalPromptText("A\nB");
+		assert.equal(hashText(a), hashText(b));
+	});
+
+	it("BOM is stripped by design", () => {
+		const a = canonicalPromptText("\uFEFFA\nB");
+		const b = canonicalPromptText("A\nB");
+		assert.equal(hashText(a), hashText(b));
+	});
+
+	it("round-trips multi-paragraph prompts without loss", () => {
+		const original = "第一段\n\n第二段\n尾行 ";
+		assert.equal(canonicalPromptText(canonicalPromptText(original)), canonicalPromptText(original));
 	});
 });

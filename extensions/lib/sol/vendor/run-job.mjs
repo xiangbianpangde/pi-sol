@@ -2100,20 +2100,24 @@ async function conversationTurnRecords(job) {
         if (!id) continue;
         if (seenIds.has(id)) continue;
         seenIds.add(id);
-        // For user turns, extract the actual prompt body node instead of the
-        // whole role container, so attachment previews / UI chrome are not
-        // included in the prompt hash comparison (audit P2-R9-NEW-1).
-        // Specific-first two-step lookup (querySelector("A, B") does NOT
-        // implement selector priority — it returns DOM-order first match).
+        // For user turns, extract the prompt identity text using a
+        // SEPARATE lossless path: only the specific body subtree, no
+        // .trim(), .trimEnd(), .filter(), or "Thought for" stripping
+        // (audit P1-R9-NEW-1 / P2-R9-NEW-1). The assistant-oriented
+        // renderText() is NOT used for user records.
         let text;
         if (role === 'user') {
-          const specificBody = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');
-          const bodyNode = specificBody || roleContainer.querySelector('.user-message-bubble-color');
+          const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');
           if (!bodyNode) {
-            // Cannot prove which text is the prompt body — fail closed.
+            // Cannot prove the prompt body — fail closed.
             continue;
           }
-          text = renderText(bodyNode);
+          // Lossless extraction: textContent (not innerText) preserves
+          // whitespace. Only canonicalPromptText normalization is applied
+          // (CRLF->LF, BOM strip), matching the source-side hash domain.
+          text = (bodyNode.textContent || '').replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+          if (!text) continue; // empty user record — reject
         } else {
           text = renderText(roleContainer);
         }

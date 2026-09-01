@@ -388,7 +388,7 @@
      conversationId,
      responseFormat: "text/plain",
 --- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 13:42:00
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 14:04:52
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -450,19 +450,20 @@
  function providerForJob(job) {
    return job?.selection?.provider === "grok" ? "grok" : "chatgpt";
  }
-@@ -706,7 +739,11 @@
+@@ -706,8 +739,12 @@
  
  async function ensureBrowserConnected(job) {
    if (!browserStarted || cleaningUpBrowser) return;
 -  const status = await streamStatus(job);
 +  let status = await streamStatus(job);
-+  if (status.connected === false) {
+   if (status.connected === false) {
 +    await sleep(1000);
 +    status = await streamStatus(job);
 +  }
-   if (status.connected === false) {
++  if (status.connected === false) {
      throw new Error("The isolated oracle browser disconnected during the job.");
    }
+ }
 @@ -1065,7 +1102,9 @@
      return { state: "challenge_blocking", message: "ChatGPT is showing a challenge/verification page" };
    }
@@ -825,7 +826,7 @@
      if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
        completionSignature = deriveAssistantCompletionSignature({
          hasStopStreaming,
-@@ -1886,6 +2050,158 @@
+@@ -1886,6 +2050,162 @@
    throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
  }
  
@@ -879,20 +880,24 @@
 +        if (!id) continue;
 +        if (seenIds.has(id)) continue;
 +        seenIds.add(id);
-+        // For user turns, extract the actual prompt body node instead of the
-+        // whole role container, so attachment previews / UI chrome are not
-+        // included in the prompt hash comparison (audit P2-R9-NEW-1).
-+        // Specific-first two-step lookup (querySelector("A, B") does NOT
-+        // implement selector priority — it returns DOM-order first match).
++        // For user turns, extract the prompt identity text using a
++        // SEPARATE lossless path: only the specific body subtree, no
++        // .trim(), .trimEnd(), .filter(), or "Thought for" stripping
++        // (audit P1-R9-NEW-1 / P2-R9-NEW-1). The assistant-oriented
++        // renderText() is NOT used for user records.
 +        let text;
 +        if (role === 'user') {
-+          const specificBody = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');
-+          const bodyNode = specificBody || roleContainer.querySelector('.user-message-bubble-color');
++          const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');
 +          if (!bodyNode) {
-+            // Cannot prove which text is the prompt body — fail closed.
++            // Cannot prove the prompt body — fail closed.
 +            continue;
 +          }
-+          text = renderText(bodyNode);
++          // Lossless extraction: textContent (not innerText) preserves
++          // whitespace. Only canonicalPromptText normalization is applied
++          // (CRLF->LF, BOM strip), matching the source-side hash domain.
++          text = (bodyNode.textContent || '').replace(/\r\n/g, "\n").replace(/\r/g, "\n");
++          if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
++          if (!text) continue; // empty user record — reject
 +        } else {
 +          text = renderText(roleContainer);
 +        }
@@ -984,7 +989,7 @@
  async function sha256(path) {
    const buffer = await readFile(path);
    return createHash("sha256").update(buffer).digest("hex");
-@@ -2355,6 +2671,108 @@
+@@ -2355,6 +2675,108 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await waitForOracleReady(currentJob);
@@ -1093,7 +1098,7 @@
      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
        at: new Date().toISOString(),
        source: "oracle:worker",
-@@ -2369,17 +2787,56 @@
+@@ -2369,17 +2791,56 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await uploadArchive(currentJob);
@@ -1154,7 +1159,7 @@
      const awaitingResponsePatch = {
        heartbeatAt: new Date().toISOString(),
        ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
-@@ -2391,7 +2848,7 @@
+@@ -2391,7 +2852,7 @@
        patch: awaitingResponsePatch,
      }));
  

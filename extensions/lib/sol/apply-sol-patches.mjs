@@ -99,6 +99,11 @@ export const SOL_PATCH_MARKERS = {
 		// message body (excluding attachment preview / UI chrome).
 		"function canonicalPromptText",
 		".user-message-bubble-color .whitespace-pre-wrap",
+		// Audit round 2026-09-01 round 11: user prompt identity uses a
+		// separate lossless extraction (textContent + CRLF/BOM only), never
+		// the assistant-oriented renderText() trim/filter pipeline.
+		"Lossless extraction: textContent (not innerText)",
+		"const bodyNode = roleContainer.querySelector('.user-message-bubble-color .whitespace-pre-wrap');",
 	],
 	lib: [
 		// Audit round 2026-09-01 oracle_recover: old lib files without the

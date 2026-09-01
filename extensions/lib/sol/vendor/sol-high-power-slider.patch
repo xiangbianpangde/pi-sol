@@ -388,7 +388,7 @@
      conversationId,
      responseFormat: "text/plain",
 --- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 14:04:52
++++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 14:14:29
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -895,7 +895,7 @@
 +          // Lossless extraction: textContent (not innerText) preserves
 +          // whitespace. Only canonicalPromptText normalization is applied
 +          // (CRLF->LF, BOM strip), matching the source-side hash domain.
-+          text = (bodyNode.textContent || '').replace(/\r\n/g, "\n").replace(/\r/g, "\n");
++          text = (bodyNode.textContent || '').replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
 +          if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
 +          if (!text) continue; // empty user record — reject
 +        } else {

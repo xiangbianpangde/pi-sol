@@ -2115,7 +2115,7 @@ async function conversationTurnRecords(job) {
           // Lossless extraction: textContent (not innerText) preserves
           // whitespace. Only canonicalPromptText normalization is applied
           // (CRLF->LF, BOM strip), matching the source-side hash domain.
-          text = (bodyNode.textContent || '').replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          text = (bodyNode.textContent || '').replace(/\\r\\n/g, "\\n").replace(/\\r/g, "\\n");
           if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
           if (!text) continue; // empty user record — reject
         } else {

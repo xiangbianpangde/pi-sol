@@ -52,7 +52,6 @@ import {
   updateJob,
   writeJob,
   getOracleJobsDir,
-  hasDurableWorkerHandoff,
   type OracleJob,
 } from "./jobs.js";
 import { isOracleProjectTrusted } from "./trust.js";

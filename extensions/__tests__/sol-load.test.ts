@@ -45,9 +45,28 @@ describe("sol extension registration", () => {
 		assert.ok(commands.has("sol-auth"));
 		assert.ok(commands.has("sol-followup"));
 		assert.ok(commands.has("sol-resume"));
+		assert.ok(commands.has("sol-diag"));
+		assert.ok(commands.has("sol-open"));
 		assert.ok(handlers.has("before_agent_start"));
 		assert.ok(handlers.has("session_start"));
 		assert.ok(handlers.has("tool_call"));
+	});
+
+	it("/sol-open rejects unknown options and a valueless --url without launching Chrome", async () => {
+		const { commands } = loadSol();
+		const handler = commands.get("sol-open")!.handler as (args: string, ctx: unknown) => Promise<void>;
+		const notices: { message: string; level: string }[] = [];
+		const ctx = { hasUI: true, ui: { notify: (message: string, level: string) => notices.push({ message, level }) } };
+		await handler("--nope", ctx);
+		await handler("--url", ctx);
+		await handler("--url file:///etc/passwd", ctx);
+		assert.equal(notices.length, 3, "each bad invocation must surface exactly one notice");
+		for (const notice of notices) {
+			assert.equal(notice.level, "warning");
+			assert.match(notice.message, /\/sol-open|--url|http\(s\)/);
+		}
+		// A rejected --url must never reach spawn(); the real-profile launch path
+		// is covered in sol-open.test.ts, which asserts spawn counts directly.
 	});
 
 	it("injects Plus High dispatch for /sol", async () => {

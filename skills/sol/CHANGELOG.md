@@ -1,5 +1,33 @@
 # sol CHANGELOG
 
+## 1.13.0 - 2026-09-02
+
+- **New `/sol-open [--grok|--chatgpt] [--url <https-url>]`**: opens pi-oracle's
+  isolated auth-seed Chrome so a human can repair what `/sol-auth` cannot — a
+  stale ChatGPT/Grok login, a wrong model/power-slider state, or a browser left
+  in a weird condition after a failed job. This profile is exactly the one every
+  job clones from, so fixing it by hand fixes subsequent jobs.
+  - Headed, detached, and deliberately **without** `--remote-debugging-port` /
+    `--remote-allow-origins`: no agent (including an oracle worker) can attach
+    to the manual window. Verified: 0 listening TCP sockets on the launched PID.
+  - Keeps `--use-mock-keychain` + `--password-store=basic`, because the seed's
+    cookies were written under those flags; dropping them makes the profile look
+    logged-out on macOS.
+  - Reads the seed dir and Chrome path from `~/.pi/agent/extensions/oracle.json`
+    off disk (same discipline as `jobs.ts` / `admission.ts`), honouring
+    pi-oracle's legacy `browser.profileDir` alias, and never imports pi-oracle
+    internals, so `pi update npm:pi-oracle` cannot drift it.
+  - Chromium singleton-aware: if the profile is already open it reports the live
+    PID from `SingletonLock` (`<hostname>-<pid>`, hyphen-safe) and spawns nothing;
+    a stale lock from a dead PID does not block an open.
+  - `--url` is validated before any filesystem or process probing, and only
+    http(s) is accepted.
+  - `npm test` now globs `extensions/__tests__/*.test.ts` instead of enumerating
+    files; the old list silently excluded new suites from CI.
+  - Tests: 172/172 (33 new: config resolution, provider seeds, Chrome discovery,
+    singleton parsing, launch-arg safety, URL validation, launch short-circuits,
+    command registration and option rejection).
+
 ## 1.12.0 - 2026-09-01
 
 - **Round 12 audit (P1-R12-NEW-1 + P2-R12-NEW-1) closed**: worker CRLF

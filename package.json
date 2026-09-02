@@ -10,7 +10,7 @@
     "url": "git+https://github.com/xiangbianpangde/pi-sol.git"
   },
   "scripts": {
-    "test": "npx --yes tsx --test extensions/__tests__/sol.test.ts extensions/__tests__/sol-load.test.ts extensions/__tests__/sol-patches.test.ts extensions/__tests__/sol-chatgpt-ui.test.ts extensions/__tests__/sol-trigger.test.ts extensions/__tests__/sol-trigger-log.test.ts",
+    "test": "npx --yes tsx --test extensions/__tests__/*.test.ts",
     "check:patches": "node extensions/lib/sol/apply-sol-patches.mjs"
   },
   "engines": {

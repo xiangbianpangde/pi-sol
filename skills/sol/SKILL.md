@@ -3,7 +3,7 @@ name: sol
 description: Relay research and planning questions to ChatGPT web GPT-5.6 Sol High via /sol and pi-oracle. Use before solving hard problems, when the user runs /sol, or when the local model needs a web-Sol advisor. Never drive chatgpt.com with agent_browser.
 compatibility: Pi coding agent
 metadata:
-  version: "1.12.0"
+  version: "1.13.0"
   status: "active"
   layer: "task"
   priority: "30"
@@ -34,11 +34,13 @@ Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `
 /sol-read [job-id]
 /sol-auth
 /sol-diag [--last N] [--candidates]
+/sol-open [--grok|--chatgpt] [--url <https-url>]
 ```
 
 - Default is **synchronous**: wait for the Sol answer in this turn
 - `--bg` dispatches and stops; later `/sol-read`
 - `--files` is an explicit local file list, not a whole-repo archive
+- `/sol-open` opens the oracle auth-seed Chrome **headed and with no debug port**, so a human can repair a stale login or wrong model state that `/sol-auth` cannot fix by itself. Every job clones that seed, so close the window before the next `/sol`.
 
 ## Consult-First Rule (second-opinion-first workflow)
 

@@ -156,6 +156,7 @@ After verifying the smoke test, ask a real question:
 | `/sol-read [job-id]` | Read a saved job result. Defaults to the latest discovered `oracle-*` job. |
 | `/sol-auth` | Sync ChatGPT cookies from local Chrome into pi-oracle's isolated browser seed. |
 | `/sol-diag [--last N] [--candidates]` | Inspect record-only trigger diagnostics. |
+| `/sol-open [--grok|--chatgpt] [--url <https-url>]` | Open pi-oracle's isolated auth-seed Chrome, headed and with **no remote-debugging port**, to repair a stale login or wrong model state by hand. |
 
 > `/sol --follow <job-id> <prompt>` and `/sol-followup <job-id> <prompt>` **both continue an existing `/sol` ChatGPT thread**. Use whichever form is more convenient.
 
@@ -165,6 +166,8 @@ After verifying the smoke test, ask a real question:
 - **`--bg`**: Submits in the background and returns a job ID; read it later with `/sol-read <job-id>`.
 - **`--files a,b`**: Attach only explicitly listed files. Repositories are never auto-archived.
 - **`--follow <job-id>`**: Continue an existing ChatGPT thread from an earlier `/sol` turn.
+
+`/sol-open` launches the same profile every job clones from, so **close that window before running `/sol` again**; a job clones the seed while Chrome is writing it. If the profile is already open, `/sol-open` reports the live PID instead of starting a second Chrome (which would collide on the Chromium singleton lock). It never exposes a DevTools endpoint, so no agent can attach to the manual window.
 
 ChatGPT submissions allow up to `maxConcurrentJobs` (default 2) concurrent `/sol` jobs across local Pi sessions; each job runs in its own isolated browser runtime profile. When the concurrency limit is reached, the new submission is blocked with the active job IDs; wait for one to finish and use `/sol-read <job-id>`. This is an account-level rate-limit safeguard, not a limitation on pi-oracle's isolated browser profiles.
 

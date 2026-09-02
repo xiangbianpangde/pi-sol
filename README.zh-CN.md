@@ -156,6 +156,7 @@ cd pi-sol
 | `/sol-read [job-id]` | 读取已保存的任务结果。未指定 ID 时默认读取最新发现的 `oracle-*` 任务。 |
 | `/sol-auth` | 将本地 Chrome 的 ChatGPT 登录 Cookie 同步到 pi-oracle 隔离环境。 |
 | `/sol-diag [--last N] [--candidates]` | 查看只记录、不改变行为的触发诊断日志。 |
+| `/sol-open [--grok|--chatgpt] [--url <https-url>]` | 打开 pi-oracle 的隔离 auth-seed Chrome（**有头、且不开放远程调试端口**），用于手工修复登录态失效或模型档位不对。 |
 
 > `/sol --follow <job-id> <prompt>` 和 `/sol-followup <job-id> <prompt>` **均可用于继续已有会话**，按个人习惯选用即可。
 
@@ -165,6 +166,8 @@ cd pi-sol
 - **`--bg`**：后台提交任务并立即返回任务 ID，稍后使用 `/sol-read <job-id>` 查看。
 - **`--files a,b`**：仅附加明确列出的文件。绝不自动全量扫描或打包仓库。
 - **`--follow <job-id>`**：跟随上一次 `/sol` 调用的对话线索。
+
+`/sol-open` 打开的正是每个任务克隆所用的那个 profile，因此**再次运行 `/sol` 前请先关掉该窗口**：任务会在 Chrome 仍在写入时克隆 seed。若该 profile 已被打开，`/sol-open` 只报告存活 PID，不会再起一个 Chrome（那会撞上 Chromium 单例锁）。它始终不开放 DevTools 端口，因此任何 agent 都无法接入这个手工窗口。
 
 ChatGPT 提交允许本机多个 Pi 会话并发运行最多 `maxConcurrentJobs`（默认 2）个 `/sol` 任务；每个任务运行在各自隔离的浏览器 runtime profile 中。当达到并发上限时，新提交会被阻止并显示活跃任务 ID；等待其中一个完成后使用 `/sol-read <job-id>`。这是针对账号级限流的保护，不是 pi-oracle 隔离浏览器 profile 的并发限制。
 

@@ -6,6 +6,7 @@
  *   /sol-followup <job-id> [--bg] [--files a,b] <prompt>
  *   /sol-read [job-id]
  *   /sol-auth
+ *   /sol-open [--grok|--chatgpt] [--url <https-url>]
  *
  * Browser work stays inside pi-oracle's isolated worker. This extension
  * only relays, validates files, auto-auths, and blocks agent_browser
@@ -37,6 +38,7 @@ import {
 	resolveSolTriggerLogPath,
 	type SolTriggerPhase,
 } from "./lib/sol/trigger-log.ts";
+import { formatSolOpenResult, openSolOracleBrowser } from "./lib/sol/open-browser.ts";
 
 const SOL_USAGE = "Usage: /sol [--bg] [--follow <job-id>] [--files a,b] <prompt>";
 
@@ -388,6 +390,39 @@ export default function (pi: ExtensionAPI) {
 			const records = await readSolTriggerLog(path);
 			const filtered = candidatesOnly ? records.filter((r) => r.candidate && r.source === "semantic" && r.parse_status !== "error" && r.ruleset_version === DETECTOR_RULESET) : records;
 			emit(pi, ctx, [formatSolDiagStats(records, path, loggingDisabled, DETECTOR_RULESET), formatSolDiagRecent(filtered, last)].join("\n\n"));
+		},
+	});
+
+	pi.registerCommand("sol-open", {
+		description: "Open the oracle auth-seed Chrome (headed, no debug port) to fix ChatGPT/Grok login or model state by hand",
+		handler: async (args, ctx) => {
+			const SOL_OPEN_USAGE = "Usage: /sol-open [--grok|--chatgpt] [--url <https-url>]";
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			let provider = "chatgpt";
+			let url: string | undefined;
+			for (let i = 0; i < tokens.length; i++) {
+				const token = tokens[i]!;
+				if (token === "--grok") { provider = "grok"; continue; }
+				if (token === "--chatgpt") { provider = "chatgpt"; continue; }
+				if (token === "--url") {
+					const next = tokens[i + 1];
+					if (!next) {
+						emit(pi, ctx, `--url needs a value. ${SOL_OPEN_USAGE}`, "warning");
+						return;
+					}
+					url = next;
+					i += 1;
+					continue;
+				}
+				emit(pi, ctx, `Unknown /sol-open option ${token}. ${SOL_OPEN_USAGE}`, "warning");
+				return;
+			}
+			try {
+				const result = openSolOracleBrowser({ provider, url });
+				emit(pi, ctx, formatSolOpenResult(result), result.ok ? "info" : "warning");
+			} catch (error) {
+				emit(pi, ctx, `${error instanceof Error ? error.message : String(error)}\n${SOL_OPEN_USAGE}`, "warning");
+			}
 		},
 	});
 }

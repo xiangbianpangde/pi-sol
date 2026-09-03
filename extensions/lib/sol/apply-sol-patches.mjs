@@ -171,7 +171,9 @@ function computeVendorDigest(vendor) {
 
 function readVendorDigest(vendor) {
 	const path = join(vendor, ".vendor-digest");
-	if (!existsSync(path)) return { ok: true, missing: true }; // genuinely absent — migration allowed
+	if (!existsSync(path)) {
+		return { ok: false, error: `vendor .vendor-digest is missing under ${vendor}; refusing to establish a trust root from current vendor bytes` };
+	}
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf8"));
 		return { ok: true, stored: parsed };
@@ -187,8 +189,7 @@ function verifyVendorDigest(vendor) {
 		return { ok: false, error: `vendor authority files missing or ORACLE_VERSION unreadable under ${vendor}; refusing to trust an incomplete vendor set` };
 	}
 	const digest = readVendorDigest(vendor);
-	if (!digest.ok) return digest; // malformed digest fails closed
-	if (digest.missing) return { ok: true, missing: true }; // pre-digest vendor — migration allowed
+	if (!digest.ok) return digest; // missing or malformed digest fails closed
 	const stored = digest.stored;
 	for (const [name, hash] of Object.entries(expected)) {
 		if (stored[name] !== hash) {
@@ -196,16 +197,6 @@ function verifyVendorDigest(vendor) {
 		}
 	}
 	return { ok: true };
-}
-
-function ensureVendorDigest(vendor) {
-	// One-time migration: only when .vendor-digest is genuinely ABSENT.
-	// Malformed digests fail closed (verifyVendorDigest) and are never
-	// overwritten by migration.
-	if (!existsSync(join(vendor, ".vendor-digest"))) {
-		const computed = computeVendorDigest(vendor);
-		if (computed) writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(computed), "utf8");
-	}
 }
 
 function missingNeedles(path, needles) {
@@ -465,14 +456,12 @@ export function ensureSolOraclePatches(options = {}) {
 
 	// Vendor digest gate (audit P2-N2): every path that trusts the vendor set
 	// — fast-path, restore, revendor decision — verifies the digest binding
-	// ORACLE_VERSION to the authority lib bytes BEFORE reading/trusting
-	// vendoredVersion. Pre-digest vendors get a one-time migration write.
+	// ORACLE_VERSION to every deployable vendor byte BEFORE reading/trusting
+	// vendoredVersion. Missing or malformed manifests fail closed; current
+	// vendor bytes may never bootstrap a new trust root.
 	const digestCheck = verifyVendorDigest(vendor);
 	if (!digestCheck.ok) {
 		return { ok: false, restored: false, missing, root, error: digestCheck.error };
-	}
-	if (digestCheck.missing) {
-		ensureVendorDigest(vendor);
 	}
 
 	// Authority hash gate on the no-op fast path too (audit P1-2): marker

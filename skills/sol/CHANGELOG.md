@@ -1,5 +1,15 @@
 # sol CHANGELOG
 
+## 1.14.2 - 2026-09-03
+
+- **Closed the missing-digest trust-bootstrap blocker**: a missing
+  `vendor/.vendor-digest` now fails closed instead of hashing current vendor
+  bytes into a new trust root. Added the stale-worker plus marker-preserving
+  vendor-mutation regression.
+- Clarified README/design/skill wording: the shared kernel-flock coordinates
+  `/sol-open`, `oracle_submit`, and `oracle_recover`, and missing or malformed
+  vendor integrity metadata is a hard failure.
+
 ## 1.14.1 - 2026-09-03
 
 - **Closed the final seed-operation race**: `/sol-open`, `oracle_submit`, and

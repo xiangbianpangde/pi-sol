@@ -35,7 +35,7 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 
 `ensureSolOraclePatches()` runs on Pi `session_start` and every `/sol` turn, and the capacity-consuming tool hook repeats the check immediately before execution.
 
-- The vendor digest binds the version, every deployed worker/library copy, and `vendor/sol-high-power-slider.patch`.
+- The vendor digest must exist, parse, and bind the version, every deployed worker/library copy, and `vendor/sol-high-power-slider.patch`; missing, malformed, or mismatching metadata fails closed rather than bootstrapping trust from current bytes.
 - All markers present → installed worker/library bytes must match reviewed pristine or trusted patched hashes; marker-preserving third hashes fail closed.
 - Installed version == vendored `0.7.20` and markers missing → copy trusted vendor worker files back after the authority checks.
 - Installed version != `0.7.20` → auto re-apply `vendor/sol-high-power-slider.patch` (revendor) to the newer pristine worker; refuse loudly if authority checks, patch application, markers, or syntax checks fail.

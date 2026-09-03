@@ -239,7 +239,7 @@ Could not find model family control for instant
 **The restoration rules are strictly enforced:**
 
 1. On `session_start` and every `before_agent_start`, `pi-sol` checks the installed worker for the required High / Power-slider patch markers.
-2. The vendor digest binds `ORACLE_VERSION`, every deployed worker/library copy, and the patch file; marker presence alone is never an integrity proof.
+2. The vendor digest must exist, parse, and bind `ORACLE_VERSION`, every deployed worker/library copy, and the patch file; a missing, malformed, or mismatching digest fails closed, and marker presence alone is never an integrity proof.
 3. If all markers are present, the installed copies must match either the reviewed pristine hashes or the trusted patched hashes; a third hash fails closed.
 4. If markers are missing on the vendored version, trusted worker copies are restored after the authority checks.
 5. If the installed version differs, `pi-sol` re-applies the patch to the new pristine worker and refreshes the vendor set only when the patch, authority checks, markers, and syntax checks all pass; otherwise it refuses to overwrite.
@@ -269,7 +269,7 @@ ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. `
 - Outside-project files with duplicate basenames receive collision-safe staged names; no selected file silently overwrites another.
 
 ### Cross-session submission admission
-- A short atomic lease protects the `oracle_submit` handoff across local Pi processes.
+- One short per-user kernel-flock lease coordinates `/sol-open`, `oracle_submit`, and `oracle_recover` handoffs across local Pi processes; `/sol-open` holds it through Chrome startup.
 - Active `job.json` states (`queued`, `preparing`, `submitted`, `waiting`) are treated as busy.
 - Terminal jobs do not block new work. The admission lock is a kernel-level flock: it is released automatically when the holding process exits or crashes (no TTL, no stale-lock reclamation).
 - A rate-limit error remains an account quota condition: do not bypass it by changing presets.

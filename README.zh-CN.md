@@ -235,7 +235,7 @@ Could not find model family control for instant
 **补丁自动恢复遵循严格准则：**
 
 1. 在 `session_start` 与每次 `before_agent_start` 时，检查已安装 worker 是否包含 High / Power-slider 特征标记。
-2. Vendor digest 绑定 `ORACLE_VERSION`、所有部署的 worker/library 副本及补丁文件；标记存在本身不是完整性证明。
+2. Vendor digest 必须存在、可解析，并绑定 `ORACLE_VERSION`、所有部署的 worker/library 副本及补丁文件；缺失、损坏或不匹配都会 fail-closed，标记存在本身不是完整性证明。
 3. 若标记已齐全，已安装副本必须匹配已审核的 pristine hash 或可信 patched hash；第三种 hash 会 fail-closed。
 4. 若 vendored 版本缺少标记，会在 authority 校验后恢复可信 worker 副本。
 5. 若版本不同，`pi-sol` 仅在补丁可应用、authority/标记/语法检查全部通过时对新 pristine worker 自动 re-vendor；任何失败都会拒绝覆盖。
@@ -266,7 +266,7 @@ ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻
 - **本地拦截**：常见可执行程序与安装包（`.exe`, `.dmg`, `.apk` 等）。
 
 ### 跨会话提交仲裁
-- 使用短时原子租约保护 `oracle_submit` 的跨 Pi 进程交接。
+- 使用一个 per-user kernel-flock 短时租约协调 `/sol-open`、`oracle_submit` 与 `oracle_recover` 的跨 Pi 进程交接；`/sol-open` 会持锁覆盖 Chrome 启动。
 - `queued`、`preparing`、`submitted`、`waiting` 状态的 `job.json` 会被视为正在占用。
 - 终态任务不阻塞新任务。提交仲裁锁是内核级 flock：持有进程退出或崩溃时由内核自动释放（无 TTL、无 stale 锁回收）。
 - 如果最终错误是 `rate limit`，仍表示账号配额窗口耗尽，不能通过切换模型档位绕过。

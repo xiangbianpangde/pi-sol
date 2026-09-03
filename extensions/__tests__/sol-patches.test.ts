@@ -41,6 +41,16 @@ function fakeVendorDir() {
 	return vendor;
 }
 
+function writeVendorDigest(vendor: string): void {
+	const digest: Record<string, string> = {
+		oracleVersion: readFileSync(join(vendor, "ORACLE_VERSION"), "utf8").trim(),
+	};
+	for (const name of [...WORKER_FILES, SOL_PATCH_FILE]) {
+		digest[name] = createHash("sha256").update(readFileSync(join(vendor, name))).digest("hex");
+	}
+	writeFileSync(join(vendor, ".vendor-digest"), JSON.stringify(digest), "utf8");
+}
+
 /** Worker files as pristine upstream: vendor content with the patch reversed. */
 function writePristineWorker(root, worker, vendor, lib = join(root, "extensions/oracle/lib")) {
 	for (const name of ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs"]) {
@@ -234,9 +244,9 @@ describe("ensureSolOraclePatches", () => {
 			// Vendor copy carries all markers but is syntactically broken.
 			const broken = `${SOL_PATCH_MARKERS.runJob.join("\n")}\nasync function broken( {\n`;
 			writeFileSync(join(vendor, "run-job.mjs"), broken);
-			// Deliberately model a pre-digest vendor so this test reaches the
-			// post-copy syntax gate rather than the earlier integrity gate.
-			rmSync(join(vendor, ".vendor-digest"), { force: true });
+			// Rebind the test fixture to the intentionally broken bytes so the
+			// vendor-integrity gate passes and the post-copy syntax gate is tested.
+			writeVendorDigest(vendor);
 			const result = ensureSolOraclePatches({ root, vendor });
 			assert.equal(result.ok, false);
 			assert.match(String(result.error), /node --check/);
@@ -415,26 +425,24 @@ describe("vendor digest + authority gates (audit round 4)", () => {
 		}
 	});
 
-	it("migrates a pre-digest vendor by writing .vendor-digest once (P2-N2 compatibility)", () => {
+	it("fails closed when vendor digest is missing instead of bootstrapping current bytes (P1-NEW-1)", () => {
 		const { root, worker, lib } = fakeOracleRoot();
 		const vendor = fakeVendorDir();
 		try {
-			// Remove any digest (pre-digest vendor state).
+			// A stale installed worker would otherwise trigger restore. The vendor
+			// run-job keeps every marker but is changed after the digest is removed.
 			rmSync(join(vendor, ".vendor-digest"), { force: true });
+			writeFileSync(join(vendor, "run-job.mjs"), `${readFileSync(join(vendor, "run-job.mjs"), "utf8")}\n// marker-preserving vendor mutation\n`);
 			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
 			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
 			writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
 			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
 			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
 			const result = ensureSolOraclePatches({ root, vendor });
-			assert.equal(result.ok, true);
-			assert.equal(result.restored, true);
-			// Digest should now exist and be valid.
-			const digest = JSON.parse(readFileSync(join(vendor, ".vendor-digest"), "utf8"));
-			assert.equal(typeof digest.oracleVersion, "string");
-			for (const name of [...WORKER_FILES, SOL_PATCH_FILE]) {
-				assert.equal(typeof digest[name], "string", `digest must bind ${name}`);
-			}
+			assert.equal(result.ok, false);
+			assert.match(String(result.error), /vendor \.vendor-digest is missing|trust root/i);
+			assert.equal(existsSync(join(vendor, ".vendor-digest")), false, "missing digest must never be recreated from current bytes");
+			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /export \{\}/, "stale worker must not be replaced");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(vendor, { recursive: true, force: true });

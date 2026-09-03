@@ -3,7 +3,7 @@ name: sol
 description: Relay research and planning questions to ChatGPT web GPT-5.6 Sol High via /sol and pi-oracle. Use before solving hard problems, when the user runs /sol, or when the local model needs a web-Sol advisor. Never drive chatgpt.com with agent_browser.
 compatibility: Pi coding agent
 metadata:
-  version: "1.14.2"
+  version: "1.14.3"
   status: "active"
   layer: "task"
   priority: "30"
@@ -81,7 +81,7 @@ This is a standing preference, not a one-off request: it applies to design / pla
 
 ## Procedure
 
-0. `/sol` already restores pi-oracle High/Power-slider worker patches on `session_start` and before this turn. **You** are the operator of that restore, not the user. The `oracle_submit` and `oracle_recover` tool gate re-checks patch integrity and hard-blocks failures; never bypass it, tell the user to run apply scripts, or downgrade the model.
+0. `/sol` already restores pi-oracle High/Power-slider worker patches on `session_start` and before this turn. **You** are the operator of that restore, not the user. The vendor digest must exist, parse, and match every vendored worker/library/patch byte; missing, malformed, or mismatching `vendor/.vendor-digest` fails closed and must never bootstrap a trust root from current vendor bytes. The `oracle_submit` and `oracle_recover` tool gate re-checks patch integrity and hard-blocks failures; never bypass it, tell the user to run apply scripts, or downgrade the model. The worker also fails closed when the ChatGPT model-selection UI does not positively prove High; an absent or unknown control is never treated as an assumed High selection.
 1. Call `oracle_preflight` with `provider: "chatgpt"`.
 2. If auth is missing/stale, call `oracle_auth` (`provider: "chatgpt"`) and preflight again. `/sol` is allowed to auto-sync Chrome cookies. If Chrome has the cookie DB locked, tell the user to quit Chrome and rerun `/sol-auth`. If auth hits Cloudflare「请稍候…」or `about:blank`, the Chrome UI is not English — tell them to put English first in `chrome://settings/languages`, relaunch Chrome, then `/sol-auth` again.
 3. If jobs fail with "redirected away from the expected authenticated chat origin" or readiness timeouts while the seed cookies are fresh, Cloudflare's managed challenge is blocking headless Chrome (the tab dies to `about:blank` after ~40s and the worker misreports it). The fix is `browser.runMode: "headed"` in `~/.pi/agent/extensions/oracle.json` — verify it is still there before debugging anything else.
@@ -151,7 +151,7 @@ node --experimental-strip-types --test extensions/__tests__/*.test.ts
 
 `--offline` against an empty cache is the actual closure test: any missing
 transitive dep surfaces as `Cannot find module 'nan'` or `ENOTCACHED` rather than
-silently passing. Expect `185 tests / 185 pass / 0 fail / 0 skipped`. Host toolchain
+silently passing. Expect `187 tests / 187 pass / 0 fail / 0 skipped`. Host toolchain
 (Node headers, C/C++ compiler, Python/node-gyp) is a normal native-addon
 prerequisite, not a closure defect. `com.apple.provenance` is SIP-protected and
 cannot be stripped with `xattr -c`; AppleDouble noise is archive hygiene, never a

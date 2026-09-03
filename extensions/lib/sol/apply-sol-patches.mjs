@@ -75,7 +75,10 @@ export const SOL_PATCH_MARKERS = {
 		"async function waitForChatGptModelPicker",
 		"async function trySelectPowerSliderHigh",
 		"Composer is ready but the model picker has not hydrated yet",
-		"!assumedDefaultThinkingFallback",
+		// Audit round 2026-09-03: unknown model-selection UI must not be
+		// promoted to High by an assumption; stale workers carrying the old
+		// assumedDefaultThinkingFallback path must be redeployed.
+		"refusing to assume the requested setting without positive UI evidence",
 		"visible compact selection is",
 		"function sanitizeProviderBlockerSnapshot",
 		"while the model is still streaming (Stop control visible)",

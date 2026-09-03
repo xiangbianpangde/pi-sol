@@ -64,6 +64,20 @@ const INCOMPLETE_COMPOSER = `
 - button "Send prompt" [disabled, ref=e90]
 `;
 
+// A usable composer plus a visible configuration surface is not enough to
+// prove High: UI drift may leave only labels that this worker cannot identify.
+// The worker must reject this state instead of treating an absent High control
+// as the default selection.
+const UNKNOWN_MODEL_CONFIGURATION = `
+- button "Add files and more" [expanded=false, ref=e188]
+- textbox "Chat with ChatGPT" [ref=e189]
+- button "Model selector" [expanded=true, ref=e190]
+- dialog "Configure model" [ref=e191]
+  - heading "Intelligence" [level=2, ref=e192]
+  - radio "Balanced" [checked=true, ref=e193]
+  - radio "Experimental" [checked=false, ref=e194]
+`;
+
 const INSTANT_CLOSED = `
 - button "Add files and more" [expanded=false, ref=e116]
 - textbox "Chat with ChatGPT" [ref=e117]
@@ -183,6 +197,13 @@ describe("composer before the High picker hydrates", () => {
 		assert.equal(snapshotHasModelOpener(INCOMPLETE_COMPOSER), false);
 		assert.equal(snapshotHasModelConfigurationUi(INCOMPLETE_COMPOSER), false);
 		assert.equal(snapshotCanSafelySkipModelConfiguration(INCOMPLETE_COMPOSER, THINKING_EXTENDED), false);
+	});
+
+	it("fails closed when configuration is visible but High is not positively identified", () => {
+		assert.equal(snapshotHasUsableComposerControls(UNKNOWN_MODEL_CONFIGURATION), true);
+		assert.equal(snapshotHasModelConfigurationUi(UNKNOWN_MODEL_CONFIGURATION), true);
+		assert.equal(snapshotStronglyMatchesRequestedModel(UNKNOWN_MODEL_CONFIGURATION, THINKING_EXTENDED), false);
+		assert.equal(snapshotCanSafelySkipModelConfiguration(UNKNOWN_MODEL_CONFIGURATION, THINKING_EXTENDED), false);
 	});
 });
 

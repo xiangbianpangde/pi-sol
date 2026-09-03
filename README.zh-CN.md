@@ -239,8 +239,8 @@ Could not find model family control for instant
 3. 若标记已齐全，已安装副本必须匹配已审核的 pristine hash 或可信 patched hash；第三种 hash 会 fail-closed。
 4. 若 vendored 版本缺少标记，会在 authority 校验后恢复可信 worker 副本。
 5. 若版本不同，`pi-sol` 仅在补丁可应用、authority/标记/语法检查全部通过时对新 pristine worker 自动 re-vendor；任何失败都会拒绝覆盖。
-6. 补丁检查失败会在工具层硬阻断 `oracle_submit` 与 `oracle_recover`，不存在只提示模型的绕过路径，也不会静默降级。
-7. 升级 `pi update npm:pi-oracle` 后若覆盖了文件，下次自动检查会按上述规则处理。
+6. 补丁检查失败会在工具层硬阻断 `oracle_submit` 与 `oracle_recover`，不存在只提示模型的绕过路径。
+7. 如果 ChatGPT 模型选择界面未知或无法正向证明 High，worker 会在上传/发送前 fail-closed；不会把缺失控件当作默认 High，也不会静默降级。若支持的运行遇到 effort 下拉菜单错误，Agent 可自行恢复补丁后以原档位重试。升级 `pi update npm:pi-oracle` 后若覆盖了文件，下次自动检查会按上述规则处理。
 
 ---
 
@@ -249,7 +249,7 @@ Could not find model family control for instant
 ### 模型选择
 - `/sol` 严格针对 ChatGPT Plus 上的 GPT-5.6 Sol **High**。
 - 内部预设名称为 `thinking_extended`。
-- **绝不静默降级**到 Instant 或 Standard。
+- **绝不静默降级**到 Instant 或 Standard；如果界面无法正向证明 High，worker 会在上传/发送前 fail-closed。
 
 ### 浏览器权限独占
 ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻止 `agent_browser` 打开以下域名：

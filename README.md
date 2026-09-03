@@ -243,8 +243,8 @@ Could not find model family control for instant
 3. If all markers are present, the installed copies must match either the reviewed pristine hashes or the trusted patched hashes; a third hash fails closed.
 4. If markers are missing on the vendored version, trusted worker copies are restored after the authority checks.
 5. If the installed version differs, `pi-sol` re-applies the patch to the new pristine worker and refreshes the vendor set only when the patch, authority checks, markers, and syntax checks all pass; otherwise it refuses to overwrite.
-6. A failed patch check hard-blocks `oracle_submit` and `oracle_recover`; there is no prompt-only warning path and no silent downgrade.
-7. If an effort-dropdown error occurs during a supported run, the agent may run the restore once and retry without downgrading.
+6. A failed patch check hard-blocks `oracle_submit` and `oracle_recover`; there is no prompt-only warning path.
+7. If the ChatGPT model-selection UI is unknown or cannot positively evidence High, the worker fails closed before upload/send. It never treats an absent control as assumed High and never silently downgrades. If an effort-dropdown error occurs during a supported run, the agent may run the restore once and retry without downgrading.
 
 ---
 
@@ -253,7 +253,7 @@ Could not find model family control for instant
 ### Model selection
 - `/sol` targets GPT-5.6 Sol **High** on ChatGPT Plus.
 - The internal preset name is `thinking_extended`.
-- `pi-sol` **never silently falls back** to Instant or Standard.
+- `pi-sol` **never silently falls back** to Instant or Standard; if the UI cannot positively verify High, the worker fails closed before upload/send.
 
 ### Browser ownership
 ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. `pi-sol` blocks `agent_browser` from opening:

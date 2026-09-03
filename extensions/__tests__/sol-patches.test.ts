@@ -111,6 +111,32 @@ describe("ensureSolOraclePatches", () => {
 		}
 	});
 
+	it("redeploys workers without positive High-selection evidence", () => {
+		const { root, worker, lib } = fakeOracleRoot();
+		try {
+			const currentRunJob = readFileSync(join(VENDOR, "run-job.mjs"), "utf8");
+			const legacyRunJob = currentRunJob.replace(
+				"refusing to assume the requested setting without positive UI evidence",
+				"legacy worker accepted an assumed model selection",
+			);
+			assert.notEqual(legacyRunJob, currentRunJob, "fixture must remove the positive-evidence redeploy marker");
+			copyFileSync(join(VENDOR, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
+			copyFileSync(join(VENDOR, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
+			writeFileSync(join(worker, "run-job.mjs"), legacyRunJob);
+			copyFileSync(join(VENDOR, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(VENDOR, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root });
+			assert.equal(result.ok, true);
+			assert.equal(result.restored, true);
+			assert.match(String(result.missing), /positive UI evidence/);
+			const restored = readFileSync(join(worker, "run-job.mjs"), "utf8");
+			assert.match(restored, /refusing to assume the requested setting without positive UI evidence/);
+			assert.doesNotMatch(restored, /assumedDefaultThinkingFallback/);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("restores vendor worker files after a simulated pi-oracle update", () => {
 		const { root, worker } = fakeOracleRoot();
 		try {

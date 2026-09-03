@@ -1661,7 +1661,6 @@ async function waitForChatGptModelPicker(job, timeoutMs = 20_000) {
 
 async function configureModel(job) {
   if (isGrokJob(job)) return configureGrokModel(job);
-  let assumedDefaultThinkingFallback = false;
   let initialSnapshot = await snapshotText(job);
   if (
     snapshotHasUsableComposerControls(initialSnapshot)
@@ -1705,21 +1704,11 @@ async function configureModel(job) {
   } else if (familyAlreadySelectedInUi) {
     await log("Model family already appears selected; verifying effort-specific settings");
   } else if (!familyEntry) {
-    // ChatGPT 新 UI：首页 headless 初始快照往往没有渲染出模型选择控件（如 High 按钮），
-    // 而默认档位就是 GPT-5.6 Sol High (= thinking family, extended)。找不到控件时按默认档位继续，
-    // 不再报错；只在非默认 family (pro/instant) 下才严格报错。
-    if (job.selection.modelFamily === "thinking") {
-      const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
-      if (visible && visible !== "high") {
-        throw new Error(`Could not find model family control for thinking; visible compact selection is ${visible}, not High`);
-      }
-      await log(`Model family control not found for thinking; assuming default ChatGPT High selection (family=thinking effort=extended) and continuing`);
-      familySnapshot = initialSnapshot;
-      verificationSnapshot = initialSnapshot;
-      assumedDefaultThinkingFallback = true;
-    } else {
-      throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
+    const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
+    if (visible) {
+      throw new Error(`Could not find model family control for ${job.selection.modelFamily}; visible compact selection is ${visible}, not the requested setting`);
     }
+    throw new Error(`Could not find model family control for ${job.selection.modelFamily}; refusing to assume the requested setting without positive UI evidence`);
   }
 
   let compactSelectionVerifiedAfterClick = false;
@@ -1743,7 +1732,7 @@ async function configureModel(job) {
     }
   }
 
-  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick && !assumedDefaultThinkingFallback) {
+  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick) {
     const effortLabel = requestedEffortLabel(job.selection);
     if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
       const opened = await openEffortDropdown(job);
@@ -1792,7 +1781,7 @@ async function configureModel(job) {
     }
   }
 
-  const stronglyVerified = compactSelectionVerifiedAfterClick || assumedDefaultThinkingFallback || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
+  const stronglyVerified = compactSelectionVerifiedAfterClick || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
   if (!stronglyVerified) {
     throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
   }

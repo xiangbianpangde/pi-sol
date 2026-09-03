@@ -27,7 +27,7 @@ Vendor patches (`extensions/lib/sol/vendor`) teach the worker:
 - Power-slider is not a model-configuration sheet
 - Instant / Medium must not skip as High
 - wait if the High button has not hydrated
-- assumed High fallback only when no other compact tier is visible
+- fail closed if the model-selection UI cannot positively prove High; an absent or unknown control is never treated as an assumed High fallback
 - follow-up send is accepted when the composer shows `Stop answering` (not only the old `Stop streaming` label)
 - reply is complete when Stop answering is gone and Send prompt is enabled again — do not wait for `Copy response` count to exceed the previous assistant count (that is what made /sol lag minutes behind the tab)
 
@@ -49,7 +49,7 @@ The admission path is intentionally separate from browser ownership and conversa
 3. It checks the provider auth-seed `SingletonLock`; a live manual owner blocks the worker so Chrome is never cloned while it is writing.
 4. For ChatGPT (the `/sol` provider), it opens `pi-sol-admission.lock` under the per-user private state dir (`PI_SOL_STATE_DIR`, default `~/.pi/agent/state`) and takes an exclusive non-blocking `flock(2)`, retrying on a bounded 5s window.
 5. It reads durable `oracle-*/job.json` records from `$PI_ORACLE_JOBS_DIR` and blocks only when the concurrency limit is reached (malformed records fail closed; other users' job dirs are ignored). The authoritative capacity check runs while holding the flock, so the decision is atomic with the reservation.
-6. The block reason names the active job, seed owner, or patch failure and tells the model to stop; it never changes the preset or silently retries.
+6. The admission block reason names the active job, seed owner, or patch failure and tells the model to stop; separately, an unverified High selection fails in the worker before upload/send. Neither path changes the preset or silently retries.
 7. `tool_result`, `tool_execution_end`, and `session_shutdown` release the lease by unlocking and closing the fd (one-shot; the kernel drops the lock on close).
 8. Process death auto-releases the flock — no TTL, no owner.json, no stale reclaim, no trash sweep. Never delete the lock path manually.
 

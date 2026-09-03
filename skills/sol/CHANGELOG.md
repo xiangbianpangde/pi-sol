@@ -1,5 +1,17 @@
 # sol CHANGELOG
 
+## 1.14.3 - 2026-09-03
+
+- **Closed the High-selection verification blocker**: the worker no longer
+  treats an absent or unrecognized ChatGPT model control as proof of the
+  default High tier. Unknown/unobservable model-selection UI now fails closed
+  before upload/send, and the redeploy marker forces old fallback workers to
+  be replaced.
+- Added a regression for a usable composer with visible but unrecognized model
+  configuration, and documented the positive-evidence/no-silent-downgrade
+  invariant in the README, design, and skill.
+- The release evidence suite is now **187/187** (`0 fail / 0 skipped`).
+
 ## 1.14.2 - 2026-09-03
 
 - **Closed the missing-digest trust-bootstrap blocker**: a missing

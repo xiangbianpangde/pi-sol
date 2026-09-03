@@ -387,8 +387,8 @@
      chatUrl: input.chatUrl,
      conversationId,
      responseFormat: "text/plain",
---- a/extensions/oracle/worker/run-job.mjs	2026-09-01 10:14:12
-+++ b/extensions/oracle/worker/run-job.mjs	2026-09-01 14:14:29
+--- a/extensions/oracle/worker/run-job.mjs
++++ b/extensions/oracle/worker/run-job.mjs
 @@ -34,11 +34,19 @@
    snapshotHasClosedCompactSelection,
    snapshotHasModelConfigurationUi,
@@ -608,7 +608,7 @@
        }
      }
  
-@@ -1526,14 +1643,49 @@
+@@ -1526,14 +1643,48 @@
    throw new Error(`Could not verify requested model settings after configuration for ${job.selection.modelFamily}`);
  }
  
@@ -631,7 +631,6 @@
  async function configureModel(job) {
    if (isGrokJob(job)) return configureGrokModel(job);
 -  const initialSnapshot = await snapshotText(job);
-+  let assumedDefaultThinkingFallback = false;
 +  let initialSnapshot = await snapshotText(job);
 +  if (
 +    snapshotHasUsableComposerControls(initialSnapshot)
@@ -659,48 +658,20 @@
    await log(`Configuring model family=${job.selection.modelFamily} effort=${job.selection?.effort || "(none)"}`);
    let familySnapshot = await openModelConfiguration(job);
    let verificationSnapshot = familySnapshot;
-@@ -1553,7 +1705,21 @@
+@@ -1553,7 +1704,11 @@
    } else if (familyAlreadySelectedInUi) {
      await log("Model family already appears selected; verifying effort-specific settings");
    } else if (!familyEntry) {
 -    throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
-+    // ChatGPT 新 UI：首页 headless 初始快照往往没有渲染出模型选择控件（如 High 按钮），
-+    // 而默认档位就是 GPT-5.6 Sol High (= thinking family, extended)。找不到控件时按默认档位继续，
-+    // 不再报错；只在非默认 family (pro/instant) 下才严格报错。
-+    if (job.selection.modelFamily === "thinking") {
-+      const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
-+      if (visible && visible !== "high") {
-+        throw new Error(`Could not find model family control for thinking; visible compact selection is ${visible}, not High`);
-+      }
-+      await log(`Model family control not found for thinking; assuming default ChatGPT High selection (family=thinking effort=extended) and continuing`);
-+      familySnapshot = initialSnapshot;
-+      verificationSnapshot = initialSnapshot;
-+      assumedDefaultThinkingFallback = true;
-+    } else {
-+      throw new Error(`Could not find model family control for ${job.selection.modelFamily}`);
++    const visible = describeCompactComposerSelection(familySnapshot || initialSnapshot);
++    if (visible) {
++      throw new Error(`Could not find model family control for ${job.selection.modelFamily}; visible compact selection is ${visible}, not the requested setting`);
 +    }
++    throw new Error(`Could not find model family control for ${job.selection.modelFamily}; refusing to assume the requested setting without positive UI evidence`);
    }
  
    let compactSelectionVerifiedAfterClick = false;
-@@ -1577,7 +1743,7 @@
-     }
-   }
- 
--  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick) {
-+  if ((job.selection.modelFamily === "thinking" || job.selection.modelFamily === "pro") && !compactSelectionVerifiedAfterClick && !assumedDefaultThinkingFallback) {
-     const effortLabel = requestedEffortLabel(job.selection);
-     if (effortLabel && !effortSelectionVisible(familySnapshot, effortLabel)) {
-       const opened = await openEffortDropdown(job);
-@@ -1626,7 +1792,7 @@
-     }
-   }
- 
--  const stronglyVerified = compactSelectionVerifiedAfterClick || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
-+  const stronglyVerified = compactSelectionVerifiedAfterClick || assumedDefaultThinkingFallback || snapshotStronglyMatchesRequestedModel(verificationSnapshot, job.selection);
-   if (!stronglyVerified) {
-     throw new Error(`Could not verify requested model settings in configuration UI for ${job.selection.modelFamily}`);
-   }
-@@ -1711,48 +1877,12 @@
+@@ -1711,48 +1866,12 @@
  }
  
  async function assistantMessages(job) {
@@ -754,7 +725,7 @@
  }
  
  async function grokAssistantMessages(job) {
-@@ -1812,24 +1942,49 @@
+@@ -1812,24 +1931,49 @@
    return previousChatUrl || stripUrlQueryAndHash(await currentUrl(job));
  }
  
@@ -810,7 +781,7 @@
  
      if (!hasStopStreaming && hasRetryButton && responseFailureText) {
        if (!retriedAfterFailure) {
-@@ -1851,6 +2006,15 @@
+@@ -1851,6 +1995,15 @@
      }
  
      let completionSignature;
@@ -826,10 +797,12 @@
      if (!hasStopStreaming && targetText && (hasTargetCopyResponse || isGrokJob(job))) {
        completionSignature = deriveAssistantCompletionSignature({
          hasStopStreaming,
-@@ -1886,6 +2050,162 @@
-   throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
- }
+@@ -1884,8 +2037,164 @@
+   }
  
+   throw new Error(`Timed out waiting for ${isGrokJob(job) ? "Grok" : "ChatGPT"} response completion`);
++}
++
 +async function conversationTurnRecords(job) {
 +  // Canonical logical turn parser: merges role container + message-id child +
 +  // testid into ONE record per logical message via closest() role merge
@@ -907,8 +880,8 @@
 +    `),
 +  );
 +  return Array.isArray(result?.records) ? result.records : [];
-+}
-+
+ }
+ 
 +async function promptFromConversationUserTurn(job, responseIndex) {
 +  // Canonical predecessor: uses the unified conversationTurnRecords domain
 +  // shared with baseline counting and target extraction. The element
@@ -989,7 +962,7 @@
  async function sha256(path) {
    const buffer = await readFile(path);
    return createHash("sha256").update(buffer).digest("hex");
-@@ -2355,6 +2675,108 @@
+@@ -2355,6 +2664,108 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await waitForOracleReady(currentJob);
@@ -1098,7 +1071,7 @@
      currentJob = await mutateJob((job) => transitionOracleJobPhase(job, "configuring_model", {
        at: new Date().toISOString(),
        source: "oracle:worker",
-@@ -2369,17 +2791,56 @@
+@@ -2369,17 +2780,56 @@
        patch: { heartbeatAt: new Date().toISOString() },
      }));
      await uploadArchive(currentJob);
@@ -1159,7 +1132,7 @@
      const awaitingResponsePatch = {
        heartbeatAt: new Date().toISOString(),
        ...(observedConversationId ? { chatUrl: observedChatUrl, conversationId: observedConversationId } : {}),
-@@ -2391,7 +2852,7 @@
+@@ -2391,7 +2841,7 @@
        patch: awaitingResponsePatch,
      }));
  

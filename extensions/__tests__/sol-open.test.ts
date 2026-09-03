@@ -3,14 +3,16 @@
  * Run: node --experimental-strip-types --test extensions/__tests__/sol-open.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 
 import {
 	detectChromeExecutablePath,
 	formatSolOpenResult,
+	liveSolSeedLock,
 	normalizeSolOpenUrl,
 	openSolOracleBrowser,
 	readSolOracleBrowserConfig,
@@ -200,12 +202,13 @@ describe("normalizeSolOpenUrl", () => {
 	});
 
 	it("rejects javascript: and file: starts", () => {
-		assert.throws(() => normalizeSolOpenUrl("javascript:alert(1)", "chatgpt"), /only http\(s\)/);
-		assert.throws(() => normalizeSolOpenUrl("file:///etc/passwd", "chatgpt"), /only http\(s\)/);
+		assert.throws(() => normalizeSolOpenUrl("javascript:alert(1)", "chatgpt"), /only https/);
+		assert.throws(() => normalizeSolOpenUrl("file:///etc/passwd", "chatgpt"), /only https/);
+		assert.throws(() => normalizeSolOpenUrl("http://chatgpt.com/", "chatgpt"), /only https/);
 	});
 
 	it("rejects a relative or unparseable url", () => {
-		assert.throws(() => normalizeSolOpenUrl("chatgpt.com", "chatgpt"), /expected an absolute http\(s\) URL/);
+		assert.throws(() => normalizeSolOpenUrl("chatgpt.com", "chatgpt"), /expected an absolute https URL/);
 	});
 });
 
@@ -243,6 +246,7 @@ describe("openSolOracleBrowser", () => {
 			existsFn: () => true,
 			executablePath: undefined,
 			config: { authSeedProfileDir: "/seed" },
+			activeJobsFn: () => [],
 		});
 		assert.equal(result.ok, false);
 		assert.equal(result.reason, "no-chrome");
@@ -259,6 +263,7 @@ describe("openSolOracleBrowser", () => {
 			existsFn: () => true,
 			executablePath: "/chrome",
 			spawnFn: (exe, args) => { seen.push({ exe, args }); return { pid: 4321, unref: () => { unrefed += 1; } }; },
+			activeJobsFn: () => [],
 		});
 		assert.equal(result.ok, true);
 		assert.equal(result.launched, true);
@@ -279,7 +284,8 @@ describe("openSolOracleBrowser", () => {
 			executablePath: "/chrome",
 			url: "file:///etc/passwd",
 			spawnFn: () => { spawned += 1; return { pid: 1 }; },
-		}), /only http\(s\)/);
+			activeJobsFn: () => [],
+		}), /only https/);
 		assert.equal(spawned, 0);
 	});
 
@@ -293,7 +299,75 @@ describe("openSolOracleBrowser", () => {
 			executablePath: "/chrome",
 			url: "javascript:alert(1)",
 			spawnFn: () => ({ pid: 1 }),
-		}), /only http\(s\)/);
+			activeJobsFn: () => [],
+		}), /only https/);
+	});
+
+	it("blocks a manual launch while a provider job is active", () => {
+		let spawned = 0;
+		const result = openSolOracleBrowser({
+			profileDir: "/seed",
+			singletonPid: () => undefined,
+			existsFn: () => true,
+			executablePath: "/chrome",
+			activeJobsFn: () => [{ id: "job-1", status: "waiting", dir: "/jobs/oracle-job-1" }],
+			spawnFn: () => { spawned += 1; return { pid: 1 }; },
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.reason, "active-jobs");
+		assert.match(result.message, /jobs are active/);
+		assert.equal(spawned, 0);
+	});
+
+	it("preflights a stale executable path without spawning", () => {
+		let spawned = 0;
+		const result = openSolOracleBrowser({
+			profileDir: "/seed",
+			singletonPid: () => undefined,
+			existsFn: () => true,
+			executablePath: "/definitely/not/a/chrome",
+			activeJobsFn: () => [],
+			spawnFn: undefined,
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.reason, "no-chrome");
+		assert.match(result.message, /missing or not executable/);
+		assert.equal(spawned, 0);
+	});
+
+	it("consumes an asynchronous spawn error and reports it through the callback", () => {
+		const child = new EventEmitter() as EventEmitter & { pid?: number; unref?: () => void };
+		child.pid = 4322;
+		const errors: Error[] = [];
+		const result = openSolOracleBrowser({
+			profileDir: "/seed",
+			singletonPid: () => undefined,
+			existsFn: () => true,
+			executablePath: "/chrome",
+			activeJobsFn: () => [],
+			spawnFn: () => child,
+			onSpawnError: (error) => errors.push(error),
+		});
+		assert.equal(result.ok, true);
+		child.emit("error", new Error("spawn ENOENT"));
+		assert.equal(errors.length, 1);
+		assert.match(errors[0]!.message, /ENOENT/);
+	});
+
+	it("reports a live provider seed lock for the submit gate", () => {
+		const { home, extDir, cleanup } = tempHome();
+		const seed = join(home, "seed");
+		try {
+			mkdirSync(seed, { recursive: true });
+			writeConfig(extDir, JSON.stringify({ browser: { authSeedProfileDir: seed } }));
+			// `SingletonLock` is a hostname-pid symlink in Chromium profiles.
+			// Use this process so pidIsAlive is deterministic and real.
+			symlinkSync(`${hostname()}-${process.pid}`, join(seed, "SingletonLock"));
+			const lock = liveSolSeedLock("chatgpt", { HOME: home });
+			assert.deepEqual(lock, { profileDir: seed, pid: process.pid });
+		} finally {
+			cleanup();
+		}
 	});
 
 	it("fails when the child dies before reporting a pid", () => {
@@ -303,6 +377,7 @@ describe("openSolOracleBrowser", () => {
 			existsFn: () => true,
 			executablePath: "/chrome",
 			spawnFn: () => ({}),
+			activeJobsFn: () => [],
 		});
 		assert.equal(result.ok, false);
 		assert.match(result.message, /exited before reporting a pid/);

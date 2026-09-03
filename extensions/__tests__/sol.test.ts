@@ -1,11 +1,11 @@
 /**
  * /sol helpers.
- * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol.test.ts
+ * Run: node --experimental-strip-types --test extensions/__tests__/sol.test.ts
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile, utimes } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ import { describe, it } from "node:test";
 import { acquireSolSubmitLease, oracleMaxConcurrentJobs, releaseSolSubmitLease } from "../lib/sol/admission.ts";
 import { stageSolFiles, validateSolFileMeta } from "../lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt, chatgptHostFromUrl } from "../lib/sol/guard.ts";
-import { formatSolJobSummary, listActiveSolJobs, readSolJob } from "../lib/sol/jobs.ts";
+import { formatSolJobSummary, isCanonicalSolJobId, listActiveSolJobs, listRecentSolJobIds, readSolJob } from "../lib/sol/jobs.ts";
 import { MAX_IMAGE_BYTES, SOL_PRESET } from "../lib/sol/limits.ts";
 import { parseSolInput } from "../lib/sol/parse.ts";
 import { buildSolDispatchPrompt, buildSolRecoverGuidance, buildSolStandingRule } from "../lib/sol/prompt.ts";
@@ -94,6 +94,28 @@ describe("stageSolFiles", () => {
 		}
 	});
 
+	it("keeps same-basename outside files as distinct staged entries", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "sol-collision-cwd-"));
+		const firstDir = await mkdtemp(join(tmpdir(), "sol-collision-a-"));
+		const secondDir = await mkdtemp(join(tmpdir(), "sol-collision-b-"));
+		try {
+			const first = join(firstDir, "same.md");
+			const second = join(secondDir, "same.md");
+			await writeFile(first, "AAA");
+			await writeFile(second, "BBB");
+			const result = await stageSolFiles(cwd, [first, second], { requestId: "collision" });
+			assert.equal(result.issues.length, 0);
+			assert.equal(result.files.length, 2);
+			assert.notEqual(result.files[0]?.relative, result.files[1]?.relative);
+			assert.equal(await readFile(join(cwd, result.files[0]!.relative), "utf8"), "AAA");
+			assert.equal(await readFile(join(cwd, result.files[1]!.relative), "utf8"), "BBB");
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+			await rm(firstDir, { recursive: true, force: true });
+			await rm(secondDir, { recursive: true, force: true });
+		}
+	});
+
 	it("writes request.md when no files are given", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "sol-empty-"));
 		try {
@@ -125,6 +147,33 @@ describe("guard", () => {
 });
 
 describe("jobs + prompt", () => {
+	it("accepts only canonical UUIDv4 job IDs", () => {
+		assert.equal(isCanonicalSolJobId("123e4567-e89b-42d3-a456-426614174000"), true);
+		assert.equal(isCanonicalSolJobId("../../secret"), false);
+		assert.equal(isCanonicalSolJobId("active"), false);
+	});
+
+	it("rejects path traversal and keeps response reads inside the job directory", async () => {
+		const jobsDir = await mkdtemp(join(tmpdir(), "sol-read-jobs-"));
+		const secret = await mkdtemp(join(tmpdir(), "sol-read-secret-"));
+		const id = "123e4567-e89b-42d3-a456-426614174000";
+		try {
+			const jobDir = join(jobsDir, `oracle-${id}`);
+			await mkdir(jobDir, { recursive: true });
+			await writeFile(join(secret, "response.md"), "TOP SECRET");
+			await writeFile(join(jobDir, "job.json"), JSON.stringify({ id, status: "complete", responsePath: join(secret, "response.md") }));
+			assert.equal(readSolJob("../../secret", jobsDir), undefined);
+			const job = readSolJob(id, jobsDir);
+			assert.ok(job);
+			assert.equal(job?.responsePath, undefined);
+			assert.equal(job?.responsePreview, undefined);
+			assert.deepEqual(listRecentSolJobIds(5, jobsDir), [id]);
+		} finally {
+			await rm(jobsDir, { recursive: true, force: true });
+			await rm(secret, { recursive: true, force: true });
+		}
+	});
+
 	it("lists only active ChatGPT jobs for admission", async () => {
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-admission-"));
 		try {

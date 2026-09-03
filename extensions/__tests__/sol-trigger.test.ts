@@ -1,6 +1,6 @@
 /**
  * /sol record-only trigger classifier.
- * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-trigger.test.ts
+ * Run: node --experimental-strip-types --test extensions/__tests__/sol-trigger.test.ts
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";

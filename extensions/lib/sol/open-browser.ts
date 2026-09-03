@@ -13,9 +13,11 @@
  * to pi-oracle's documented defaults.
  */
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, readlinkSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.ts";
 
 export const ORACLE_CONFIG_BASENAME = "oracle.json";
 export const DEFAULT_AUTH_SEED_BASENAME = "oracle-auth-seed-profile";
@@ -111,6 +113,29 @@ export function pidIsAlive(pid: number): boolean {
 	}
 }
 
+/** A synchronous preflight used only for the real Chrome launch path. */
+export function isExecutableFile(path: string): boolean {
+	try {
+		return statSync(path).isFile() && (accessSync(path, fsConstants.X_OK), true);
+	} catch {
+		return false;
+	}
+}
+
+export type SolSeedLock = {
+	profileDir: string;
+	pid: number;
+};
+
+/** Return the live manual-browser owner for a provider's auth seed, if any. */
+export function liveSolSeedLock(provider = "chatgpt", env: NodeJS.ProcessEnv = process.env): SolSeedLock | undefined {
+	const normalizedProvider = provider.toLowerCase() === "grok" ? "grok" : "chatgpt";
+	const config = readSolOracleBrowserConfig(env);
+	const profileDir = seedProfileDirForProvider(normalizedProvider, config);
+	const pid = singletonOwnerPid(profileDir);
+	return pid === undefined ? undefined : { profileDir, pid };
+}
+
 /**
  * The manual launch arg set. Deliberately NOT the worker's set:
  *   - no --remote-debugging-port / --remote-allow-origins → no CDP surface, and
@@ -143,7 +168,7 @@ export function solOpenBrowserArgs(profileDir: string, url: string): string[] {
 	];
 }
 
-/** Only http(s) start URLs; blocks file://, chrome:// and javascript:// surprises. */
+/** Only HTTPS start URLs; never put an authenticated seed on plain HTTP. */
 export function normalizeSolOpenUrl(raw: string | undefined, provider: string): string {
 	const fallback = DEFAULT_PROVIDER_URLS[provider] ?? DEFAULT_PROVIDER_URLS.chatgpt!;
 	if (!raw) return fallback;
@@ -151,10 +176,10 @@ export function normalizeSolOpenUrl(raw: string | undefined, provider: string): 
 	try {
 		parsed = new URL(raw.trim());
 	} catch {
-		throw new Error(`Invalid --url ${JSON.stringify(raw)}: expected an absolute http(s) URL`);
+		throw new Error(`Invalid --url ${JSON.stringify(raw)}: expected an absolute https URL`);
 	}
-	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-		throw new Error(`Invalid --url protocol ${parsed.protocol}: only http(s) may be opened`);
+	if (parsed.protocol !== "https:") {
+		throw new Error(`Invalid --url protocol ${parsed.protocol}: only https may be opened`);
 	}
 	return parsed.toString();
 }
@@ -162,7 +187,13 @@ export function normalizeSolOpenUrl(raw: string | undefined, provider: string): 
 export type SolOpenResult =
 	| { ok: true; launched: true; pid: number; profileDir: string; url: string; executablePath: string }
 	| { ok: true; launched: false; alreadyOpenPid: number; profileDir: string }
-	| { ok: false; reason: "no-profile" | "no-chrome"; profileDir: string; message: string };
+	| { ok: false; reason: "no-profile" | "no-chrome" | "active-jobs"; profileDir: string; message: string };
+
+type SolOpenChild = {
+	pid?: number;
+	unref?: () => void;
+	on?: (event: "error", listener: (error: unknown) => void) => unknown;
+};
 
 export type SolOpenDeps = {
 	env?: NodeJS.ProcessEnv;
@@ -171,7 +202,11 @@ export type SolOpenDeps = {
 	url?: string;
 	profileDir?: string;
 	executablePath?: string;
-	spawnFn?: (exe: string, args: string[]) => { pid?: number; unref?: () => void };
+	spawnFn?: (exe: string, args: string[]) => SolOpenChild;
+	executableReadyFn?: (path: string) => boolean;
+	/** Injectable for tests; production scans durable jobs before opening a seed. */
+	activeJobsFn?: (provider: string) => SolJobSummary[];
+	onSpawnError?: (error: Error) => void;
 	existsFn?: (p: string) => boolean;
 	singletonPid?: (profileDir: string) => number | undefined;
 };
@@ -183,7 +218,7 @@ export type SolOpenDeps = {
 export function openSolOracleBrowser(deps: SolOpenDeps = {}): SolOpenResult {
 	const env = deps.env ?? process.env;
 	const config = deps.config ?? readSolOracleBrowserConfig(env);
-	const provider = deps.provider ?? "chatgpt";
+	const provider = deps.provider?.toLowerCase() === "grok" ? "grok" : "chatgpt";
 	// Validate the caller's URL before touching the filesystem or probing the
 	// Chromium singleton, so a malformed command always reports the usage error
 	// instead of being masked by an "already open" short-circuit.
@@ -200,6 +235,32 @@ export function openSolOracleBrowser(deps: SolOpenDeps = {}): SolOpenResult {
 			message: `Oracle ${provider} auth seed not found at ${profileDir}. Run /sol-auth first to create it.`,
 		};
 	}
+
+	// A manual window and a live worker must never touch the same seed. The
+	// reciprocal check complements the tool_call SingletonLock check: opening
+	// is rejected while a durable job is cloning/using this provider's seed.
+	let activeJobs: SolJobSummary[];
+	try {
+		activeJobs = (deps.activeJobsFn ?? ((selectedProvider) => listActiveSolJobs(getOracleJobsDir(env), { provider: selectedProvider })))(provider);
+	} catch (error) {
+		return {
+			ok: false,
+			reason: "active-jobs",
+			profileDir,
+			message: `Cannot verify active oracle jobs before opening ${profileDir}: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (activeJobs.length > 0) {
+		const shown = activeJobs.slice(0, 3).map((job) => `${job.id} (${job.status})`).join(", ");
+		const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
+		return {
+			ok: false,
+			reason: "active-jobs",
+			profileDir,
+			message: `Cannot open oracle ${provider} auth seed while jobs are active: ${shown}${suffix}. Wait for them to finish before changing the seed.`,
+		};
+	}
+
 	const executablePath = deps.executablePath ?? config.executablePath;
 	if (!executablePath) {
 		return {
@@ -209,8 +270,27 @@ export function openSolOracleBrowser(deps: SolOpenDeps = {}): SolOpenResult {
 			message: "No Chrome executable found. Set browser.executablePath in ~/.pi/agent/extensions/oracle.json.",
 		};
 	}
+	// A real spawn failure is delivered asynchronously by ChildProcess. Do a
+	// synchronous file/access preflight first, while still installing an error
+	// listener below for races (permission changes, mount failures, etc.). A
+	// custom spawnFn is a test seam and supplies its own readiness decision.
+	const executableReady = deps.executableReadyFn ?? (deps.spawnFn ? (() => true) : isExecutableFile);
+	if (!executableReady(executablePath)) {
+		return {
+			ok: false,
+			reason: "no-chrome",
+			profileDir,
+			message: `Chrome executable is missing or not executable: ${executablePath}. Fix browser.executablePath in ~/.pi/agent/extensions/oracle.json.`,
+		};
+	}
 	const spawnFn = deps.spawnFn ?? ((exe, args) => spawn(exe, args, { detached: true, stdio: "ignore" }));
 	const child = spawnFn(executablePath, solOpenBrowserArgs(profileDir, url));
+	child.on?.("error", (rawError) => {
+		const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+		// Always consume the EventEmitter error so a stale executable can never
+		// terminate Pi. The command handler supplies the user-facing callback.
+		try { deps.onSpawnError?.(error); } catch { /* a diagnostic callback must not escape */ }
+	});
 	child.unref?.();
 	const pid = child.pid;
 	if (typeof pid !== "number") {

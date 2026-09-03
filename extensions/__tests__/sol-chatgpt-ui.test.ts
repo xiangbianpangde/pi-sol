@@ -1,6 +1,6 @@
 /**
  * ChatGPT Plus compact High / Power-slider UI used by /sol (pi-oracle 0.7.20).
- * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-chatgpt-ui.test.ts
+ * Run: node --experimental-strip-types --test extensions/__tests__/sol-chatgpt-ui.test.ts
  *
  * These fixtures are trimmed from real 2026-08-18 oracle snapshots:
  * - closed High button → successful thinking_extended job 72bd9e38

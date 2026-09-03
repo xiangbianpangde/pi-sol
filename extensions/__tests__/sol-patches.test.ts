@@ -1,7 +1,7 @@
 /**
  * /sol auto-restores pi-oracle High/Power-slider worker patches.
  * The human does not run this. Pi's /sol extension (and the in-Pi model) does.
- * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-patches.test.ts
+ * Run: node --experimental-strip-types --test extensions/__tests__/sol-patches.test.ts
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -104,9 +104,10 @@ describe("ensureSolOraclePatches", () => {
 	it("restores vendor worker files after a simulated pi-oracle update", () => {
 		const { root, worker } = fakeOracleRoot();
 		try {
-			writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export function detectCompactIntelligenceSelection() {}\n");
-			writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {};\n");
-			writeFileSync(join(worker, "run-job.mjs"), "async function configureModel() { throw new Error('Could not open effort dropdown'); }\n");
+			// A real unpatched same-version install has the reviewed pristine
+			// bytes, not arbitrary stubs. This keeps the authority gate honest
+			// while still exercising marker-driven restoration.
+			writePristineWorker(root, worker, VENDOR);
 			const result = ensureSolOraclePatches({ root });
 			assert.equal(result.ok, true);
 			assert.equal(result.restored, true);
@@ -233,6 +234,9 @@ describe("ensureSolOraclePatches", () => {
 			// Vendor copy carries all markers but is syntactically broken.
 			const broken = `${SOL_PATCH_MARKERS.runJob.join("\n")}\nasync function broken( {\n`;
 			writeFileSync(join(vendor, "run-job.mjs"), broken);
+			// Deliberately model a pre-digest vendor so this test reaches the
+			// post-copy syntax gate rather than the earlier integrity gate.
+			rmSync(join(vendor, ".vendor-digest"), { force: true });
 			const result = ensureSolOraclePatches({ root, vendor });
 			assert.equal(result.ok, false);
 			assert.match(String(result.error), /node --check/);
@@ -428,8 +432,50 @@ describe("vendor digest + authority gates (audit round 4)", () => {
 			// Digest should now exist and be valid.
 			const digest = JSON.parse(readFileSync(join(vendor, ".vendor-digest"), "utf8"));
 			assert.equal(typeof digest.oracleVersion, "string");
-			assert.equal(typeof digest["tools.ts"], "string");
-			assert.equal(typeof digest["jobs.ts"], "string");
+			for (const name of [...WORKER_FILES, SOL_PATCH_FILE]) {
+				assert.equal(typeof digest[name], "string", `digest must bind ${name}`);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(vendor, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects marker-preserving mutations of every deployed worker or patch file", () => {
+		for (const name of [...WORKER_FILES, SOL_PATCH_FILE]) {
+			const { root, worker, lib } = fakeOracleRoot();
+			const vendor = fakeVendorDir();
+			try {
+				copyFileSync(join(vendor, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
+				copyFileSync(join(vendor, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
+				copyFileSync(join(vendor, "run-job.mjs"), join(worker, "run-job.mjs"));
+				copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+				copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+				writeFileSync(join(vendor, name), readFileSync(join(vendor, name), "utf8") + "\n// tampered\n");
+				const result = ensureSolOraclePatches({ root, vendor });
+				assert.equal(result.ok, false, `${name} mutation must fail closed`);
+				assert.match(String(result.error), /digest mismatch/);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+				rmSync(vendor, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("rejects a marker-preserving installed run-job mutation on the fast path", () => {
+		const { root, worker, lib } = fakeOracleRoot();
+		const vendor = fakeVendorDir();
+		try {
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.mjs"), join(worker, "chatgpt-ui-helpers.mjs"));
+			copyFileSync(join(vendor, "chatgpt-ui-helpers.d.mts"), join(worker, "chatgpt-ui-helpers.d.mts"));
+			const runJob = readFileSync(join(vendor, "run-job.mjs"), "utf8") + "\n// semantic drift with all markers retained\n";
+			writeFileSync(join(worker, "run-job.mjs"), runJob);
+			copyFileSync(join(vendor, "tools.ts"), join(lib, "tools.ts"));
+			copyFileSync(join(vendor, "jobs.ts"), join(lib, "jobs.ts"));
+			const result = ensureSolOraclePatches({ root, vendor });
+			assert.equal(result.ok, false);
+			assert.match(String(result.error), /authority hash fail-closed/);
+			assert.match(readFileSync(join(worker, "run-job.mjs"), "utf8"), /semantic drift/);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(vendor, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 /**
  * /sol trigger-log: default-path resolution, default write, redaction.
- * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-trigger-log.test.ts
+ * Run: node --experimental-strip-types --test extensions/__tests__/sol-trigger-log.test.ts
  */
 import assert from "node:assert/strict";
 import { mkdirSync, statSync, writeFileSync } from "node:fs";

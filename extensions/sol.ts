@@ -17,7 +17,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { acquireSolSubmitLease, releaseSolSubmitLease, type SolSubmitLease } from "./lib/sol/admission.ts";
 import { stageSolFiles } from "./lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt } from "./lib/sol/guard.ts";
-import { formatSolJobSummary, listRecentSolJobIds, readSolJob } from "./lib/sol/jobs.ts";
+import { formatSolJobSummary, isCanonicalSolJobId, listRecentSolJobIds, readSolJob } from "./lib/sol/jobs.ts";
 import { SOL_PRESET_LABEL } from "./lib/sol/limits.ts";
 import {
 	formatSolUserCommand,
@@ -25,7 +25,7 @@ import {
 	parseSolInput,
 	type ParsedSolInput,
 } from "./lib/sol/parse.ts";
-import { ensureSolOraclePatches, formatSolPatchNote } from "./lib/sol/patches.ts";
+import { ensureSolOraclePatches, formatSolPatchNote, type SolPatchResult } from "./lib/sol/patches.ts";
 import { buildSolAuthPrompt, buildSolDispatchPrompt, buildSolRecoverGuidance, buildSolStandingRule, SOL_SKILL_NAME } from "./lib/sol/prompt.ts";
 import { classifySolTrigger, DETECTOR_RULESET, hashSolText, normalizeSolText } from "./lib/sol/trigger-detect.ts";
 import {
@@ -38,7 +38,7 @@ import {
 	resolveSolTriggerLogPath,
 	type SolTriggerPhase,
 } from "./lib/sol/trigger-log.ts";
-import { formatSolOpenResult, openSolOracleBrowser } from "./lib/sol/open-browser.ts";
+import { formatSolOpenResult, liveSolSeedLock, openSolOracleBrowser } from "./lib/sol/open-browser.ts";
 
 const SOL_USAGE = "Usage: /sol [--bg] [--follow <job-id>] [--files a,b] <prompt>";
 
@@ -103,14 +103,35 @@ async function stageAndDispatch(cwd: string, input: Extract<ParsedSolInput, { co
 	};
 }
 
+function checkSolPatchHealth(): SolPatchResult {
+	try {
+		return ensureSolOraclePatches();
+	} catch (error) {
+		return {
+			ok: false,
+			restored: false,
+			missing: [],
+			root: "unknown",
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
 function applyWorkerPatches(systemPrompt: string): string {
-	const note = formatSolPatchNote(ensureSolOraclePatches());
+	const note = formatSolPatchNote(checkSolPatchHealth());
 	return note ? `${systemPrompt}${note}` : systemPrompt;
+}
+
+function patchHealthBlockReason(result: SolPatchResult, phase: string): string {
+	const detail = result.error ?? (result.missing.length > 0 ? result.missing.join(", ") : "unknown worker integrity failure");
+	return `pi-sol worker patch integrity check failed (${detail}); oracle_${phase} is blocked fail-closed. Do not bypass the check or downgrade the model.`;
 }
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async () => {
-		ensureSolOraclePatches();
+		// Startup is best-effort for ordinary Pi sessions; the capacity-consuming
+		// tool gate below performs the authoritative fail-closed check.
+		checkSolPatchHealth();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -190,15 +211,27 @@ export default function (pi: ExtensionAPI) {
 			if (phase) {
 				const session = sessionOf(ctx);
 				let admissionBlockReason: string | undefined;
+				let patchBlockReason: string | undefined;
+				let seedBlockReason: string | undefined;
 				// Capacity-consuming oracle tools: oracle_submit and oracle_recover
-				// both launch a browser worker that consumes ChatGPT capacity, so
-				// both go through the kernel-flock admission gate (audit round
-				// 2026-09-01 oracle_recover). oracle_read/preflight/auth do not.
+				// both launch a browser worker that consumes browser/account capacity.
+				// Before either can execute, verify worker integrity and ensure the
+				// provider's manual auth seed is not being written by Chrome.
 				if (phase === "submit" || phase === "recover") {
-					const provider = (event.input as { provider?: unknown } | undefined)?.provider;
+					const rawProvider = (event.input as { provider?: unknown } | undefined)?.provider;
+					const provider = typeof rawProvider === "string" && rawProvider.toLowerCase() === "grok" ? "grok" : "chatgpt";
+					const patchHealth = checkSolPatchHealth();
+					if (!patchHealth.ok) {
+						patchBlockReason = patchHealthBlockReason(patchHealth, phase);
+					} else {
+						const seedLock = liveSolSeedLock(provider);
+						if (seedLock) {
+							seedBlockReason = `Oracle ${provider} auth seed is open in the manual Chrome window (PID ${seedLock.pid}): ${seedLock.profileDir}. Close that window before oracle_${phase}; the seed must not be cloned while Chrome is writing it.`;
+						}
+					}
 					// /sol always uses ChatGPT. Leave Grok's independent admission
 					// policy untouched when an agent explicitly invokes it.
-					if (typeof provider !== "string" || provider.toLowerCase() !== "grok") {
+					if (!patchBlockReason && !seedBlockReason && provider !== "grok") {
 						const admission = await acquireSolSubmitLease();
 						if (admission.acquired) {
 							submitLeases.set(event.toolCallId, admission.lease);
@@ -230,17 +263,23 @@ export default function (pi: ExtensionAPI) {
 					near: false,
 					needs_confirmation: false,
 					matches: [],
-					suppressed: admissionBlockReason ? ["chatgpt-submit-admission-busy"] : [],
+					suppressed: [
+						...(admissionBlockReason ? ["chatgpt-submit-admission-busy"] : []),
+						...(patchBlockReason ? ["oracle-worker-patch-integrity-failed"] : []),
+						...(seedBlockReason ? ["oracle-auth-seed-open"] : []),
+					],
 					confidence: 0,
 					score: 0,
 					char_count: 0,
 					ruleset_version: DETECTOR_RULESET,
-					preview: `oracle_${phase} ${admissionBlockReason ? "blocked-admission" : assoc ?? (dispatch ? "in-dispatch" : "manual")}`,
+					preview: `oracle_${phase} ${patchBlockReason ? "blocked-patch-integrity" : seedBlockReason ? "blocked-seed-open" : admissionBlockReason ? "blocked-admission" : assoc ?? (dispatch ? "in-dispatch" : "manual")}`,
 					dispatch_id: dispatch?.dispatchId,
 					oracle_phase: phase,
 					assoc,
 				});
-				if (admissionBlockReason) return { block: true, reason: admissionBlockReason };
+				if (patchBlockReason || seedBlockReason || admissionBlockReason) {
+					return { block: true, reason: patchBlockReason ?? seedBlockReason ?? admissionBlockReason };
+				}
 			}
 			return;
 		}
@@ -343,6 +382,10 @@ export default function (pi: ExtensionAPI) {
 		description: "Read a /sol or oracle job result",
 		handler: async (args, ctx) => {
 			const explicit = args.trim();
+			if (explicit && !isCanonicalSolJobId(explicit)) {
+				emit(pi, ctx, `Invalid oracle job ID ${JSON.stringify(explicit)}; expected a canonical UUID v4.`, "warning");
+				return;
+			}
 			const jobId = explicit || listRecentSolJobIds()[0];
 			if (!jobId) {
 				emit(pi, ctx, "No /sol jobs found. Run /sol first.", "info");
@@ -418,7 +461,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			try {
-				const result = openSolOracleBrowser({ provider, url });
+				const result = openSolOracleBrowser({
+					provider,
+					url,
+					onSpawnError: (error) => emit(pi, ctx, `Oracle browser failed after launch: ${error.message}`, "warning"),
+				});
 				emit(pi, ctx, formatSolOpenResult(result), result.ok ? "info" : "warning");
 			} catch (error) {
 				emit(pi, ctx, `${error instanceof Error ? error.message : String(error)}\n${SOL_OPEN_USAGE}`, "warning");

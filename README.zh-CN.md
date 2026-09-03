@@ -153,7 +153,7 @@ cd pi-sol
 |---|---|
 | `/sol [--bg] [--follow <job-id>] [--files a,b] <prompt>` | 向 ChatGPT GPT-5.6 Sol High 提问。默认同步等待解答返回。 |
 | `/sol-followup <job-id> [--bg] [--files a,b] <prompt>` | 继续之前的 `/sol` ChatGPT 对话上下文。 |
-| `/sol-read [job-id]` | 读取已保存的任务结果。未指定 ID 时默认读取最新发现的 `oracle-*` 任务。 |
+| `/sol-read [job-id]` | 读取已保存的任务结果。ID 必须是规范 UUIDv4，响应只从经过校验的任务目录读取。 |
 | `/sol-auth` | 将本地 Chrome 的 ChatGPT 登录 Cookie 同步到 pi-oracle 隔离环境。 |
 | `/sol-diag [--last N] [--candidates]` | 查看只记录、不改变行为的触发诊断日志。 |
 | `/sol-open [--grok|--chatgpt] [--url <https-url>]` | 打开 pi-oracle 的隔离 auth-seed Chrome（**有头、且不开放远程调试端口**），用于手工修复登录态失效或模型档位不对。 |
@@ -167,7 +167,7 @@ cd pi-sol
 - **`--files a,b`**：仅附加明确列出的文件。绝不自动全量扫描或打包仓库。
 - **`--follow <job-id>`**：跟随上一次 `/sol` 调用的对话线索。
 
-`/sol-open` 打开的正是每个任务克隆所用的那个 profile，因此**再次运行 `/sol` 前请先关掉该窗口**：任务会在 Chrome 仍在写入时克隆 seed。若该 profile 已被打开，`/sol-open` 只报告存活 PID，不会再起一个 Chrome（那会撞上 Chromium 单例锁）。它始终不开放 DevTools 端口，因此任何 agent 都无法接入这个手工窗口。
+`/sol-open` 打开的正是每个任务克隆所用的那个 profile。若该 provider 有活跃任务，命令会拒绝打开；反过来，`oracle_submit`/`oracle_recover` 的工具门也会在手工 Chrome 占用 seed 时拒绝克隆。若该 profile 已被打开，`/sol-open` 只报告存活 PID，不会再起一个 Chrome（那会撞上 Chromium 单例锁）。启动 URL 仅允许 HTTPS，且始终不开放 DevTools 端口，因此任何 agent 都无法接入这个手工窗口。
 
 ChatGPT 提交允许本机多个 Pi 会话并发运行最多 `maxConcurrentJobs`（默认 2）个 `/sol` 任务；每个任务运行在各自隔离的浏览器 runtime profile 中。当达到并发上限时，新提交会被阻止并显示活跃任务 ID；等待其中一个完成后使用 `/sol-read <job-id>`。这是针对账号级限流的保护，不是 pi-oracle 隔离浏览器 profile 的并发限制。
 
@@ -235,10 +235,12 @@ Could not find model family control for instant
 **补丁自动恢复遵循严格准则：**
 
 1. 在 `session_start` 与每次 `before_agent_start` 时，检查已安装 worker 是否包含 High / Power-slider 特征标记。
-2. 若标记已齐全，不执行任何文件覆盖。
-3. 若标记缺失，**仅当已安装的 `pi-oracle` 版本严格等于 0.7.20 时**，才自动写回补丁。
-4. 若版本不一致或无法读取版本，`pi-sol` 坚决拒绝覆盖 worker 文件。
-5. 升级 `pi update npm:pi-oracle` 后若覆盖了文件，下次自动检查将在合规情况下自动恢复。
+2. Vendor digest 绑定 `ORACLE_VERSION`、所有部署的 worker/library 副本及补丁文件；标记存在本身不是完整性证明。
+3. 若标记已齐全，已安装副本必须匹配已审核的 pristine hash 或可信 patched hash；第三种 hash 会 fail-closed。
+4. 若 vendored 版本缺少标记，会在 authority 校验后恢复可信 worker 副本。
+5. 若版本不同，`pi-sol` 仅在补丁可应用、authority/标记/语法检查全部通过时对新 pristine worker 自动 re-vendor；任何失败都会拒绝覆盖。
+6. 补丁检查失败会在工具层硬阻断 `oracle_submit` 与 `oracle_recover`，不存在只提示模型的绕过路径，也不会静默降级。
+7. 升级 `pi update npm:pi-oracle` 后若覆盖了文件，下次自动检查会按上述规则处理。
 
 ---
 
@@ -254,6 +256,8 @@ ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻
 - `chatgpt.com`, `www.chatgpt.com`
 - `chat.openai.com`, `chatgpt.openai.com`
 - `auth.openai.com`
+
+项目外文件若 basename 重复，会被改用无冲突的暂存名；不会有选中的文件静默覆盖另一个文件。`/sol-read` 会拒绝路径穿越 ID，并限制响应读取在已验证的任务目录内。
 
 ### 文件暂存与安全边界
 - 本地文件上传完全遵循显式选择原则（`--files`）。
@@ -372,8 +376,11 @@ ChatGPT 网页自动化完全归属于 pi-oracle 隔离 worker。`pi-sol` 会阻
 ### 运行自动化测试
 
 ```bash
+npm ci
 npm test
 ```
+
+测试命令使用 Node 22 内置的 TypeScript stripping，不会从网络解析未锁定的测试运行器。安装脚本只安装运行时文件；完整测试请在本仓库 checkout 中执行。
 
 ### 录制与生成演示动图/视频
 

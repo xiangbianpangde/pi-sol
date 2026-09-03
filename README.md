@@ -153,7 +153,7 @@ After verifying the smoke test, ask a real question:
 |---|---|
 | `/sol [--bg] [--follow <job-id>] [--files a,b] <prompt>` | Ask ChatGPT GPT-5.6 Sol High. Waits for answer synchronously by default. |
 | `/sol-followup <job-id> [--bg] [--files a,b] <prompt>` | Continue an existing `/sol` ChatGPT conversation thread. |
-| `/sol-read [job-id]` | Read a saved job result. Defaults to the latest discovered `oracle-*` job. |
+| `/sol-read [job-id]` | Read a saved job result. IDs must be canonical UUIDv4 values; responses are read only from the verified job directory. |
 | `/sol-auth` | Sync ChatGPT cookies from local Chrome into pi-oracle's isolated browser seed. |
 | `/sol-diag [--last N] [--candidates]` | Inspect record-only trigger diagnostics. |
 | `/sol-open [--grok|--chatgpt] [--url <https-url>]` | Open pi-oracle's isolated auth-seed Chrome, headed and with **no remote-debugging port**, to repair a stale login or wrong model state by hand. |
@@ -167,7 +167,7 @@ After verifying the smoke test, ask a real question:
 - **`--files a,b`**: Attach only explicitly listed files. Repositories are never auto-archived.
 - **`--follow <job-id>`**: Continue an existing ChatGPT thread from an earlier `/sol` turn.
 
-`/sol-open` launches the same profile every job clones from, so **close that window before running `/sol` again**; a job clones the seed while Chrome is writing it. If the profile is already open, `/sol-open` reports the live PID instead of starting a second Chrome (which would collide on the Chromium singleton lock). It never exposes a DevTools endpoint, so no agent can attach to the manual window.
+`/sol-open` launches the same profile every job clones from. It refuses to open while that provider has an active job, and the `oracle_submit`/`oracle_recover` tool gate refuses to clone a seed while its manual Chrome window is open. If the profile is already open, `/sol-open` reports the live PID instead of starting a second Chrome (which would collide on the Chromium singleton lock). It accepts HTTPS start URLs only and never exposes a DevTools endpoint, so no agent can attach to the manual window.
 
 ChatGPT submissions allow up to `maxConcurrentJobs` (default 2) concurrent `/sol` jobs across local Pi sessions; each job runs in its own isolated browser runtime profile. When the concurrency limit is reached, the new submission is blocked with the active job IDs; wait for one to finish and use `/sol-read <job-id>`. This is an account-level rate-limit safeguard, not a limitation on pi-oracle's isolated browser profiles.
 
@@ -239,11 +239,12 @@ Could not find model family control for instant
 **The restoration rules are strictly enforced:**
 
 1. On `session_start` and every `before_agent_start`, `pi-sol` checks the installed worker for the required High / Power-slider patch markers.
-2. If all required markers are already present, no vendor copy is performed.
-3. If markers are missing, `pi-sol` restores the vendored worker files **only when the installed `pi-oracle` version exactly matches 0.7.20**.
-4. If the installed version is different or unreadable, `pi-sol` refuses to overwrite the worker.
-5. If `pi update npm:pi-oracle` replaces patched worker files, the next automatic check restores them if permitted.
-6. If an effort-dropdown error occurs during a supported run, the agent may run the restore once and retry without downgrading.
+2. The vendor digest binds `ORACLE_VERSION`, every deployed worker/library copy, and the patch file; marker presence alone is never an integrity proof.
+3. If all markers are present, the installed copies must match either the reviewed pristine hashes or the trusted patched hashes; a third hash fails closed.
+4. If markers are missing on the vendored version, trusted worker copies are restored after the authority checks.
+5. If the installed version differs, `pi-sol` re-applies the patch to the new pristine worker and refreshes the vendor set only when the patch, authority checks, markers, and syntax checks all pass; otherwise it refuses to overwrite.
+6. A failed patch check hard-blocks `oracle_submit` and `oracle_recover`; there is no prompt-only warning path and no silent downgrade.
+7. If an effort-dropdown error occurs during a supported run, the agent may run the restore once and retry without downgrading.
 
 ---
 
@@ -265,6 +266,7 @@ ChatGPT browser automation belongs exclusively to pi-oracle's isolated worker. `
 - Maximum **10 files** per turn.
 - Images: **20 MiB** | Spreadsheets: **50 MiB** | Text/Docs: **20 MiB** proxy limit.
 - **Rejected locally**: Executables and installers (`.exe`, `.dmg`, `.apk`, ...).
+- Outside-project files with duplicate basenames receive collision-safe staged names; no selected file silently overwrites another.
 
 ### Cross-session submission admission
 - A short atomic lease protects the `oracle_submit` handoff across local Pi processes.
@@ -318,7 +320,7 @@ Reload Pi (`/reload`) or start a new session, then retry. If the error persists,
 
 <br/>
 
-`pi-sol` will refuse to force-overwrite installed `pi-oracle` workers if the version differs from the vendored 0.7.20 patches. Check your installed version via `npm list -g pi-oracle`.
+For a different `pi-oracle` version, `pi-sol` attempts a checked auto-revendor: it applies the patch to the new worker, verifies the reviewed authority files, markers, and syntax, and refuses to overwrite on any failure. Check your installed version via `npm list -g pi-oracle` if the check reports a blocker.
 </details>
 
 <details>
@@ -377,8 +379,13 @@ Yes. Prompts and explicitly attached files (<code>--files</code>) are submitted 
 ### Running Tests
 
 ```bash
+npm ci
 npm test
 ```
+
+The test command uses Node 22's built-in TypeScript stripping, so it does not
+resolve an unpinned test runner from the network. The installer intentionally
+installs runtime files only; run the suite from this checkout.
 
 ### Recording & Converting Demos
 

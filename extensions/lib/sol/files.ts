@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { copyFile, mkdir, stat, writeFile } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
 	BLOCKED_EXTENSIONS,
@@ -36,6 +38,38 @@ function isInside(cwd: string, target: string): boolean {
 	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
+async function pathExists(path: string): Promise<boolean> {
+	try {
+		await stat(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Pick a collision-safe basename for an outside-project file. Keep the first
+ * basename readable, then add a stable source-path digest (and, if needed, a
+ * numeric suffix). A request-id directory is normally fresh, but checking the
+ * filesystem also prevents a reused request id from overwriting an old stage.
+ */
+async function collisionSafeStagingName(stagingDir: string, source: string, usedNames: Set<string>): Promise<string> {
+	const original = basename(source);
+	const extension = extname(original);
+	const stem = extension && extension !== original ? original.slice(0, -extension.length) : original;
+	const digest = createHash("sha256").update(source).digest("hex").slice(0, 12);
+	let candidate = original;
+	let suffix = 0;
+	while (usedNames.has(candidate) || await pathExists(join(stagingDir, candidate))) {
+		suffix += 1;
+		candidate = suffix === 1
+			? `${stem}--${digest}${extension}`
+			: `${stem}--${digest}-${suffix}${extension}`;
+	}
+	usedNames.add(candidate);
+	return candidate;
+}
+
 export function validateSolFileMeta(filePath: string, bytes: number): SolFileIssue | undefined {
 	if (isBlockedPath(filePath)) {
 		return {
@@ -70,6 +104,7 @@ export async function stageSolFiles(
 	const requestId = options?.requestId ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	const stagingDir = join(cwd, ".pi", "sol-staging", requestId);
 	const staged: SolStagedFile[] = [];
+	const usedStagingNames = new Set<string>();
 	let usedStaging = false;
 
 	for (const raw of requested) {
@@ -91,8 +126,9 @@ export async function stageSolFiles(
 			}
 			usedStaging = true;
 			await mkdir(stagingDir, { recursive: true });
-			const dest = join(stagingDir, basename(source));
-			await copyFile(source, dest);
+			const name = await collisionSafeStagingName(stagingDir, source, usedStagingNames);
+			const dest = join(stagingDir, name);
+			await copyFile(source, dest, fsConstants.COPYFILE_EXCL);
 			staged.push({ source, relative: posixRel(cwd, dest), bytes: info.size, copied: true });
 		} catch (error) {
 			issues.push({

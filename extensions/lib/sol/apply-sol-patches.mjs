@@ -24,7 +24,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const VENDORED_ORACLE_VERSION = "0.7.20";
@@ -153,13 +153,15 @@ function readVendoredOracleVersion(vendor) {
 }
 
 function computeVendorDigest(vendor) {
-	// Digest of the authority-sensitive vendor files AND the vendored version
-	// string, so tampering with ORACLE_VERSION cannot skip the revendor branch
-	// or route an old vendor set onto a newer pi-oracle (audit P2-N2).
+	// Bind every file that can be deployed, plus the patch used for future
+	// revendors. Marker presence is only a deployment discriminator; it is not
+	// an integrity proof for run-job, helpers, declarations, or the patch.
+	// Include the vendored version string so tampering with ORACLE_VERSION cannot
+	// skip the revendor branch or route an old vendor set onto a newer oracle.
 	const version = readVendoredOracleVersion(vendor);
 	if (!version) return undefined; // missing/unreadable ORACLE_VERSION — fail closed at verify
 	const entries = { oracleVersion: version };
-	for (const name of ["tools.ts", "jobs.ts"]) {
+	for (const name of [...WORKER_RELATIVE_FILES.map((rel) => basename(rel)), SOL_PATCH_FILE]) {
 		const path = join(vendor, name);
 		if (!existsSync(path)) return undefined;
 		entries[name] = sha256File(path);
@@ -229,10 +231,15 @@ function sha256File(path) {
 	return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-// Authority-sensitive vendor files: the oracle tool registry and job type
-// definitions. These MUST NOT be re-vendored against an upstream whose
-// pristine content has not been reviewed (exact-hash fail-closed, audit P1-5).
-const AUTHORITY_RELATIVE_FILES = WORKER_RELATIVE_FILES.filter((rel) => rel.includes("/lib/"));
+// Every deployed worker/library file is authority-sensitive for a same-
+// version restore. In particular, run-job carries the read-only recovery
+// branch and prompt-identity proof, so marker presence alone must never
+// authorize an overwrite (exact-hash fail-closed, audit P1-2).
+const AUTHORITY_RELATIVE_FILES = WORKER_RELATIVE_FILES;
+// A genuinely newer pi-oracle is allowed to change browser workers; the patch
+// itself is applied to that pristine tree and must still reject changes to the
+// reviewed tool/job authority files before doing so.
+const REVENDOR_AUTHORITY_RELATIVE_FILES = WORKER_RELATIVE_FILES.filter((rel) => rel.includes("/lib/"));
 
 /**
  * Verify that the installed lib files exactly match the reviewed pristine
@@ -242,7 +249,7 @@ const AUTHORITY_RELATIVE_FILES = WORKER_RELATIVE_FILES.filter((rel) => rel.inclu
  */
 function verifyUpstreamAuthorityHashes(root, vendor) {
 	const mismatches = [];
-	for (const rel of AUTHORITY_RELATIVE_FILES) {
+	for (const rel of REVENDOR_AUTHORITY_RELATIVE_FILES) {
 		const source = join(root, rel);
 		if (!existsSync(source)) {
 			return { ok: false, error: `pi-oracle is missing ${rel}; cannot verify authority hash` };
@@ -265,11 +272,14 @@ function verifyUpstreamAuthorityHashes(root, vendor) {
 /**
  * Same-version restore accepts two known installed states for authority
  * files: the reviewed pristine hash OR the current vendor patched hash.
- * Any third hash is refused (audit P1-5 bypass A).
+ * Browser worker files with missing markers are stale candidates and are
+ * replaced by the trusted vendor copy; once all markers are present, every
+ * deployed file is checked and any third hash is refused (audit P1-2).
  * @returns {{ ok: true } | { ok: false; error: string }}
  */
-function verifyAuthorityRestoreState(root, vendor) {
-	for (const rel of AUTHORITY_RELATIVE_FILES) {
+function verifyAuthorityRestoreState(root, vendor, options = {}) {
+	const files = options.strictWorkers ? AUTHORITY_RELATIVE_FILES : REVENDOR_AUTHORITY_RELATIVE_FILES;
+	for (const rel of files) {
 		const source = join(root, rel);
 		if (!existsSync(source)) continue; // missing files are created by restore
 		const actual = sha256File(source);
@@ -465,11 +475,11 @@ export function ensureSolOraclePatches(options = {}) {
 		ensureVendorDigest(vendor);
 	}
 
-	// Authority hash gate on the no-op fast path too (audit P1-N1): marker
+	// Authority hash gate on the no-op fast path too (audit P1-2): marker
 	// presence alone is not authority. A marker-preserving third-hash mutation
-	// of lib/tools.ts or lib/jobs.ts must fail closed, not silently pass.
+	// of any deployed worker/library file must fail closed, not silently pass.
 	if (!options.force && missing.length === 0) {
-		const authority = verifyAuthorityRestoreState(root, vendor);
+		const authority = verifyAuthorityRestoreState(root, vendor, { strictWorkers: true });
 		if (!authority.ok) {
 			return { ok: false, restored: false, missing: [authority.error], root, error: authority.error };
 		}
@@ -500,7 +510,7 @@ export function ensureSolOraclePatches(options = {}) {
 	// Same-version restore: refuse to overwrite authority lib files whose
 	// installed content matches neither the reviewed pristine baseline nor
 	// the current vendored patched copy (audit P1-5 bypass A).
-	const authorityRestore = verifyAuthorityRestoreState(root, vendor);
+	const authorityRestore = verifyAuthorityRestoreState(root, vendor, { strictWorkers: missing.length === 0 });
 	if (!authorityRestore.ok) {
 		return { ok: false, restored: false, missing, root, error: authorityRestore.error };
 	}

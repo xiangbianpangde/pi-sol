@@ -1,11 +1,11 @@
 /**
  * /sol extension load + dispatch shape.
- * Run: npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-load.test.ts
+ * Run: node --experimental-strip-types --test extensions/__tests__/sol-load.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
@@ -109,6 +109,83 @@ describe("sol extension registration", () => {
 			else process.env.PI_ORACLE_ROOT = previous;
 			await rm(cwd, { recursive: true, force: true });
 			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("hard-blocks submit and recover when worker patch integrity validation fails", async () => {
+		const root = mkdtempSync(join(tmpdir(), "sol-patch-block-"));
+		const previousRoot = process.env.PI_ORACLE_ROOT;
+		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
+		const previousStateDir = process.env.PI_SOL_STATE_DIR;
+		process.env.PI_ORACLE_ROOT = root;
+		process.env.PI_ORACLE_JOBS_DIR = join(root, "jobs");
+		process.env.PI_SOL_STATE_DIR = join(root, "state");
+		try {
+			mkdirSync(join(root, "extensions", "oracle", "worker"), { recursive: true });
+			writeFileSync(join(root, "package.json"), JSON.stringify({ name: "pi-oracle", version: "0.7.20" }));
+			const { handlers } = loadSol();
+			const toolCall = handlers.get("tool_call") as ToolHandler;
+			for (const toolName of ["oracle_submit", "oracle_recover"]) {
+				const blocked = await toolCall({
+					toolCallId: `patch-${toolName}`,
+					toolName,
+					input: { provider: "chatgpt" },
+				});
+				assert.equal(blocked?.block, true);
+				assert.match(String(blocked?.reason), /patch integrity|fail-closed/i);
+			}
+		} finally {
+			if (previousRoot === undefined) delete process.env.PI_ORACLE_ROOT;
+			else process.env.PI_ORACLE_ROOT = previousRoot;
+			if (previousJobsDir === undefined) delete process.env.PI_ORACLE_JOBS_DIR;
+			else process.env.PI_ORACLE_JOBS_DIR = previousJobsDir;
+			if (previousStateDir === undefined) delete process.env.PI_SOL_STATE_DIR;
+			else process.env.PI_SOL_STATE_DIR = previousStateDir;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("blocks oracle submissions while the manual auth seed is open", async () => {
+		const root = mkdtempSync(join(tmpdir(), "sol-seed-block-"));
+		const seed = join(root, "seed");
+		const jobsDir = join(root, "jobs");
+		const stateDir = join(root, "state");
+		const previousHome = process.env.HOME;
+		const previousRoot = process.env.PI_ORACLE_ROOT;
+		const oracleRoot = previousRoot ?? join(previousHome ?? homedir(), ".pi", "agent", "npm", "node_modules", "pi-oracle");
+		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
+		const previousStateDir = process.env.PI_SOL_STATE_DIR;
+		process.env.HOME = root;
+		process.env.PI_ORACLE_ROOT = oracleRoot;
+		process.env.PI_ORACLE_JOBS_DIR = jobsDir;
+		process.env.PI_SOL_STATE_DIR = stateDir;
+		try {
+			mkdirSync(seed, { recursive: true });
+			mkdirSync(join(root, ".pi", "agent", "extensions"), { recursive: true });
+			writeFileSync(join(root, ".pi", "agent", "extensions", "oracle.json"), JSON.stringify({ browser: { authSeedProfileDir: seed } }));
+			// The current process is a live Chromium owner for the test lock.
+			const { hostname } = await import("node:os");
+			const { symlinkSync } = await import("node:fs");
+			symlinkSync(`${hostname()}-${process.pid}`, join(seed, "SingletonLock"));
+			const { handlers } = loadSol();
+			const toolCall = handlers.get("tool_call") as ToolHandler;
+			const blocked = await toolCall({
+				toolCallId: "seed-open",
+				toolName: "oracle_submit",
+				input: { provider: "chatgpt", prompt: "test" },
+			});
+			assert.equal(blocked?.block, true);
+			assert.match(String(blocked?.reason), /auth seed.*open|SingletonLock/i);
+		} finally {
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousRoot === undefined) delete process.env.PI_ORACLE_ROOT;
+			else process.env.PI_ORACLE_ROOT = previousRoot;
+			if (previousJobsDir === undefined) delete process.env.PI_ORACLE_JOBS_DIR;
+			else process.env.PI_ORACLE_JOBS_DIR = previousJobsDir;
+			if (previousStateDir === undefined) delete process.env.PI_SOL_STATE_DIR;
+			else process.env.PI_SOL_STATE_DIR = previousStateDir;
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 

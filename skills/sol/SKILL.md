@@ -3,7 +3,7 @@ name: sol
 description: Relay research and planning questions to ChatGPT web GPT-5.6 Sol High via /sol and pi-oracle. Use before solving hard problems, when the user runs /sol, or when the local model needs a web-Sol advisor. Never drive chatgpt.com with agent_browser.
 compatibility: Pi coding agent
 metadata:
-  version: "1.13.0"
+  version: "1.14.0"
   status: "active"
   layer: "task"
   priority: "30"
@@ -40,7 +40,7 @@ Do **not** use `/sol` for trivial local edits. Do **not** open `chatgpt.com` / `
 - Default is **synchronous**: wait for the Sol answer in this turn
 - `--bg` dispatches and stops; later `/sol-read`
 - `--files` is an explicit local file list, not a whole-repo archive
-- `/sol-open` opens the oracle auth-seed Chrome **headed and with no debug port**, so a human can repair a stale login or wrong model state that `/sol-auth` cannot fix by itself. Every job clones that seed, so close the window before the next `/sol`.
+- `/sol-open` opens the oracle auth-seed Chrome **headed and with no debug port**, so a human can repair a stale login or wrong model state that `/sol-auth` cannot fix by itself. It refuses to open while that provider has an active job, and the submit/recover gate refuses to clone a live manual seed; close the window before `/sol`.
 
 ## Consult-First Rule (second-opinion-first workflow)
 
@@ -81,11 +81,11 @@ This is a standing preference, not a one-off request: it applies to design / pla
 
 ## Procedure
 
-0. `/sol` already restores pi-oracle High/Power-slider worker patches on `session_start` and before this turn. **You** are the operator of that restore, not the user. Never tell the user to run apply scripts or `pi update`.
+0. `/sol` already restores pi-oracle High/Power-slider worker patches on `session_start` and before this turn. **You** are the operator of that restore, not the user. The `oracle_submit` and `oracle_recover` tool gate re-checks patch integrity and hard-blocks failures; never bypass it, tell the user to run apply scripts, or downgrade the model.
 1. Call `oracle_preflight` with `provider: "chatgpt"`.
 2. If auth is missing/stale, call `oracle_auth` (`provider: "chatgpt"`) and preflight again. `/sol` is allowed to auto-sync Chrome cookies. If Chrome has the cookie DB locked, tell the user to quit Chrome and rerun `/sol-auth`. If auth hits Cloudflare「请稍候…」or `about:blank`, the Chrome UI is not English — tell them to put English first in `chrome://settings/languages`, relaunch Chrome, then `/sol-auth` again.
 3. If jobs fail with "redirected away from the expected authenticated chat origin" or readiness timeouts while the seed cookies are fresh, Cloudflare's managed challenge is blocking headless Chrome (the tab dies to `about:blank` after ~40s and the worker misreports it). The fix is `browser.runMode: "headed"` in `~/.pi/agent/extensions/oracle.json` — verify it is still there before debugging anything else.
-3b. If a job reports `ChatGPT is showing a transient outage/rate-limit page ... rate limit`, the extension's positive-scope sanitizer only trusts provider-owned error surfaces (alert/status/dialog/banner/log). Only when such a surface is verified should you treat it as a genuine rate limit; a plain error string is not proof of account-level quota exhaustion. If genuine, this is the ChatGPT account quota window (Plus), not auth and not a session lock — pi-oracle runs isolated-profile concurrency (`maxConcurrentJobs`; only same-`conversationId` is prohibited). Check there is no other active job; if none are active, stop retrying and tell the user the quota window is exhausted (no downgrade to Instant/Standard, no silent fallback). The `/sol` extension serializes ChatGPT submissions across local Pi sessions with a short atomic admission lease (per-user private state dir) plus active `job.json` inspection; if it blocks `oracle_submit` for an active job, report that job id and stop without retrying. Keep one /sol submission at a time.
+3b. If a job reports `ChatGPT is showing a transient outage/rate-limit page ... rate limit`, the extension's positive-scope sanitizer only trusts provider-owned error surfaces (alert/status/dialog/banner/log). Only when such a surface is verified should you treat it as a genuine rate limit; a plain error string is not proof of account-level quota exhaustion. If genuine, this is the ChatGPT account quota window (Plus), not auth and not a session lock — pi-oracle runs isolated-profile concurrency (`maxConcurrentJobs`; only same-`conversationId` is prohibited). Check there is no other active job; if none are active, stop retrying and tell the user the quota window is exhausted (no downgrade to Instant/Standard, no silent fallback). The `/sol` extension bounds ChatGPT submissions across local Pi sessions with a short atomic admission lease plus active `job.json` inspection; if it blocks `oracle_submit` for an active job, report that job id and stop without retrying. If it reports that the manual auth seed is open, close that provider's `/sol-open` window and retry once. Do not clone or mutate a live seed.
 4. Submit with `oracle_submit`:
    - `provider`: `chatgpt`
    - `preset`: `thinking_extended` (maps to GPT-5.6 Sol **High**, Plus max)
@@ -121,18 +121,21 @@ Outside-project files are copied to `.pi/sol-staging/<id>/` so `oracle_submit` c
 
 - `/sol ping` (or a real question) after `/sol-auth` returns a Sol answer or a clear auth/login blocker
 - `node ~/.pi/agent/extensions/lib/sol/run-sol-smoke.mjs` is self-contained: it reuses the newest real oracle job as template, or builds a minimal job + tar.zst from scratch when /tmp has none
-- `/sol --bg …` then `/sol-read` shows the same job
+- `/sol --bg …` then `/sol-read <uuid-v4-job-id>` shows the same job; path traversal IDs are rejected and saved responses are read only from the verified job directory
+- `/sol-open` accepts HTTPS provider URLs only and refuses to open while that provider has an active job
 - `agent_browser` open chatgpt.com is blocked
 - A `.exe` in `--files` is rejected before submit
-- `npx --yes tsx --test ~/.pi/agent/extensions/__tests__/sol-trigger.test.ts` covers classifier normalization/signals/suppressors/vetoes (ruleset detect-v3); `sol-trigger-log.test.ts` covers default-path write (isolated HOME), off-disabling, redact-before-truncate, secret patterns, 0700/0600 create AND upgrade, ruleset stats isolation and version fields; `/sol-diag` shows live rows
+- From the pi-sol checkout, `node --experimental-strip-types --test extensions/__tests__/*.test.ts` runs the complete deterministic suite (the installer does not copy test files into `~/.pi/agent`); the trigger tests cover classifier normalization/signals/suppressors/vetoes and private redacted diagnostics; `/sol-diag` shows live rows.
 
 ## Release evidence bundle
 
 When an audit needs a reviewer to reproduce the suite from the archive, ship the
-**whole `node_modules/`**, never an enumerated subset of source files. A picked
-subset keeps failing on module resolution one dependency at a time (this burned
-three audit rounds: the `patches.ts` façade, then eight `lib/sol/*.ts` modules,
-then `fs-ext`'s build dep `nan`). Closure-by-construction beats guessing.
+**whole `node_modules/`**, never an enumerated subset of source files. Pass
+`node_modules/` explicitly to `oracle_submit`; explicit directory selection
+overrides pi-oracle's default bulky-directory exclusion. A picked subset keeps
+failing on module resolution one dependency at a time (this burned three audit
+rounds: the `patches.ts` façade, then eight `lib/sol/*.ts` modules, then
+`fs-ext`'s build dep `nan`). Closure-by-construction beats guessing.
 
 A native addon's prebuilt `.node` is not portable across OS/arch, so the archive
 carries the addon **source plus its build deps** and the target machine rebuilds.
@@ -148,7 +151,7 @@ node --experimental-strip-types --test extensions/__tests__/*.test.ts
 
 `--offline` against an empty cache is the actual closure test: any missing
 transitive dep surfaces as `Cannot find module 'nan'` or `ENOTCACHED` rather than
-silently passing. Expect `138 tests / 138 pass / 0 fail`. Host toolchain
+silently passing. Expect `183 tests / 183 pass / 0 fail / 0 skipped`. Host toolchain
 (Node headers, C/C++ compiler, Python/node-gyp) is a normal native-addon
 prerequisite, not a closure defect. `com.apple.provenance` is SIP-protected and
 cannot be stripped with `xattr -c`; AppleDouble noise is archive hygiene, never a

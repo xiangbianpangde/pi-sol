@@ -1,5 +1,26 @@
 # sol CHANGELOG
 
+## 1.14.0 - 2026-09-03
+
+- **Oracle audit blockers closed**: `oracle_submit` and `oracle_recover` now
+  hard-block when the automatic worker patch/digest/authority check fails;
+  prompt wording is no longer the only safety boundary.
+- Vendor integrity now binds `ORACLE_VERSION`, every deployed worker/library
+  copy, and `sol-high-power-slider.patch`; marker-preserving `run-job.mjs`,
+  helper, declaration, or patch mutations fail closed. Stale workers with
+  missing markers are still safely replaced by trusted copies.
+- `/sol-open` preflights the executable, consumes asynchronous Chrome spawn
+  errors, refuses to race an active provider job, and `/sol` refuses to clone a
+  provider seed while its manual `SingletonLock` is live. Start URLs are HTTPS
+  only.
+- Outside-project files with duplicate basenames receive collision-safe stage
+  names. `/sol-read` accepts canonical UUIDv4 IDs only, verifies job ownership
+  and realpath containment, and never follows a response path outside the job.
+- `npm test` uses Node 22's built-in TypeScript stripping instead of an
+  unpinned `npx tsx` download. Release evidence expects the complete
+  **183/183** suite; audit archives explicitly include the whole `node_modules/`
+  tree and `package-lock.json` for offline native-addon rebuilds.
+
 ## 1.13.0 - 2026-09-02
 
 - **New `/sol-open [--grok|--chatgpt] [--url <https-url>]`**: opens pi-oracle's
@@ -9,7 +30,8 @@
   job clones from, so fixing it by hand fixes subsequent jobs.
   - Headed, detached, and deliberately **without** `--remote-debugging-port` /
     `--remote-allow-origins`: no agent (including an oracle worker) can attach
-    to the manual window. Verified: 0 listening TCP sockets on the launched PID.
+    to the manual window. A real socket check belongs in release evidence; the
+    unit suite verifies that no debug flags are passed.
   - Keeps `--use-mock-keychain` + `--password-store=basic`, because the seed's
     cookies were written under those flags; dropping them makes the profile look
     logged-out on macOS.

@@ -7,8 +7,9 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 
+import { acquireSolSubmitLease, releaseSolSubmitLease } from "../lib/sol/admission.ts";
 import {
 	detectChromeExecutablePath,
 	formatSolOpenResult,
@@ -32,6 +33,16 @@ function writeConfig(extDir: string, body: string): string {
 	const path = join(extDir, "oracle.json");
 	writeFileSync(path, body);
 	return path;
+}
+
+function testOperationLeaseDeps() {
+	return {
+		acquireOperationLeaseFn: () => ({
+			acquired: true as const,
+			lease: { path: "/tmp/test-sol-operation.lock", token: "test", fd: -1 },
+		}),
+		releaseOperationLeaseFn: () => true,
+	};
 }
 
 describe("readSolOracleBrowserConfig", () => {
@@ -213,9 +224,9 @@ describe("normalizeSolOpenUrl", () => {
 });
 
 describe("openSolOracleBrowser", () => {
-	it("short-circuits when the profile is already open and never spawns twice", () => {
+	it("short-circuits when the profile is already open and never spawns twice", async () => {
 		let spawned = 0;
-		const result = openSolOracleBrowser({
+		const result = await openSolOracleBrowser({
 			profileDir: "/seed",
 			singletonPid: () => 777,
 			spawnFn: () => { spawned += 1; return { pid: 1 }; },
@@ -226,8 +237,8 @@ describe("openSolOracleBrowser", () => {
 		assert.equal(result.alreadyOpenPid, 777);
 	});
 
-	it("tells the user to run /sol-auth when the seed does not exist", () => {
-		const result = openSolOracleBrowser({
+	it("tells the user to run /sol-auth when the seed does not exist", async () => {
+		const result = await openSolOracleBrowser({
 			profileDir: "/missing-seed",
 			singletonPid: () => undefined,
 			existsFn: () => false,
@@ -239,8 +250,9 @@ describe("openSolOracleBrowser", () => {
 		assert.match(result.message, /Run \/sol-auth first/);
 	});
 
-	it("reports a clear blocker when no Chrome was detected", () => {
-		const result = openSolOracleBrowser({
+	it("reports a clear blocker when no Chrome was detected", async () => {
+		const result = await openSolOracleBrowser({
+			...testOperationLeaseDeps(),
 			profileDir: "/seed",
 			singletonPid: () => undefined,
 			existsFn: () => true,
@@ -253,10 +265,11 @@ describe("openSolOracleBrowser", () => {
 		assert.match(result.message, /browser\.executablePath/);
 	});
 
-	it("launches detached, unrefs the child, and reports the pid", () => {
+	it("launches detached, unrefs the child, and reports the pid", async () => {
 		let unrefed = 0;
 		const seen: { exe: string; args: string[] }[] = [];
-		const result = openSolOracleBrowser({
+		const result = await openSolOracleBrowser({
+			...testOperationLeaseDeps(),
 			provider: "grok",
 			profileDir: "/seed-grok",
 			singletonPid: () => undefined,
@@ -275,9 +288,9 @@ describe("openSolOracleBrowser", () => {
 		assert.equal(unrefed, 1, "child must be unref'd so closing pi never kills the window");
 	});
 
-	it("surfaces an invalid --url instead of launching anything", () => {
+	it("surfaces an invalid --url instead of launching anything", async () => {
 		let spawned = 0;
-		assert.throws(() => openSolOracleBrowser({
+		await assert.rejects(() => openSolOracleBrowser({
 			profileDir: "/seed",
 			singletonPid: () => undefined,
 			existsFn: () => true,
@@ -289,10 +302,10 @@ describe("openSolOracleBrowser", () => {
 		assert.equal(spawned, 0);
 	});
 
-	it("validates --url before probing the singleton, so an open browser cannot mask a bad command", () => {
+	it("validates --url before probing the singleton, so an open browser cannot mask a bad command", async () => {
 		// Regression guard: with a live owner the call used to short-circuit to
 		// "already open" and never report the malformed URL.
-		assert.throws(() => openSolOracleBrowser({
+		await assert.rejects(() => openSolOracleBrowser({
 			profileDir: "/seed",
 			singletonPid: () => 999,
 			existsFn: () => true,
@@ -303,9 +316,10 @@ describe("openSolOracleBrowser", () => {
 		}), /only https/);
 	});
 
-	it("blocks a manual launch while a provider job is active", () => {
+	it("blocks a manual launch while a provider job is active", async () => {
 		let spawned = 0;
-		const result = openSolOracleBrowser({
+		const result = await openSolOracleBrowser({
+			...testOperationLeaseDeps(),
 			profileDir: "/seed",
 			singletonPid: () => undefined,
 			existsFn: () => true,
@@ -319,9 +333,10 @@ describe("openSolOracleBrowser", () => {
 		assert.equal(spawned, 0);
 	});
 
-	it("preflights a stale executable path without spawning", () => {
+	it("preflights a stale executable path without spawning", async () => {
 		let spawned = 0;
-		const result = openSolOracleBrowser({
+		const result = await openSolOracleBrowser({
+			...testOperationLeaseDeps(),
 			profileDir: "/seed",
 			singletonPid: () => undefined,
 			existsFn: () => true,
@@ -335,11 +350,12 @@ describe("openSolOracleBrowser", () => {
 		assert.equal(spawned, 0);
 	});
 
-	it("consumes an asynchronous spawn error and reports it through the callback", () => {
+	it("consumes an asynchronous spawn error and reports it through the callback", async () => {
 		const child = new EventEmitter() as EventEmitter & { pid?: number; unref?: () => void };
 		child.pid = 4322;
 		const errors: Error[] = [];
-		const result = openSolOracleBrowser({
+		const result = await openSolOracleBrowser({
+			...testOperationLeaseDeps(),
 			profileDir: "/seed",
 			singletonPid: () => undefined,
 			existsFn: () => true,
@@ -352,6 +368,67 @@ describe("openSolOracleBrowser", () => {
 		child.emit("error", new Error("spawn ENOENT"));
 		assert.equal(errors.length, 1);
 		assert.match(errors[0]!.message, /ENOENT/);
+	});
+
+	it("consumes a real ChildProcess ENOENT without crashing the host", async () => {
+		let resolveError: (error: Error) => void = () => {};
+		const spawnError = new Promise<Error>((resolve) => { resolveError = resolve; });
+		const result = await openSolOracleBrowser({
+			profileDir: "/seed",
+			singletonPid: () => undefined,
+			existsFn: () => true,
+			executablePath: "/definitely/not/a/chrome",
+			executableReadyFn: () => true,
+			activeJobsFn: () => [],
+			onSpawnError: resolveError,
+		});
+		assert.equal(result.ok, false);
+		assert.equal(result.reason, "no-chrome");
+		const error = await Promise.race([
+			spawnError,
+			new Promise<Error>((_, reject) => setTimeout(() => reject(new Error("timed out waiting for spawn error")), 1000)),
+		]);
+		assert.match(error.message, /ENOENT/);
+	});
+
+	it("holds the shared operation lease through browser startup so submit cannot enter the gap", async () => {
+		const stateDir = mkdtempSync(join(tmpdir(), "sol-open-lock-"));
+		const jobsDir = mkdtempSync(join(tmpdir(), "sol-open-lock-jobs-"));
+		const child = new EventEmitter() as EventEmitter & { pid?: number; unref?: () => void };
+		child.pid = 4323;
+		try {
+			const opened = await openSolOracleBrowser({
+				env: { ...process.env, PI_SOL_STATE_DIR: stateDir },
+				profileDir: "/seed",
+				singletonPid: () => undefined,
+				existsFn: () => true,
+				executablePath: "/chrome",
+				executableReadyFn: () => true,
+				activeJobsFn: () => [],
+				spawnFn: () => child,
+				// Production acquire/release functions are intentional here: this is
+				// the regression that proves /sol-open shares the admission flock.
+			});
+			assert.equal(opened.ok, true);
+			assert.equal(opened.launched, true);
+
+			let settled = false;
+			const contender = acquireSolSubmitLease(stateDir, jobsDir, 2, () => []).then((result) => {
+				settled = true;
+				return result;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			assert.equal(settled, false, "submit must remain blocked while open holds the startup lease");
+
+			child.emit("exit", 0);
+			const admitted = await contender;
+			assert.equal(admitted.acquired, true);
+			if (admitted.acquired) await releaseSolSubmitLease(admitted.lease);
+		} finally {
+			child.emit("close");
+			rmSync(stateDir, { recursive: true, force: true });
+			rmSync(jobsDir, { recursive: true, force: true });
+		}
 	});
 
 	it("reports a live provider seed lock for the submit gate", () => {
@@ -370,8 +447,9 @@ describe("openSolOracleBrowser", () => {
 		}
 	});
 
-	it("fails when the child dies before reporting a pid", () => {
-		const result = openSolOracleBrowser({
+	it("fails when the child dies before reporting a pid", async () => {
+		const result = await openSolOracleBrowser({
+			...testOperationLeaseDeps(),
 			profileDir: "/seed",
 			singletonPid: () => undefined,
 			existsFn: () => true,

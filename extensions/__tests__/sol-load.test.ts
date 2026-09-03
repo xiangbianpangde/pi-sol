@@ -3,16 +3,33 @@
  * Run: node --experimental-strip-types --test extensions/__tests__/sol-load.test.ts
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 
 // Keep record-only /sol trigger diagnostics inert during this load test.
 process.env.PI_SOL_TRIGGER_LOG = "off";
 
 import solExtension from "../sol.ts";
+
+const VENDOR = join(dirname(fileURLToPath(import.meta.url)), "../lib/sol/vendor");
+const VENDOR_FILES = ["chatgpt-ui-helpers.mjs", "chatgpt-ui-helpers.d.mts", "run-job.mjs", "tools.ts", "jobs.ts"];
+
+/** Create a complete, trusted same-version pi-oracle root for tool-gate tests. */
+function seedPatchedOracleRoot(root: string): void {
+	const worker = join(root, "extensions", "oracle", "worker");
+	const lib = join(root, "extensions", "oracle", "lib");
+	mkdirSync(worker, { recursive: true });
+	mkdirSync(lib, { recursive: true });
+	writeFileSync(join(root, "package.json"), JSON.stringify({ name: "pi-oracle", version: "0.7.20" }));
+	for (const name of VENDOR_FILES) {
+		const target = name === "tools.ts" || name === "jobs.ts" ? lib : worker;
+		copyFileSync(join(VENDOR, name), join(target, name));
+	}
+}
 
 type StartHandler = (
 	event: { prompt: string; systemPrompt: string },
@@ -90,8 +107,7 @@ describe("sol extension registration", () => {
 	it("restores stripped pi-oracle worker files on /sol before submit", async () => {
 		const root = mkdtempSync(join(tmpdir(), "sol-auto-patch-"));
 		const worker = join(root, "extensions/oracle/worker");
-		mkdirSync(worker, { recursive: true });
-		writeFileSync(join(root, "package.json"), JSON.stringify({ name: "pi-oracle", version: "0.7.20" }));
+		seedPatchedOracleRoot(root);
 		writeFileSync(join(worker, "chatgpt-ui-helpers.mjs"), "export {}\n");
 		writeFileSync(join(worker, "chatgpt-ui-helpers.d.mts"), "export {}\n");
 		writeFileSync(join(worker, "run-job.mjs"), "export {}\n");
@@ -147,14 +163,15 @@ describe("sol extension registration", () => {
 
 	it("blocks oracle submissions while the manual auth seed is open", async () => {
 		const root = mkdtempSync(join(tmpdir(), "sol-seed-block-"));
+		const oracleRoot = mkdtempSync(join(tmpdir(), "sol-seed-block-oracle-"));
 		const seed = join(root, "seed");
 		const jobsDir = join(root, "jobs");
 		const stateDir = join(root, "state");
 		const previousHome = process.env.HOME;
 		const previousRoot = process.env.PI_ORACLE_ROOT;
-		const oracleRoot = previousRoot ?? join(previousHome ?? homedir(), ".pi", "agent", "npm", "node_modules", "pi-oracle");
 		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
 		const previousStateDir = process.env.PI_SOL_STATE_DIR;
+		seedPatchedOracleRoot(oracleRoot);
 		process.env.HOME = root;
 		process.env.PI_ORACLE_ROOT = oracleRoot;
 		process.env.PI_ORACLE_JOBS_DIR = jobsDir;
@@ -186,14 +203,19 @@ describe("sol extension registration", () => {
 			if (previousStateDir === undefined) delete process.env.PI_SOL_STATE_DIR;
 			else process.env.PI_SOL_STATE_DIR = previousStateDir;
 			rmSync(root, { recursive: true, force: true });
+			rmSync(oracleRoot, { recursive: true, force: true });
 		}
 	});
 
 	it("allows a second ChatGPT submission while one Pi session is active; blocks only at the concurrency limit", async () => {
 		const jobsDir = await mkdtemp(join(tmpdir(), "sol-active-jobs-"));
+		const oracleRoot = mkdtempSync(join(tmpdir(), "sol-active-oracle-"));
+		seedPatchedOracleRoot(oracleRoot);
 		const stateDir = await mkdtemp(join(tmpdir(), "sol-active-state-"));
+		const previousRoot = process.env.PI_ORACLE_ROOT;
 		const previousJobsDir = process.env.PI_ORACLE_JOBS_DIR;
 		const previousStateDir = process.env.PI_SOL_STATE_DIR;
+		process.env.PI_ORACLE_ROOT = oracleRoot;
 		process.env.PI_ORACLE_JOBS_DIR = jobsDir;
 		process.env.PI_SOL_STATE_DIR = stateDir;
 		try {
@@ -227,12 +249,15 @@ describe("sol extension registration", () => {
 			assert.equal(blocked?.block, true);
 			assert.match(String(blocked?.reason), /concurrency limit/i);
 		} finally {
+			if (previousRoot === undefined) delete process.env.PI_ORACLE_ROOT;
+			else process.env.PI_ORACLE_ROOT = previousRoot;
 			if (previousJobsDir === undefined) delete process.env.PI_ORACLE_JOBS_DIR;
 			else process.env.PI_ORACLE_JOBS_DIR = previousJobsDir;
 			if (previousStateDir === undefined) delete process.env.PI_SOL_STATE_DIR;
 			else process.env.PI_SOL_STATE_DIR = previousStateDir;
 			await rm(jobsDir, { recursive: true, force: true });
 			await rm(stateDir, { recursive: true, force: true });
+			rmSync(oracleRoot, { recursive: true, force: true });
 		}
 	});
 

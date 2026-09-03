@@ -17,6 +17,13 @@ import { accessSync, constants as fsConstants, existsSync, readFileSync, readlin
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import {
+	acquireSolOperationLease,
+	getSolStateDir,
+	releaseSolOperationLease,
+	type SolOperationAdmission,
+	type SolOperationLease,
+} from "./admission.ts";
 import { getOracleJobsDir, listActiveSolJobs, type SolJobSummary } from "./jobs.ts";
 
 export const ORACLE_CONFIG_BASENAME = "oracle.json";
@@ -187,12 +194,12 @@ export function normalizeSolOpenUrl(raw: string | undefined, provider: string): 
 export type SolOpenResult =
 	| { ok: true; launched: true; pid: number; profileDir: string; url: string; executablePath: string }
 	| { ok: true; launched: false; alreadyOpenPid: number; profileDir: string }
-	| { ok: false; reason: "no-profile" | "no-chrome" | "active-jobs"; profileDir: string; message: string };
+	| { ok: false; reason: "no-profile" | "no-chrome" | "active-jobs" | "operation-busy"; profileDir: string; message: string };
 
 type SolOpenChild = {
 	pid?: number;
 	unref?: () => void;
-	on?: (event: "error", listener: (error: unknown) => void) => unknown;
+	on?: (event: "error" | "exit" | "close", listener: (...args: any[]) => void) => unknown;
 };
 
 export type SolOpenDeps = {
@@ -206,16 +213,24 @@ export type SolOpenDeps = {
 	executableReadyFn?: (path: string) => boolean;
 	/** Injectable for tests; production scans durable jobs before opening a seed. */
 	activeJobsFn?: (provider: string) => SolJobSummary[];
+	/** Injectable shared seed-operation lease; production uses the admission flock. */
+	acquireOperationLeaseFn?: (stateDir: string) => Promise<SolOperationAdmission> | SolOperationAdmission;
+	releaseOperationLeaseFn?: (lease: SolOperationLease) => Promise<boolean> | boolean;
 	onSpawnError?: (error: Error) => void;
 	existsFn?: (p: string) => boolean;
 	singletonPid?: (profileDir: string) => number | undefined;
 };
 
 /**
- * Open (or report the already-open) oracle browser. Pure enough to unit test:
- * every side effect is injectable.
+ * Open (or report the already-open) oracle browser. The shared operation lease
+ * is held from the final singleton/job checks through spawn and remains held
+ * until the launched child exits or reports an error. This closes the startup
+ * window where Chrome has not created SingletonLock yet.
+ *
+ * Every side effect is injectable so the ordering and lease lifetime are
+ * directly testable without launching a real browser.
  */
-export function openSolOracleBrowser(deps: SolOpenDeps = {}): SolOpenResult {
+export async function openSolOracleBrowser(deps: SolOpenDeps = {}): Promise<SolOpenResult> {
 	const env = deps.env ?? process.env;
 	const config = deps.config ?? readSolOracleBrowserConfig(env);
 	const provider = deps.provider?.toLowerCase() === "grok" ? "grok" : "chatgpt";
@@ -225,8 +240,11 @@ export function openSolOracleBrowser(deps: SolOpenDeps = {}): SolOpenResult {
 	const url = normalizeSolOpenUrl(deps.url, provider);
 	const profileDir = deps.profileDir ?? seedProfileDirForProvider(provider, config);
 	const exists = deps.existsFn ?? existsSync;
-	const livePid = (deps.singletonPid ?? singletonOwnerPid)(profileDir);
-	if (livePid !== undefined) return { ok: true, launched: false, alreadyOpenPid: livePid, profileDir };
+	const singletonPid = deps.singletonPid ?? singletonOwnerPid;
+	// Fast path for a window that is already open. The authoritative re-check
+	// runs after the shared lease is acquired below, closing the check/spawn race.
+	const initialLivePid = singletonPid(profileDir);
+	if (initialLivePid !== undefined) return { ok: true, launched: false, alreadyOpenPid: initialLivePid, profileDir };
 	if (!exists(profileDir)) {
 		return {
 			ok: false,
@@ -236,67 +254,123 @@ export function openSolOracleBrowser(deps: SolOpenDeps = {}): SolOpenResult {
 		};
 	}
 
-	// A manual window and a live worker must never touch the same seed. The
-	// reciprocal check complements the tool_call SingletonLock check: opening
-	// is rejected while a durable job is cloning/using this provider's seed.
-	let activeJobs: SolJobSummary[];
+	const acquireLease = deps.acquireOperationLeaseFn ?? ((stateDir: string) => acquireSolOperationLease(stateDir));
+	let operation: SolOperationAdmission;
 	try {
-		activeJobs = (deps.activeJobsFn ?? ((selectedProvider) => listActiveSolJobs(getOracleJobsDir(env), { provider: selectedProvider })))(provider);
+		operation = await acquireLease(getSolStateDir(env));
 	} catch (error) {
 		return {
 			ok: false,
-			reason: "active-jobs",
+			reason: "operation-busy",
 			profileDir,
-			message: `Cannot verify active oracle jobs before opening ${profileDir}: ${error instanceof Error ? error.message : String(error)}`,
+			message: `Cannot acquire the shared /sol seed-operation lock before opening ${profileDir}: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
-	if (activeJobs.length > 0) {
-		const shown = activeJobs.slice(0, 3).map((job) => `${job.id} (${job.status})`).join(", ");
-		const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
+	if (!operation.acquired) {
 		return {
 			ok: false,
-			reason: "active-jobs",
+			reason: "operation-busy",
 			profileDir,
-			message: `Cannot open oracle ${provider} auth seed while jobs are active: ${shown}${suffix}. Wait for them to finish before changing the seed.`,
+			message: `Cannot open oracle ${provider} auth seed while another /sol seed operation is active: ${operation.reason}`,
 		};
 	}
 
-	const executablePath = deps.executablePath ?? config.executablePath;
-	if (!executablePath) {
-		return {
-			ok: false,
-			reason: "no-chrome",
-			profileDir,
-			message: "No Chrome executable found. Set browser.executablePath in ~/.pi/agent/extensions/oracle.json.",
-		};
+	const lease = operation.lease;
+	const releaseOperationLease = deps.releaseOperationLeaseFn ?? releaseSolOperationLease;
+	let leaseReleased = false;
+	const releaseHeldLease = (): void => {
+		if (leaseReleased) return;
+		leaseReleased = true;
+		try {
+			void Promise.resolve(releaseOperationLease(lease)).catch(() => { /* kernel close remains best-effort */ });
+		} catch { /* a release diagnostic must not escape a child event */ }
+	};
+	let retainLease = false;
+	try {
+		// Re-check every observation under the same lock. A submit/recover that
+		// acquired the lock first has now completed its handoff; an open that won
+		// first keeps the lock through the browser startup lifecycle below.
+		const livePid = singletonPid(profileDir);
+		if (livePid !== undefined) return { ok: true, launched: false, alreadyOpenPid: livePid, profileDir };
+		if (!exists(profileDir)) {
+			return {
+				ok: false,
+				reason: "no-profile",
+				profileDir,
+				message: `Oracle ${provider} auth seed not found at ${profileDir}. Run /sol-auth first to create it.`,
+			};
+		}
+
+		let activeJobs: SolJobSummary[];
+		try {
+			activeJobs = (deps.activeJobsFn ?? ((selectedProvider) => listActiveSolJobs(getOracleJobsDir(env), { provider: selectedProvider })))(provider);
+		} catch (error) {
+			return {
+				ok: false,
+				reason: "active-jobs",
+				profileDir,
+				message: `Cannot verify active oracle jobs before opening ${profileDir}: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+		if (activeJobs.length > 0) {
+			const shown = activeJobs.slice(0, 3).map((job) => `${job.id} (${job.status})`).join(", ");
+			const suffix = activeJobs.length > 3 ? `, +${activeJobs.length - 3} more` : "";
+			return {
+				ok: false,
+				reason: "active-jobs",
+				profileDir,
+				message: `Cannot open oracle ${provider} auth seed while jobs are active: ${shown}${suffix}. Wait for them to finish before changing the seed.`,
+			};
+		}
+
+		const executablePath = deps.executablePath ?? config.executablePath;
+		if (!executablePath) {
+			return {
+				ok: false,
+				reason: "no-chrome",
+				profileDir,
+				message: "No Chrome executable found. Set browser.executablePath in ~/.pi/agent/extensions/oracle.json.",
+			};
+		}
+		// A real spawn failure is delivered asynchronously by ChildProcess. Do a
+		// synchronous file/access preflight first, while still installing an error
+		// listener below for races (permission changes, mount failures, etc.). A
+		// custom spawnFn is a test seam and supplies its own readiness decision.
+		const executableReady = deps.executableReadyFn ?? (deps.spawnFn ? (() => true) : isExecutableFile);
+		if (!executableReady(executablePath)) {
+			return {
+				ok: false,
+				reason: "no-chrome",
+				profileDir,
+				message: `Chrome executable is missing or not executable: ${executablePath}. Fix browser.executablePath in ~/.pi/agent/extensions/oracle.json.`,
+			};
+		}
+		const spawnFn = deps.spawnFn ?? ((exe, args) => spawn(exe, args, { detached: true, stdio: "ignore" }));
+		const child = spawnFn(executablePath, solOpenBrowserArgs(profileDir, url));
+		const childHasLifecycle = typeof child.on === "function";
+		child.on?.("error", (rawError) => {
+			const error = rawError instanceof Error ? rawError : new Error(String(rawError));
+			// Always consume the EventEmitter error so a stale executable can never
+			// terminate Pi. The command handler supplies the user-facing callback.
+			try { deps.onSpawnError?.(error); } catch { /* a diagnostic callback must not escape */ }
+			releaseHeldLease();
+		});
+		// Keep the shared lease until the detached browser child exits. If Chrome
+		// has handed off to a separate singleton process, the submit gate still
+		// observes SingletonLock after this release; while startup is in progress
+		// this lease is the atomic reservation that SingletonLock cannot provide.
+		child.on?.("exit", () => releaseHeldLease());
+		child.on?.("close", () => releaseHeldLease());
+		child.unref?.();
+		const pid = child.pid;
+		if (typeof pid !== "number") {
+			return { ok: false, reason: "no-chrome", profileDir, message: `Failed to launch ${executablePath}; it exited before reporting a pid.` };
+		}
+		retainLease = childHasLifecycle;
+		return { ok: true, launched: true, pid, profileDir, url, executablePath };
+	} finally {
+		if (!retainLease) releaseHeldLease();
 	}
-	// A real spawn failure is delivered asynchronously by ChildProcess. Do a
-	// synchronous file/access preflight first, while still installing an error
-	// listener below for races (permission changes, mount failures, etc.). A
-	// custom spawnFn is a test seam and supplies its own readiness decision.
-	const executableReady = deps.executableReadyFn ?? (deps.spawnFn ? (() => true) : isExecutableFile);
-	if (!executableReady(executablePath)) {
-		return {
-			ok: false,
-			reason: "no-chrome",
-			profileDir,
-			message: `Chrome executable is missing or not executable: ${executablePath}. Fix browser.executablePath in ~/.pi/agent/extensions/oracle.json.`,
-		};
-	}
-	const spawnFn = deps.spawnFn ?? ((exe, args) => spawn(exe, args, { detached: true, stdio: "ignore" }));
-	const child = spawnFn(executablePath, solOpenBrowserArgs(profileDir, url));
-	child.on?.("error", (rawError) => {
-		const error = rawError instanceof Error ? rawError : new Error(String(rawError));
-		// Always consume the EventEmitter error so a stale executable can never
-		// terminate Pi. The command handler supplies the user-facing callback.
-		try { deps.onSpawnError?.(error); } catch { /* a diagnostic callback must not escape */ }
-	});
-	child.unref?.();
-	const pid = child.pid;
-	if (typeof pid !== "number") {
-		return { ok: false, reason: "no-chrome", profileDir, message: `Failed to launch ${executablePath}; it exited before reporting a pid.` };
-	}
-	return { ok: true, launched: true, pid, profileDir, url, executablePath };
 }
 
 /** Human-readable outcome for ctx.ui.notify. */

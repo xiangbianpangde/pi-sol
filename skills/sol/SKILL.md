@@ -3,7 +3,7 @@ name: sol
 description: Relay research and planning questions to ChatGPT web GPT-5.6 Sol High via /sol and pi-oracle. Use before solving hard problems, when the user runs /sol, or when the local model needs a web-Sol advisor. Never drive chatgpt.com with agent_browser.
 compatibility: Pi coding agent
 metadata:
-  version: "1.14.0"
+  version: "1.14.1"
   status: "active"
   layer: "task"
   priority: "30"
@@ -151,7 +151,7 @@ node --experimental-strip-types --test extensions/__tests__/*.test.ts
 
 `--offline` against an empty cache is the actual closure test: any missing
 transitive dep surfaces as `Cannot find module 'nan'` or `ENOTCACHED` rather than
-silently passing. Expect `183 tests / 183 pass / 0 fail / 0 skipped`. Host toolchain
+silently passing. Expect `185 tests / 185 pass / 0 fail / 0 skipped`. Host toolchain
 (Node headers, C/C++ compiler, Python/node-gyp) is a normal native-addon
 prerequisite, not a closure defect. `com.apple.provenance` is SIP-protected and
 cannot be stripped with `xattr -c`; AppleDouble noise is archive hygiene, never a

@@ -14,7 +14,13 @@
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
-import { acquireSolSubmitLease, releaseSolSubmitLease, type SolSubmitLease } from "./lib/sol/admission.ts";
+import {
+	acquireSolOperationLease,
+	acquireSolSubmitLease,
+	releaseSolOperationLease,
+	releaseSolSubmitLease,
+	type SolSubmitLease,
+} from "./lib/sol/admission.ts";
 import { stageSolFiles } from "./lib/sol/files.ts";
 import { agentBrowserTargetsChatGpt } from "./lib/sol/guard.ts";
 import { formatSolJobSummary, isCanonicalSolJobId, listRecentSolJobIds, readSolJob } from "./lib/sol/jobs.ts";
@@ -224,19 +230,37 @@ export default function (pi: ExtensionAPI) {
 					if (!patchHealth.ok) {
 						patchBlockReason = patchHealthBlockReason(patchHealth, phase);
 					} else {
-						const seedLock = liveSolSeedLock(provider);
-						if (seedLock) {
-							seedBlockReason = `Oracle ${provider} auth seed is open in the manual Chrome window (PID ${seedLock.pid}): ${seedLock.profileDir}. Close that window before oracle_${phase}; the seed must not be cloned while Chrome is writing it.`;
-						}
-					}
-					// /sol always uses ChatGPT. Leave Grok's independent admission
-					// policy untouched when an agent explicitly invokes it.
-					if (!patchBlockReason && !seedBlockReason && provider !== "grok") {
-						const admission = await acquireSolSubmitLease();
-						if (admission.acquired) {
-							submitLeases.set(event.toolCallId, admission.lease);
-						} else {
-							admissionBlockReason = admission.reason;
+						// Acquire the shared operation lease BEFORE inspecting the seed.
+						// /sol-open uses the same lease and keeps it through Chrome
+						// startup, so SingletonLock creation cannot leave a gap here.
+						let heldLease: SolSubmitLease | undefined;
+						try {
+							const operation = provider === "grok"
+								? await acquireSolOperationLease()
+								: await acquireSolSubmitLease();
+							if (operation.acquired) {
+								heldLease = operation.lease;
+								try {
+									const seedLock = liveSolSeedLock(provider);
+									if (seedLock) {
+										seedBlockReason = `Oracle ${provider} auth seed is open in the manual Chrome window (PID ${seedLock.pid}): ${seedLock.profileDir}. Close that window before oracle_${phase}; the seed must not be cloned while Chrome is writing it.`;
+									}
+								} catch (error) {
+									seedBlockReason = `Cannot verify the ${provider} auth seed lock before oracle_${phase}: ${error instanceof Error ? error.message : String(error)}`;
+								}
+								if (seedBlockReason) {
+									await releaseSolOperationLease(heldLease);
+									heldLease = undefined;
+								} else {
+									submitLeases.set(event.toolCallId, heldLease);
+									heldLease = undefined;
+								}
+							} else {
+								admissionBlockReason = operation.reason;
+							}
+						} catch (error) {
+							if (heldLease) await releaseSolOperationLease(heldLease);
+							admissionBlockReason = `Cannot acquire the shared /sol seed-operation lock: ${error instanceof Error ? error.message : String(error)}`;
 						}
 					}
 				}
@@ -461,7 +485,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			try {
-				const result = openSolOracleBrowser({
+				const result = await openSolOracleBrowser({
 					provider,
 					url,
 					onSpawnError: (error) => emit(pi, ctx, `Oracle browser failed after launch: ${error.message}`, "warning"),

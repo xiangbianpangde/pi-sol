@@ -32,7 +32,7 @@ export function oracleMaxConcurrentJobs(env = process.env): number {
 }
 
 export function getSolStateDir(env = process.env): string {
-	return env.PI_SOL_STATE_DIR?.trim() || join(homedir(), ".pi", "agent", "state");
+	return env.PI_SOL_STATE_DIR?.trim() || join(env.HOME ?? homedir(), ".pi", "agent", "state");
 }
 
 /**
@@ -47,14 +47,21 @@ const ADMISSION_LOCK_NAME = "pi-sol-admission.lock";
 const LOCK_RETRY_MS = 100;
 const LOCK_WAIT_MS = 5000;
 
-export type SolSubmitLease = {
-	/** Absolute path of the flock file (kept for diagnostics / tests). */
+export type SolOperationLease = {
+	/** Absolute path of the shared seed-operation flock file. */
 	path: string;
 	/** Unique per-acquire id (kept for diagnostics; release uses the fd). */
 	token: string;
 	/** Open file descriptor holding the kernel flock. */
 	fd: number;
 };
+
+/** Backward-compatible name for callers that reserve a submit handoff. */
+export type SolSubmitLease = SolOperationLease;
+
+export type SolOperationAdmission =
+	| { acquired: true; lease: SolOperationLease }
+	| { acquired: false; reason: string };
 
 export type SolSubmitAdmission =
 	| { acquired: true; lease: SolSubmitLease }
@@ -64,7 +71,7 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
-function busyReason(activeJobs: SolJobSummary[], _lockPath?: string): string {
+function busyReason(activeJobs: SolJobSummary[]): string {
 	if (activeJobs.length > 0) {
 		const shown = activeJobs
 			.slice(0, 3)
@@ -74,8 +81,24 @@ function busyReason(activeJobs: SolJobSummary[], _lockPath?: string): string {
 		return `ChatGPT /sol concurrency limit reached: active jobs ${shown}${suffix}. Wait for one to finish, then use /sol-read <job-id> and retry.`;
 	}
 	// No rm advice: the lock is kernel-managed and auto-released on holder
-	// death; telling an agent to delete the lock file would be wrong.
-	return `Another Pi session is currently admitting a ChatGPT /sol submission; the admission coordination lock is briefly held. Wait briefly and retry.`;
+	// death; telling an agent to delete the lock file would be wrong. The same
+	// lock also protects /sol-open seed startup, so keep this wording generic.
+	return `Another Pi session is currently holding the /sol seed-operation/admission coordination lock; wait briefly and retry.`;
+}
+
+type StateDirResult = { ok: true } | { ok: false; reason: string };
+
+async function ensurePrivateStateDir(stateDir: string): Promise<StateDirResult> {
+	try {
+		await mkdir(stateDir, { recursive: true, mode: 0o700 });
+		await chmodPrivate(stateDir);
+		return { ok: true };
+	} catch (error) {
+		return {
+			ok: false,
+			reason: `Cannot establish /sol seed-operation state dir: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
 }
 
 /** Tighten an existing (not just newly created) state dir to 0700. Fail closed
@@ -113,6 +136,34 @@ function tryTakeFlock(lockPath: string): number | undefined {
 }
 
 /**
+ * Acquire the shared per-user seed-operation lease. Both /sol-open and the
+ * capacity-consuming oracle hooks use this exact kernel flock. A caller keeps
+ * the returned lease for the whole operation; the kernel releases it if the
+ * owning Pi process crashes.
+ */
+export async function acquireSolOperationLease(stateDir = getSolStateDir()): Promise<SolOperationAdmission> {
+	const setup = await ensurePrivateStateDir(stateDir);
+	if (!setup.ok) return setup;
+
+	const lockPath = join(stateDir, ADMISSION_LOCK_NAME);
+	let fd: number | undefined;
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	try {
+		while (fd === undefined && Date.now() < deadline) {
+			fd = tryTakeFlock(lockPath);
+			if (fd === undefined) await sleep(LOCK_RETRY_MS);
+		}
+	} catch (error) {
+		return {
+			acquired: false,
+			reason: `Cannot acquire /sol seed-operation coordination lock: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (fd === undefined) return { acquired: false, reason: busyReason([]) };
+	return { acquired: true, lease: { path: lockPath, token: randomUUID(), fd } };
+}
+
+/**
  * Acquire a short-lived cross-Pi admission lease before oracle_submit.
  *
  * Mutual exclusion is a KERNEL flock: only one process can hold LOCK_EX on
@@ -133,37 +184,31 @@ export async function acquireSolSubmitLease(
 	maxConcurrentJobs = oracleMaxConcurrentJobs(),
 	scanActive: (jobsDir: string) => SolJobSummary[] = listActiveSolJobs,
 ): Promise<SolSubmitAdmission> {
-	const lockPath = join(stateDir, ADMISSION_LOCK_NAME);
+	// Fast-path pre-check (optimization only; authoritative check is in-lock).
+	let pre: SolJobSummary[];
 	try {
-		await mkdir(stateDir, { recursive: true, mode: 0o700 });
-		await chmodPrivate(stateDir);
+		pre = scanActive(jobsDir);
 	} catch (error) {
 		return {
 			acquired: false,
-			reason: `Cannot establish ChatGPT /sol admission state dir: ${error instanceof Error ? error.message : String(error)}`,
+			reason: `Cannot scan active /sol jobs before acquiring the coordination lock: ${error instanceof Error ? error.message : String(error)}`,
 			activeJobs: [],
 		};
 	}
-
-	// Fast-path pre-check (optimization only; authoritative check is in-lock).
-	const pre = scanActive(jobsDir);
 	if (pre.length >= maxConcurrentJobs) {
 		return { acquired: false, reason: busyReason(pre), activeJobs: pre };
 	}
 
-	// Wait for the kernel flock (bounded).  Use fd === undefined checks —
-	// fd 0 is a valid descriptor (e.g. when stdin is closed) and must not be
-	// treated as "not acquired" (audit round P2-1).
-	let fd: number | undefined;
-	const deadline = Date.now() + LOCK_WAIT_MS;
-	while (fd === undefined && Date.now() < deadline) {
-		fd = tryTakeFlock(lockPath);
-		if (fd === undefined) await sleep(LOCK_RETRY_MS);
-	}
-	if (fd === undefined) {
-		return { acquired: false, reason: busyReason([], lockPath), activeJobs: scanActive(jobsDir) };
+	// The same lease protects /sol-open seed startup. The submit caller keeps
+	// it until the oracle tool has completed its seed clone/handoff.
+	const operation = await acquireSolOperationLease(stateDir);
+	if (!operation.acquired) {
+		let activeJobs: SolJobSummary[] = [];
+		try { activeJobs = scanActive(jobsDir); } catch { /* preserve the lock failure */ }
+		return { acquired: false, reason: operation.reason, activeJobs };
 	}
 
+	const { fd } = operation.lease;
 	try {
 		// AUTHORITATIVE capacity check under the kernel lock.
 		const active = scanActive(jobsDir);
@@ -172,7 +217,7 @@ export async function acquireSolSubmitLease(
 			closeSync(fd);
 			return { acquired: false, reason: busyReason(active), activeJobs: active };
 		}
-		return { acquired: true, lease: { path: lockPath, token: randomUUID(), fd } };
+		return { acquired: true, lease: operation.lease };
 	} catch (error) {
 		// Scan failed after acquiring the lock: release and fail closed.
 		// The kernel drops the lock on close even if unlock fails.
@@ -187,18 +232,18 @@ export async function acquireSolSubmitLease(
 }
 
 /**
- * Release the admission lease: unlock + close the fd.  The kernel releases
- * the flock on close, so there is no generation-check or reclaim-token step.
- * Always succeeds (close is authoritative); returns true once the fd is
- * closed so the caller drops the lease from its map.
+ * Release the shared operation lease: unlock + close the fd. The kernel
+ * releases the flock on close, so there is no generation-check or reclaim
+ * token step. Always succeeds (close is authoritative); callers may safely
+ * drop the lease after this one-shot operation.
  */
-const RELEASED_LEASES = new WeakSet<SolSubmitLease>();
+const RELEASED_LEASES = new WeakSet<SolOperationLease>();
 
-export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<boolean> {
+export async function releaseSolOperationLease(lease: SolOperationLease): Promise<boolean> {
 	// One-shot release (audit round P2-2): a lease is released exactly once.
 	// Once unlock/close has been attempted, ownership is gone — the fd must
 	// never be reused by a later event, because the kernel may have recycled
-	// the numeric descriptor.  Return true (dropped from the map) either way;
+	// the numeric descriptor. Return true (dropped from the map) either way;
 	// a close failure is a diagnostic, not a reason to keep retrying a raw fd.
 	if (RELEASED_LEASES.has(lease)) return true;
 	RELEASED_LEASES.add(lease);
@@ -209,8 +254,12 @@ export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<bool
 		closeSync(lease.fd);
 	} catch {
 		// The fd may already be gone (kernel closed it on our exit path, or a
-		// recycled descriptor).  We still report success: the lease is
-		// consumed and must not be retried.
+		// recycled descriptor). We still report success: the lease is consumed.
 	}
 	return true;
+}
+
+/** Backward-compatible submit-specific release name. */
+export async function releaseSolSubmitLease(lease: SolSubmitLease): Promise<boolean> {
+	return releaseSolOperationLease(lease);
 }

@@ -1,5 +1,17 @@
 # sol CHANGELOG
 
+## 1.14.1 - 2026-09-03
+
+- **Closed the final seed-operation race**: `/sol-open`, `oracle_submit`, and
+  `oracle_recover` now share one per-user kernel `flock`; `/sol-open` holds its
+  lease through Chrome startup and releases it on child exit/error, while the
+  capacity check remains authoritative under the same lease.
+- Added a cross-process `/sol-open` startup-gap regression test and a complete
+  trusted `pi-oracle 0.7.20` fixture for the load tests.
+- The release evidence suite is now **185/185** (`0 fail / 0 skipped`), with
+  the count kept in sync with the archive reproduction instructions; the
+  `/sol-open` regression also exercises a real `ChildProcess` `ENOENT` path.
+
 ## 1.14.0 - 2026-09-03
 
 - **Oracle audit blockers closed**: `oracle_submit` and `oracle_recover` now
